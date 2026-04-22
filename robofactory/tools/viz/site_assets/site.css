@@ -1,0 +1,120 @@
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: #0f1115; color: #e6e6e6;
+  height: 100%;
+}
+header {
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0.8rem 1.2rem;
+  border-bottom: 1px solid #232731;
+  background: #171a21;
+}
+header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; color: #4f8aff; }
+.task-picker { display: flex; align-items: center; gap: 0.5rem; }
+.task-picker button {
+  background: #232731; color: #e6e6e6; border: 1px solid #2f3542;
+  padding: 0.25rem 0.6rem; border-radius: 4px; cursor: pointer;
+}
+.task-picker button:hover { background: #2f3542; }
+#task-badges { margin-left: 1rem; color: #a0a8b5; font-size: 0.85rem; }
+select {
+  background: #232731; color: #e6e6e6; border: 1px solid #2f3542;
+  padding: 0.3rem 0.5rem; border-radius: 4px;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 280px 1fr 360px;
+  height: calc(100vh - 60px);
+  gap: 0;
+}
+
+#episode-panel {
+  border-right: 1px solid #232731;
+  display: flex; flex-direction: column;
+  background: #13151b;
+  overflow: hidden;
+}
+.panel-head {
+  padding: 0.6rem 0.8rem; border-bottom: 1px solid #232731;
+  display: flex; flex-direction: column; gap: 0.4rem;
+  font-size: 0.85rem;
+}
+.panel-head label { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+#episode-list {
+  list-style: none; padding: 0; margin: 0;
+  overflow-y: auto; flex: 1;
+}
+#episode-list li {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  gap: 0.5rem; padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid #1c1f26;
+  cursor: pointer;
+  align-items: center;
+}
+#episode-list li:hover { background: #1c1f26; }
+#episode-list li.active { background: #1f2d4a; border-left: 3px solid #4f8aff; }
+#episode-list li img { width: 64px; height: auto; border-radius: 3px; display: block; }
+#episode-list li .ep-meta { font-size: 0.82rem; line-height: 1.2; }
+#episode-list li .ep-meta .ep-num { font-weight: 600; color: #cfd3da; }
+#episode-list li .ep-meta .ep-sub { color: #8a93a6; font-size: 0.75rem; }
+#episode-list li .succ-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px;
+}
+.succ-dot.ok { background: #2a9d8f; }
+.succ-dot.fail { background: #e63946; }
+
+#player-panel {
+  display: flex; flex-direction: column;
+  align-items: stretch;
+  padding: 1rem 1.2rem;
+  background: #0f1115;
+  overflow-y: auto;
+}
+.player-head {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding-bottom: 0.6rem;
+  font-size: 0.9rem;
+}
+.player-head .spacer { flex: 1; }
+.player-head button {
+  background: #232731; color: #e6e6e6; border: 1px solid #2f3542;
+  padding: 0.25rem 0.7rem; border-radius: 4px; cursor: pointer;
+  font-size: 0.85rem;
+}
+.player-head button:hover { background: #2f3542; }
+#episode-title { font-weight: 600; font-size: 1rem; }
+#episode-meta { color: #a0a8b5; }
+
+#player {
+  width: 100%; max-height: 60vh;
+  background: #000; border-radius: 6px;
+  object-fit: contain;
+}
+.hint { color: #6b7384; font-size: 0.8rem; margin-top: 0.6rem; }
+kbd {
+  background: #232731; border: 1px solid #2f3542; padding: 1px 5px; border-radius: 3px;
+  font-size: 0.75rem; font-family: monospace; color: #cfd3da;
+}
+
+#stats-panel {
+  border-left: 1px solid #232731; background: #13151b;
+  padding: 0.8rem 1rem; overflow-y: auto;
+}
+#stats-panel h3 { margin: 0 0 0.6rem 0; font-size: 0.95rem; color: #4f8aff; }
+#stats-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  margin-bottom: 1rem;
+  padding: 0.6rem;
+  background: #171a21; border-radius: 4px;
+}
+#stats-summary .k { color: #8a93a6; }
+#stats-summary .v { text-align: right; font-variant-numeric: tabular-nums; color: #e6e6e6; }
+.plot { margin-bottom: 0.8rem; min-height: 220px; }
+.plot-wide { min-height: 360px; margin-top: 1rem; }

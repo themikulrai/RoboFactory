@@ -39,10 +39,13 @@ export CUDA_VISIBLE_DEVICES=${gpu_id}
 python ./policy/Diffusion-Policy/train.py --config-name=${config_name}.yaml \
                                             task.name=${task_name} \
                                             task.dataset.zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${load_num}.zarr" \
+                                            current_agent_id=${agent_id} \
+                                            eval.data_num=${load_num} \
                                             training.debug=$DEBUG \
                                             training.seed=${seed} \
                                             training.device="cuda:0" \
                                             exp_name=${exp_name} \
-                                            logging.mode=${wandb_mode}
+                                            logging.mode=${wandb_mode} \
+                                            "${@:6}"
                                             # checkpoint.save_ckpt=${save_ckpt}
                                             # hydra.run.dir=${run_dir} \

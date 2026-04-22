@@ -1,0 +1,315 @@
+"""
+Env runner for the centralised (joint) diffusion policy.
+
+One policy consumes obs from all N arms (separate RGB keys `head_cam_0..head_cam_{N-1}`
+plus a single concatenated `agent_pos` of length 8*N) and emits a (horizon, 8*N)
+action chunk that is split back into N per-arm actions and dispatched via
+`panda-{i}` in the env step call.
+
+This is the minimal baseline runner: raw action execution, no TOPP resync, no
+peer-checkpoint loading. Intended as a head-to-head A/B against the per-arm
+RobotMultiAgentImageRunner on tasks like TakePhoto-rf and LongPipelineDelivery-rf.
+"""
+import os
+import traceback
+from collections import deque
+from typing import List, Optional
+
+import numpy as np
+import torch
+import tqdm
+
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+
+class RobotJointImageRunner:
+    def __init__(
+        self,
+        output_dir: str,
+        env_id: str = "TakePhoto-rf",
+        config_path: Optional[str] = None,
+        n_agents: int = 4,
+        data_num: int = 150,
+        n_eval_episodes: int = 10,
+        n_action_exec: int = 6,
+        max_episode_steps: int = 1500,
+        n_obs_steps: int = 3,
+        n_action_steps: int = 8,
+        test_start_seed: int = 100000,
+        record_video_episodes: Optional[List[int]] = None,
+        fps: int = 20,
+        device: str = "cuda:0",
+        tqdm_interval_sec: float = 5.0,
+    ):
+        self.output_dir = output_dir
+        self.env_id = env_id
+        self.config_path = config_path
+        self.n_agents = n_agents
+        self.data_num = data_num
+        self.n_eval_episodes = n_eval_episodes
+        self.n_action_exec = n_action_exec
+        self.max_episode_steps = max_episode_steps
+        self.n_obs_steps = n_obs_steps
+        self.n_action_steps = n_action_steps
+        self.test_start_seed = test_start_seed
+        self.record_video_episodes = set(record_video_episodes or [0, 5])
+        self.fps = fps
+        self.device = device
+        self.tqdm_interval_sec = tqdm_interval_sec
+
+    # ------------------- env plumbing -------------------
+
+    def _make_env(self):
+        import gymnasium as gym
+        import robofactory.tasks  # noqa: F401  (register_env side effect)
+
+        cfg_path = self.config_path
+        if cfg_path is None:
+            from robofactory import CONFIG_DIR
+            default_cfg = {
+                "TakePhoto-rf": ("robocasa", "take_photo.yaml"),
+                "LongPipelineDelivery-rf": ("robocasa", "long_pipeline_delivery.yaml"),
+            }
+            if self.env_id not in default_cfg:
+                raise ValueError(
+                    f"No default config for env_id={self.env_id}; set task.env_runner.config_path"
+                )
+            cfg_path = os.path.join(CONFIG_DIR, *default_cfg[self.env_id])
+
+        env_kwargs = dict(
+            config=cfg_path,
+            obs_mode="rgb",
+            reward_mode="dense",
+            control_mode="pd_joint_pos",
+            render_mode="rgb_array",
+            sensor_configs=dict(shader_pack="default"),
+            human_render_camera_configs=dict(shader_pack="default"),
+            viewer_camera_configs=dict(shader_pack="default"),
+            num_envs=1,
+            sim_backend="cpu",
+            enable_shadow=True,
+        )
+        return gym.make(self.env_id, **env_kwargs)
+
+    # ------------------- obs extraction -------------------
+
+    @staticmethod
+    def _initial_agent_pos_one(raw_obs, agent_id: int) -> np.ndarray:
+        qpos = raw_obs["agent"][f"panda-{agent_id}"]["qpos"]
+        if hasattr(qpos, "squeeze"):
+            qpos = qpos.squeeze(0)
+        qpos_np = qpos.cpu().numpy() if hasattr(qpos, "cpu") else np.asarray(qpos)
+        arm = qpos_np[:-2]
+        gripper = np.array([1.0], dtype=arm.dtype)
+        return np.concatenate([arm, gripper]).astype(np.float32)
+
+    def _build_obs_dict(self, raw_obs, last_exec: Optional[np.ndarray]) -> dict:
+        # Per-arm state: if we have the previously commanded joint action, use that
+        # (matches the dataset's convention). Otherwise fall back to qpos on reset.
+        if last_exec is not None:
+            agent_pos = last_exec.astype(np.float32)  # (8*N,)
+        else:
+            agent_pos = np.concatenate(
+                [self._initial_agent_pos_one(raw_obs, i) for i in range(self.n_agents)]
+            ).astype(np.float32)
+
+        out = {"agent_pos": agent_pos}
+        for i in range(self.n_agents):
+            rgb = raw_obs["sensor_data"][f"head_camera_agent{i}"]["rgb"]
+            if hasattr(rgb, "squeeze"):
+                rgb = rgb.squeeze(0)
+            rgb_np = rgb.cpu().numpy() if hasattr(rgb, "cpu") else np.asarray(rgb)
+            out[f"head_cam_{i}"] = np.moveaxis(rgb_np, -1, 0).astype(np.float32) / 255.0
+        return out
+
+    # ------------------- policy forward -------------------
+
+    @staticmethod
+    def _stack_last_n(deque_, n_steps):
+        lst = list(deque_)
+        first = lst[-1]
+        out = np.zeros((n_steps,) + first.shape, dtype=first.dtype)
+        start = -min(n_steps, len(lst))
+        out[start:] = np.array(lst[start:])
+        if n_steps > len(lst):
+            out[:start] = out[start]
+        return out
+
+    def _predict_joint_action(self, policy, obs_history: deque) -> np.ndarray:
+        # obs_history is a deque of per-step obs dicts; stack to (n_obs_steps, ...)
+        keys = list(obs_history[0].keys())
+        stacked = {k: self._stack_last_n([o[k] for o in obs_history], self.n_obs_steps)
+                   for k in keys}
+        device = next(policy.parameters()).device
+        obs_in = {k: torch.from_numpy(v).to(device).unsqueeze(0) for k, v in stacked.items()}
+        with torch.no_grad():
+            out = policy.predict_action(obs_in)
+        return out["action"].squeeze(0).detach().cpu().numpy()  # (n_action_steps, 8*N)
+
+    # ------------------- rendering -------------------
+
+    @staticmethod
+    def _render_frame(env) -> Optional[np.ndarray]:
+        try:
+            frame = env.render()
+        except Exception:
+            return None
+        if hasattr(frame, "cpu"):
+            frame = frame.cpu().numpy()
+        else:
+            frame = np.asarray(frame)
+        while frame.ndim > 3:
+            frame = frame[0]
+        return frame.astype(np.uint8)
+
+    @staticmethod
+    def _check_success(info: dict) -> bool:
+        if not isinstance(info, dict):
+            return False
+        succ = info.get("success", False)
+        if hasattr(succ, "__len__"):
+            try:
+                return bool(np.asarray(succ).all())
+            except Exception:
+                return False
+        try:
+            return bool(succ)
+        except Exception:
+            return False
+
+    # ------------------- main rollout -------------------
+
+    def _rollout_single_episode(self, env, policy, seed: int, record_frames: bool) -> dict:
+        obs_history: deque = deque(maxlen=self.n_obs_steps + 1)
+        raw_obs, _ = env.reset(seed=seed)
+        if env.action_space is not None:
+            env.action_space.seed(seed)
+
+        obs_history.append(self._build_obs_dict(raw_obs, last_exec=None))
+
+        frames: List[np.ndarray] = []
+        if record_frames:
+            f0 = self._render_frame(env)
+            if f0 is not None:
+                frames.append(f0)
+
+        success = False
+        steps = 0
+        info: dict = {}
+
+        while steps < self.max_episode_steps:
+            joint_action_chunk = self._predict_joint_action(policy, obs_history)
+            # shape (n_action_steps, 8*N) -> split per-arm
+            per_arm = np.split(joint_action_chunk, self.n_agents, axis=1)  # list of (H, 8)
+            last_joint = joint_action_chunk[0]
+
+            for t in range(min(self.n_action_exec, self.n_action_steps)):
+                action_dict = {
+                    f"panda-{i}": np.asarray(per_arm[i][t], dtype=np.float64)
+                    for i in range(self.n_agents)
+                }
+                raw_obs, _, term, trunc, info = env.step(action_dict)
+                steps += 1
+                if record_frames:
+                    fr = self._render_frame(env)
+                    if fr is not None:
+                        frames.append(fr)
+                last_joint = joint_action_chunk[t]
+                success = self._check_success(info)
+                if success or steps >= self.max_episode_steps:
+                    break
+
+            obs_history.append(self._build_obs_dict(raw_obs, last_exec=last_joint))
+            if success:
+                break
+
+        return dict(success=bool(success), length=steps, frames=frames)
+
+    def run(self, policy) -> dict:
+        try:
+            policy.eval()
+            env = self._make_env()
+        except Exception as e:
+            traceback.print_exc()
+            return {
+                "test_mean_score": 0.0,
+                "rollout/success_rate": 0.0,
+                "rollout/mean_episode_length": 0.0,
+                "rollout/n_eval_episodes": 0,
+                "rollout/enabled": 0,
+                "rollout/error": f"setup_failed:{type(e).__name__}",
+            }
+
+        successes: List[bool] = []
+        lengths: List[int] = []
+        video_frames = {}
+
+        try:
+            pbar = tqdm.tqdm(
+                range(self.n_eval_episodes),
+                desc="Eval rollouts (joint)",
+                leave=False,
+                mininterval=self.tqdm_interval_sec,
+            )
+            for ep_idx in pbar:
+                record = ep_idx in self.record_video_episodes
+                seed = self.test_start_seed + ep_idx
+                try:
+                    result = self._rollout_single_episode(
+                        env, policy, seed=seed, record_frames=record
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    result = dict(success=False, length=self.max_episode_steps, frames=[])
+                    if ep_idx == 0:
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+                        return {
+                            "test_mean_score": 0.0,
+                            "rollout/success_rate": 0.0,
+                            "rollout/mean_episode_length": 0.0,
+                            "rollout/n_eval_episodes": 0,
+                            "rollout/enabled": 0,
+                            "rollout/error": f"rollout_failed:{type(e).__name__}",
+                        }
+                successes.append(result["success"])
+                lengths.append(result["length"])
+                if record and result["frames"]:
+                    video_frames[ep_idx] = result["frames"]
+                pbar.set_postfix(success=sum(successes), total=len(successes))
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+        try:
+            policy.train()
+        except Exception:
+            pass
+
+        success_rate = float(np.mean(successes)) if successes else 0.0
+        mean_len = float(np.mean(lengths)) if lengths else 0.0
+        log = {
+            "test_mean_score": success_rate,
+            "rollout/success_rate": success_rate,
+            "rollout/mean_episode_length": mean_len,
+            "rollout/n_eval_episodes": len(successes),
+            "rollout/enabled": 1,
+        }
+        if wandb is not None:
+            for ep_idx, frames in video_frames.items():
+                if not frames:
+                    continue
+                try:
+                    arr = np.stack(frames)
+                    arr = np.transpose(arr, (0, 3, 1, 2))
+                    log[f"rollout/video_ep{ep_idx}"] = wandb.Video(arr, fps=self.fps, format="mp4")
+                except Exception:
+                    traceback.print_exc()
+        return log

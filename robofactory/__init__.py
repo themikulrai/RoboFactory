@@ -10,3 +10,4 @@ DIR_MAP = {
 
 from .tasks import *
 from .planner import *
+from . import agents  # register PandaWristCamMulti

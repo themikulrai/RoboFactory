@@ -26,20 +26,23 @@ shape_meta: &shape_meta
     shape: [8]
 
 env_runner:
-  _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
-  n_train: 6
-  n_train_vis: 2
-  train_start_seed: 0
-  n_test: 50
-  n_test_vis: 4
-  legacy_test: True
-  test_start_seed: 100000
-  max_steps: 300
+  _target_: diffusion_policy.env_runner.robot_multi_agent_image_runner.RobotMultiAgentImageRunner
+  env_id: "ThreeRobotsStackCube-rf"
+  config_path: null
+  current_agent_id: ${current_agent_id}
+  n_agents: 3
+  data_num: ${eval.data_num}
+  peer_checkpoint_num: ${eval.peer_checkpoint_num}
+  other_ckpt_search_roots: ["data/outputs"]
+  n_eval_episodes: ${eval.n_episodes}
+  n_action_exec: ${eval.n_action_exec}
+  max_episode_steps: 800
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
-  fps: 10
-  past_action: ${past_action_visible}
-  n_envs: null
+  test_start_seed: 100000
+  record_video_episodes: [0, 5]
+  fps: 20
+  device: ${training.device}
 
 dataset:
   _target_: diffusion_policy.dataset.robot_image_dataset.RobotImageDataset
@@ -50,3 +53,4 @@ dataset:
   seed: 42
   val_ratio: 0.02
   max_train_episodes: 90
+  batch_size: ${dataloader.batch_size}

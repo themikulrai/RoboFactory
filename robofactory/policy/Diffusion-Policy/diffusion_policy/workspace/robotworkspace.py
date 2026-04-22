@@ -8,8 +8,10 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import time
 import hydra
 import torch
+import wandb
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
@@ -104,24 +106,55 @@ class RobotWorkspace(BaseWorkspace):
                 model=self.ema_model)
 
         # configure env
-        # env_runner: BaseImageRunner
-        # env_runner = hydra.utils.instantiate(
-        #     cfg.task.env_runner,
-        #     output_dir=self.output_dir)
-        # assert isinstance(env_runner, BaseImageRunner)
-        env_runner = None
+        try:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+        except Exception as e:
+            print(f"[env_runner] init failed, skipping rollouts: {e}")
+            env_runner = None
 
         # configure logging
-        # wandb_run = wandb.init(
-        #     dir=str(self.output_dir),
-        #     config=OmegaConf.to_container(cfg, resolve=True),
-        #     **cfg.logging
-        # )
-        # wandb.config.update(
-        #     {
-        #         "output_dir": self.output_dir,
-        #     }
-        # )
+        wandb_run = wandb.init(
+            dir=str(self.output_dir),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging
+        )
+        wandb.config.update(
+            {
+                "output_dir": self.output_dir,
+            }
+        )
+
+        # parameter count (one-shot to wandb.summary)
+        try:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            wandb.summary['params/total_millions'] = total_params / 1e6
+            wandb.summary['params/trainable_millions'] = trainable_params / 1e6
+            wandb.summary['params/current_agent_id'] = int(getattr(cfg, 'current_agent_id', 0))
+        except Exception as e:
+            print(f"[wandb] param-count logging failed: {e}")
+
+        # dataset summary (one-shot to wandb.summary)
+        try:
+            action_arr = np.asarray(dataset.replay_buffer['action'])
+            state_arr = np.asarray(dataset.replay_buffer['state'])
+            head_shape = list(dataset.replay_buffer['head_camera'].shape)
+            wandb.summary['dataset/n_train_episodes'] = int(dataset.train_mask.sum())
+            wandb.summary['dataset/n_val_episodes'] = int((~dataset.train_mask).sum())
+            wandb.summary['dataset/n_train_samples'] = len(dataset)
+            wandb.summary['dataset/n_val_samples'] = len(val_dataset)
+            wandb.summary['dataset/action_dim'] = int(action_arr.shape[-1])
+            wandb.summary['dataset/state_dim'] = int(state_arr.shape[-1])
+            wandb.summary['dataset/image_shape'] = head_shape[1:]
+            wandb.summary['dataset/action_min'] = float(action_arr.min())
+            wandb.summary['dataset/action_max'] = float(action_arr.max())
+            wandb.summary['dataset/state_min'] = float(state_arr.min())
+            wandb.summary['dataset/state_max'] = float(state_arr.max())
+            wandb.summary['dataset/zarr_path'] = str(cfg.task.dataset.zarr_path)
+        except Exception as e:
+            print(f"[wandb] dataset summary logging failed: {e}")
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -153,6 +186,8 @@ class RobotWorkspace(BaseWorkspace):
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
+                epoch_start_time = time.time()
+                epoch_samples = 0
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
                     self.model.obs_encoder.eval()
@@ -172,12 +207,16 @@ class RobotWorkspace(BaseWorkspace):
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
-                        # step optimizer
+                        # step optimizer (also measure grad norm right before step)
+                        grad_norm = None
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), max_norm=float('inf')
+                            ).item()
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
+
                         # update ema
                         if cfg.training.use_ema:
                             ema.step(self.model)
@@ -186,17 +225,24 @@ class RobotWorkspace(BaseWorkspace):
                         raw_loss_cpu = raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
+                        try:
+                            epoch_samples += int(batch['action'].shape[0])
+                        except Exception:
+                            pass
                         step_log = {
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        if grad_norm is not None:
+                            step_log['grad_norm'] = grad_norm
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             json_logger.log(step_log)
+                            wandb.log(step_log, step=self.global_step)
                             self.global_step += 1
 
                         if (cfg.training.max_train_steps is not None) \
@@ -215,10 +261,18 @@ class RobotWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                # if (self.epoch % cfg.training.rollout_every) == 0:
-                #     runner_log = env_runner.run(policy)
-                #     # log all
-                #     step_log.update(runner_log)
+                if env_runner is not None and (self.epoch % cfg.training.rollout_every) == 0:
+                    try:
+                        runner_log = env_runner.run(policy)
+                    except Exception as e:
+                        import traceback as _tb
+                        _tb.print_exc()
+                        runner_log = {
+                            'test_mean_score': 0.0,
+                            'rollout/enabled': 0,
+                            'rollout/error': f'run_exception:{type(e).__name__}',
+                        }
+                    step_log.update(runner_log)
 
                 # run validation
                 if (self.epoch % cfg.training.val_every) == 0:
@@ -245,7 +299,7 @@ class RobotWorkspace(BaseWorkspace):
                         batch = train_sampling_batch
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
+
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
@@ -256,6 +310,21 @@ class RobotWorkspace(BaseWorkspace):
                         del result
                         del pred_action
                         del mse
+
+                        # same diffusion sampling on one val batch for val action MSE
+                        try:
+                            for val_batch_raw in val_dataloader:
+                                val_batch = dataset.postprocess(val_batch_raw, device)
+                                v_obs = val_batch['obs']
+                                v_gt = val_batch['action']
+                                v_result = policy.predict_action(v_obs)
+                                v_pred = v_result['action_pred']
+                                v_mse = torch.nn.functional.mse_loss(v_pred, v_gt)
+                                step_log['val_action_mse_error'] = v_mse.item()
+                                del val_batch_raw, val_batch, v_obs, v_gt, v_result, v_pred, v_mse
+                                break
+                        except Exception as _e:
+                            print(f"[val_action_mse] skipped: {_e}")
                 
                 # checkpoint
                 if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
@@ -266,11 +335,62 @@ class RobotWorkspace(BaseWorkspace):
                 # ========= eval end for this epoch ==========
                 policy.train()
 
+                # EMA decay snapshot
+                if cfg.training.use_ema and ema is not None:
+                    ema_decay = getattr(ema, 'decay', None)
+                    if ema_decay is None:
+                        ema_decay = float(cfg.ema.max_value)
+                    try:
+                        step_log['ema_decay'] = float(ema_decay)
+                    except Exception:
+                        pass
+
+                # epoch wall-time + samples/sec
+                epoch_elapsed = time.time() - epoch_start_time
+                step_log['epoch_time_sec'] = epoch_elapsed
+                if epoch_elapsed > 0 and epoch_samples > 0:
+                    step_log['samples_per_sec'] = epoch_samples / epoch_elapsed
+
+                # best-so-far via wandb.summary
+                if not hasattr(self, '_best_metrics'):
+                    self._best_metrics = {}
+                for _key, _mode in [
+                    ('val_loss', 'min'),
+                    ('val_action_mse_error', 'min'),
+                    ('train_action_mse_error', 'min'),
+                    ('test_mean_score', 'max'),
+                    ('rollout/success_rate', 'max'),
+                ]:
+                    if _key not in step_log:
+                        continue
+                    _val = step_log[_key]
+                    try:
+                        _val = float(_val)
+                    except Exception:
+                        continue
+                    _best_key = f'best/{_key}'
+                    _cur = self._best_metrics.get(_best_key)
+                    _is_better = (
+                        _cur is None
+                        or (_mode == 'min' and _val < _cur)
+                        or (_mode == 'max' and _val > _cur)
+                    )
+                    if _is_better:
+                        self._best_metrics[_best_key] = _val
+                        try:
+                            wandb.summary[_best_key] = _val
+                            wandb.summary[f'{_best_key}_epoch'] = self.epoch
+                        except Exception:
+                            pass
+
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 json_logger.log(step_log)
+                wandb.log(step_log, step=self.global_step)
                 self.global_step += 1
                 self.epoch += 1
+
+        wandb.finish()
 
 
 class BatchSampler:

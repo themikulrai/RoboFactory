@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>RoboFactory — Dataset Viewer</title>
+<link rel="stylesheet" href="shared/site.css?v={{ build_id }}" />
+<script src="shared/plotly.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>RoboFactory Dataset</h1>
+  <div class="task-picker">
+    <label>Task:
+      <select id="task-select"></select>
+    </label>
+    <button id="prev-task" title="prev task">◀</button>
+    <button id="next-task" title="next task (t)">▶</button>
+    <span id="task-badges"></span>
+  </div>
+</header>
+
+<main>
+  <aside id="episode-panel">
+    <div class="panel-head">
+      <label><input type="checkbox" id="filter-success" /> success only</label>
+      <label><input type="checkbox" id="filter-failure" /> failures only</label>
+      <select id="sort-by">
+        <option value="ep">sort: episode</option>
+        <option value="length">sort: length</option>
+        <option value="jerk">sort: jerk</option>
+      </select>
+    </div>
+    <ul id="episode-list"></ul>
+  </aside>
+
+  <section id="player-panel">
+    <div class="player-head">
+      <span id="episode-title"></span>
+      <span id="episode-meta"></span>
+      <span class="spacer"></span>
+      <button id="prev-ep" title="prev (←)">prev</button>
+      <button id="next-ep" title="next (→)">next</button>
+      <button id="replay-ep" title="replay (r)">replay</button>
+    </div>
+    <video id="player" controls preload="metadata"></video>
+    <video id="preloader" style="display:none" preload="auto"></video>
+    <p class="hint">keys: ← / → prev/next episode · <kbd>r</kbd> replay · <kbd>space</kbd> play/pause · <kbd>t</kbd> next task</p>
+    <div id="fig-path-std" class="plot plot-wide"></div>
+  </section>
+
+  <aside id="stats-panel">
+    <h3>Task stats</h3>
+    <div id="stats-summary"></div>
+    <div id="fig-length" class="plot"></div>
+    <div id="fig-jerk" class="plot"></div>
+    <div id="fig-saturation" class="plot"></div>
+  </aside>
+</main>
+
+<script src="shared/app.js?v={{ build_id }}"></script>
+</body>
+</html>

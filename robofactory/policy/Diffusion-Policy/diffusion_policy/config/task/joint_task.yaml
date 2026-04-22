@@ -1,0 +1,51 @@
+name: joint_task_config
+
+image_shape: &image_shape [3, 240, 320]
+
+shape_meta: &shape_meta
+  obs:
+    head_cam_0:
+      shape: *image_shape
+      type: rgb
+    head_cam_1:
+      shape: *image_shape
+      type: rgb
+    head_cam_2:
+      shape: *image_shape
+      type: rgb
+    head_cam_3:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [32]
+      type: low_dim
+  action:
+    shape: [32]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.robot_joint_image_runner.RobotJointImageRunner
+  env_id: "TakePhoto-rf"
+  config_path: null
+  n_agents: 4
+  data_num: ${eval.data_num}
+  n_eval_episodes: ${eval.n_episodes}
+  n_action_exec: ${eval.n_action_exec}
+  max_episode_steps: 1500
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  test_start_seed: 100000
+  record_video_episodes: [0, 5]
+  fps: 20
+  device: ${training.device}
+
+dataset:
+  _target_: diffusion_policy.dataset.robot_joint_image_dataset.RobotJointImageDataset
+  zarr_path: data/zarr_data/TakePhoto-rf_joint_150.zarr
+  n_agents: 4
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 140
+  batch_size: ${dataloader.batch_size}

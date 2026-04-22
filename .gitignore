@@ -58,3 +58,23 @@ imgui.ini
 htmlcov/
 
 !robofactory/assets/.gitkeep
+
+# Personal/local
+guide
+
+# Heavy / runtime artifacts
+robofactory/logs/
+robofactory/.slurm_scripts/
+robofactory/site
+scripts/feasibility_wrist_replay/rollouts_out
+
+# ML data
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.hdf5
+*.zarr
+wandb/
