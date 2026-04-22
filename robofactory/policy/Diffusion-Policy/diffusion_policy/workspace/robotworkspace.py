@@ -140,7 +140,8 @@ class RobotWorkspace(BaseWorkspace):
         try:
             action_arr = np.asarray(dataset.replay_buffer['action'])
             state_arr = np.asarray(dataset.replay_buffer['state'])
-            head_shape = list(dataset.replay_buffer['head_camera'].shape)
+            _img_key = 'head_camera' if 'head_camera' in dataset.replay_buffer else 'head_camera_0'
+            head_shape = list(dataset.replay_buffer[_img_key].shape)
             wandb.summary['dataset/n_train_episodes'] = int(dataset.train_mask.sum())
             wandb.summary['dataset/n_val_episodes'] = int((~dataset.train_mask).sum())
             wandb.summary['dataset/n_train_samples'] = len(dataset)
@@ -201,9 +202,21 @@ class RobotWorkspace(BaseWorkspace):
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
-                        # compute loss
-                        # pdb.set_trace()
-                        raw_loss = self.model.compute_loss(batch)
+                        # compute loss (optionally under bf16 autocast)
+                        use_bf16 = bool(getattr(cfg.training, 'use_bf16', False))
+                        if use_bf16:
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                raw_loss = self.model.compute_loss(batch)
+                        else:
+                            raw_loss = self.model.compute_loss(batch)
+                        if not torch.isfinite(raw_loss):
+                            print(f"[FATAL] non-finite loss at epoch={self.epoch} step={self.global_step}: {raw_loss.item()}")
+                            try:
+                                wandb.alert(title="non-finite DP loss",
+                                            text=f"epoch {self.epoch} step {self.global_step}")
+                            except Exception:
+                                pass
+                            raise RuntimeError("non-finite training loss")
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -233,6 +246,8 @@ class RobotWorkspace(BaseWorkspace):
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
+                            'samples_seen': self.global_step * int(cfg.dataloader.batch_size),
+                            'wall_time_s': time.time() - epoch_start_time,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
                         if grad_norm is not None:
@@ -321,7 +336,16 @@ class RobotWorkspace(BaseWorkspace):
                                 v_pred = v_result['action_pred']
                                 v_mse = torch.nn.functional.mse_loss(v_pred, v_gt)
                                 step_log['val_action_mse_error'] = v_mse.item()
-                                del val_batch_raw, val_batch, v_obs, v_gt, v_result, v_pred, v_mse
+                                # per-dim val MSE and gt std (per-arm / per-DOF signal)
+                                per_dim_mse = torch.nn.functional.mse_loss(
+                                    v_pred, v_gt, reduction='none'
+                                ).mean(dim=tuple(range(v_pred.ndim - 1)))
+                                for _d in range(per_dim_mse.shape[0]):
+                                    step_log[f'val_action_mse/dim_{_d:02d}'] = per_dim_mse[_d].item()
+                                step_log['val_action_gt_std_mean'] = v_gt.std(
+                                    dim=tuple(range(v_gt.ndim - 1))
+                                ).mean().item()
+                                del val_batch_raw, val_batch, v_obs, v_gt, v_result, v_pred, v_mse, per_dim_mse
                                 break
                         except Exception as _e:
                             print(f"[val_action_mse] skipped: {_e}")
@@ -422,7 +446,7 @@ def create_dataloader(dataset, *, batch_size: int, shuffle: bool, num_workers: i
     def collate(x):
         assert len(x) == 1
         return x[0]
-    dataloader = DataLoader(dataset, collate_fn=collate, sampler=batch_sampler, num_workers=num_workers, pin_memory=False, persistent_workers=persistent_workers)
+    dataloader = DataLoader(dataset, collate_fn=collate, sampler=batch_sampler, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
     return dataloader
 
 @hydra.main(
