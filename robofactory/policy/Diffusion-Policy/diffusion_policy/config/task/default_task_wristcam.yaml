@@ -1,0 +1,48 @@
+name: default_task_wristcam
+
+image_shape: &image_shape [3, 224, 224]
+
+shape_meta: &shape_meta
+  obs:
+    head_cam:
+      shape: *image_shape
+      type: rgb
+    head_cam_global:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [8]
+      type: low_dim
+  action:
+    shape: [8]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.robot_multi_agent_image_runner.RobotMultiAgentImageRunner
+  env_id: "ThreeRobotsStackCube-rf"
+  config_path: null
+  current_agent_id: ${current_agent_id}
+  n_agents: 3
+  data_num: ${eval.data_num}
+  peer_checkpoint_num: ${eval.peer_checkpoint_num}
+  other_ckpt_search_roots: ["data/outputs"]
+  n_eval_episodes: ${eval.n_episodes}
+  n_action_exec: ${eval.n_action_exec}
+  max_episode_steps: 800
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  test_start_seed: 100000
+  record_video_episodes: [0, 5]
+  fps: 20
+  device: ${training.device}
+
+dataset:
+  _target_: diffusion_policy.dataset.robot_image_dataset.RobotImageDataset
+  zarr_path: data/zarr_data/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150.zarr
+  include_global: true
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90
+  batch_size: ${dataloader.batch_size}

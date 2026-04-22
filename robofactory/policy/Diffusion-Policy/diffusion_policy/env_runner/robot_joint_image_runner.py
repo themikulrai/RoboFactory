@@ -1,20 +1,20 @@
 """
 Env runner for the centralised (joint) diffusion policy.
 
-One policy consumes obs from all N arms (separate RGB keys `head_cam_0..head_cam_{N-1}`
-plus a single concatenated `agent_pos` of length 8*N) and emits a (horizon, 8*N)
-action chunk that is split back into N per-arm actions and dispatched via
-`panda-{i}` in the env step call.
+One policy consumes obs from all N arms (separate RGB keys `head_camera_0..head_camera_{N-1}`,
+plus an optional `head_camera_global`, plus a single concatenated `agent_pos` of
+length 8*N) and emits a (horizon, 8*N) action chunk that is split back into N
+per-arm actions and dispatched via `panda-{i}` in the env step call.
 
-This is the minimal baseline runner: raw action execution, no TOPP resync, no
-peer-checkpoint loading. Intended as a head-to-head A/B against the per-arm
-RobotMultiAgentImageRunner on tasks like TakePhoto-rf and LongPipelineDelivery-rf.
+All RGB streams are resized to `resize x resize` to match the training zarr schema
+(default 224).
 """
 import os
 import traceback
 from collections import deque
 from typing import List, Optional
 
+import cv2
 import numpy as np
 import torch
 import tqdm
@@ -25,13 +25,22 @@ except Exception:
     wandb = None
 
 
+CAM_KEY_TPL = {
+    "workspace": "head_camera_agent{i}",
+    "wristcam":  "hand_camera_{i}",
+}
+
+
 class RobotJointImageRunner:
     def __init__(
         self,
         output_dir: str,
-        env_id: str = "TakePhoto-rf",
+        env_id: str = "ThreeRobotsStackCube-rf",
         config_path: Optional[str] = None,
-        n_agents: int = 4,
+        n_agents: int = 3,
+        include_global: bool = True,
+        camera_family: str = "wristcam",
+        resize: int = 224,
         data_num: int = 150,
         n_eval_episodes: int = 10,
         n_action_exec: int = 6,
@@ -48,6 +57,10 @@ class RobotJointImageRunner:
         self.env_id = env_id
         self.config_path = config_path
         self.n_agents = n_agents
+        self.include_global = include_global
+        assert camera_family in CAM_KEY_TPL, f"bad camera_family={camera_family}"
+        self.camera_family = camera_family
+        self.resize = int(resize)
         self.data_num = data_num
         self.n_eval_episodes = n_eval_episodes
         self.n_action_exec = n_action_exec
@@ -72,6 +85,7 @@ class RobotJointImageRunner:
             default_cfg = {
                 "TakePhoto-rf": ("robocasa", "take_photo.yaml"),
                 "LongPipelineDelivery-rf": ("robocasa", "long_pipeline_delivery.yaml"),
+                "ThreeRobotsStackCube-rf": ("robocasa", "three_robots_stack_cube.yaml"),
             }
             if self.env_id not in default_cfg:
                 raise ValueError(
@@ -96,6 +110,11 @@ class RobotJointImageRunner:
 
     # ------------------- obs extraction -------------------
 
+    def _resize_rgb(self, rgb_hwc: np.ndarray) -> np.ndarray:
+        if rgb_hwc.shape[0] == self.resize and rgb_hwc.shape[1] == self.resize:
+            return rgb_hwc
+        return cv2.resize(rgb_hwc, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
+
     @staticmethod
     def _initial_agent_pos_one(raw_obs, agent_id: int) -> np.ndarray:
         qpos = raw_obs["agent"][f"panda-{agent_id}"]["qpos"]
@@ -106,9 +125,15 @@ class RobotJointImageRunner:
         gripper = np.array([1.0], dtype=arm.dtype)
         return np.concatenate([arm, gripper]).astype(np.float32)
 
+    def _pull_rgb(self, raw_obs, key: str) -> np.ndarray:
+        rgb = raw_obs["sensor_data"][key]["rgb"]
+        if hasattr(rgb, "squeeze"):
+            rgb = rgb.squeeze(0)
+        rgb_np = rgb.cpu().numpy() if hasattr(rgb, "cpu") else np.asarray(rgb)
+        rgb_np = self._resize_rgb(rgb_np)
+        return np.moveaxis(rgb_np, -1, 0).astype(np.float32) / 255.0
+
     def _build_obs_dict(self, raw_obs, last_exec: Optional[np.ndarray]) -> dict:
-        # Per-arm state: if we have the previously commanded joint action, use that
-        # (matches the dataset's convention). Otherwise fall back to qpos on reset.
         if last_exec is not None:
             agent_pos = last_exec.astype(np.float32)  # (8*N,)
         else:
@@ -117,12 +142,11 @@ class RobotJointImageRunner:
             ).astype(np.float32)
 
         out = {"agent_pos": agent_pos}
+        tpl = CAM_KEY_TPL[self.camera_family]
         for i in range(self.n_agents):
-            rgb = raw_obs["sensor_data"][f"head_camera_agent{i}"]["rgb"]
-            if hasattr(rgb, "squeeze"):
-                rgb = rgb.squeeze(0)
-            rgb_np = rgb.cpu().numpy() if hasattr(rgb, "cpu") else np.asarray(rgb)
-            out[f"head_cam_{i}"] = np.moveaxis(rgb_np, -1, 0).astype(np.float32) / 255.0
+            out[f"head_camera_{i}"] = self._pull_rgb(raw_obs, tpl.format(i=i))
+        if self.include_global:
+            out["head_camera_global"] = self._pull_rgb(raw_obs, "head_camera_global")
         return out
 
     # ------------------- policy forward -------------------
@@ -139,7 +163,6 @@ class RobotJointImageRunner:
         return out
 
     def _predict_joint_action(self, policy, obs_history: deque) -> np.ndarray:
-        # obs_history is a deque of per-step obs dicts; stack to (n_obs_steps, ...)
         keys = list(obs_history[0].keys())
         stacked = {k: self._stack_last_n([o[k] for o in obs_history], self.n_obs_steps)
                    for k in keys}
@@ -202,8 +225,7 @@ class RobotJointImageRunner:
 
         while steps < self.max_episode_steps:
             joint_action_chunk = self._predict_joint_action(policy, obs_history)
-            # shape (n_action_steps, 8*N) -> split per-arm
-            per_arm = np.split(joint_action_chunk, self.n_agents, axis=1)  # list of (H, 8)
+            per_arm = np.split(joint_action_chunk, self.n_agents, axis=1)
             last_joint = joint_action_chunk[0]
 
             for t in range(min(self.n_action_exec, self.n_action_steps)):

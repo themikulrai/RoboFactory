@@ -1,11 +1,12 @@
 """
 Dataset for the centralised (joint) diffusion policy.
 
-Mirrors robot_image_dataset.RobotImageDataset exactly, except it loads N camera
-streams (`head_camera_0 ... head_camera_{N-1}`) and emits an obs dict with keys
-`head_cam_0 ... head_cam_{N-1}` plus a single `agent_pos` of shape (8*N,).
+Loads N per-arm camera streams (`head_camera_0 ... head_camera_{N-1}`) and an
+optional global camera (`head_camera_global`) plus a single concatenated
+`agent_pos` of shape (8*N,).
 
-The zarr schema is produced by scripts/parse_h5_to_zarr_joint.py.
+The zarr schema is produced by scripts/parse_h5_to_zarr_unified.py
+(--mode joint). All images are stored at 3x224x224 uint8.
 """
 from typing import Dict
 import copy
@@ -25,6 +26,7 @@ class RobotJointImageDataset(BaseImageDataset):
     def __init__(self,
                  zarr_path,
                  n_agents: int,
+                 include_global: bool = False,
                  horizon: int = 1,
                  pad_before: int = 0,
                  pad_after: int = 0,
@@ -34,7 +36,10 @@ class RobotJointImageDataset(BaseImageDataset):
                  max_train_episodes=None):
         super().__init__()
         self.n_agents = n_agents
+        self.include_global = include_global
         cam_keys = [f"head_camera_{i}" for i in range(n_agents)]
+        if include_global:
+            cam_keys.append("head_camera_global")
         keys = cam_keys + ["state", "action"]
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=keys)
 
@@ -79,8 +84,8 @@ class RobotJointImageDataset(BaseImageDataset):
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
-        for i in range(self.n_agents):
-            normalizer[f"head_cam_{i}"] = get_image_range_normalizer()
+        for ck in self.cam_keys:
+            normalizer[ck] = get_image_range_normalizer()
         return normalizer
 
     def __len__(self) -> int:
@@ -89,16 +94,15 @@ class RobotJointImageDataset(BaseImageDataset):
     def _sample_to_data(self, sample):
         agent_pos = sample["state"].astype(np.float32)
         obs = {"agent_pos": agent_pos}
-        for i, ck in enumerate(self.cam_keys):
+        for ck in self.cam_keys:
             # (T, 3, H, W) uint8 -> float32 [0, 1]
-            obs[f"head_cam_{i}"] = sample[ck].astype(np.float32) / 255.0
+            obs[ck] = sample[ck].astype(np.float32) / 255.0
         return {"obs": obs, "action": sample["action"].astype(np.float32)}
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         if isinstance(idx, int):
             sample = self.sampler.sample_sequence(idx)
             data = self._sample_to_data(sample)
-            # to torch
             data["obs"] = {k: torch.from_numpy(v) for k, v in data["obs"].items()}
             data["action"] = torch.from_numpy(data["action"])
             return data

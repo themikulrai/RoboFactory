@@ -14,14 +14,15 @@ import pdb
 
 class RobotImageDataset(BaseImageDataset):
     def __init__(self,
-                 zarr_path, 
+                 zarr_path,
                  horizon=1,
                  pad_before=0,
                  pad_after=0,
                  seed=42,
                  val_ratio=0.0,
                  batch_size=64,
-                 max_train_episodes=None):
+                 max_train_episodes=None,
+                 include_global: bool = False):
         """
         初始化数据集对象，配置采样器，数据缓冲区等。
 
@@ -37,9 +38,13 @@ class RobotImageDataset(BaseImageDataset):
         
         # 加载回放缓存，指定数据键（包括头部摄像头图像、状态和动作）
         super().__init__()
+        self.include_global = include_global
+        rb_keys = ['head_camera', 'state', 'action']
+        if include_global:
+            rb_keys.append('head_camera_global')
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path,
-            keys=['head_camera', 'state', 'action']  # 选择需要的字段
+            keys=rb_keys,
         )
             
         # 生成验证集掩码
@@ -117,9 +122,8 @@ class RobotImageDataset(BaseImageDataset):
         
         # 为不同的相机图像获取归一化器
         normalizer['head_cam'] = get_image_range_normalizer()
-        normalizer['front_cam'] = get_image_range_normalizer()
-        normalizer['left_cam'] = get_image_range_normalizer()
-        normalizer['right_cam'] = get_image_range_normalizer()
+        if self.include_global:
+            normalizer['head_cam_global'] = get_image_range_normalizer()
         return normalizer
 
     def __len__(self) -> int:
@@ -183,30 +187,17 @@ class RobotImageDataset(BaseImageDataset):
             raise ValueError(idx)
 
     def postprocess(self, samples, device):
-        """
-        将采样的数据转换到设备并标准化。
-
-        :param samples: 采样的数据。
-        :param device: PyTorch 设备。
-        :return: 经过标准化后的数据字典
-        """
         agent_pos = samples['state'].to(device, non_blocking=True)
         head_cam = samples['head_camera'].to(device, non_blocking=True) / 255.0
-        # front_cam = samples['front_camera'].to(device, non_blocking=True) / 255.0
-        # left_cam = samples['left_camera'].to(device, non_blocking=True) / 255.0
-        # right_cam = samples['right_camera'].to(device, non_blocking=True) / 255.0
         action = samples['action'].to(device, non_blocking=True)
-        
-        return {
-            'obs': {
-                'head_cam': head_cam,  # B, T, 3, H, W
-                # 'front_cam': front_cam, # B, T, 3, H, W
-                # 'left_cam': left_cam, # B, T, 3, H, W
-                # 'right_cam': right_cam, # B, T, 3, H, W
-                'agent_pos': agent_pos,  # B, T, D
-            },
-            'action': action  # B, T, D
+        obs = {
+            'head_cam': head_cam,  # B, T, 3, H, W
+            'agent_pos': agent_pos,  # B, T, D
         }
+        if self.include_global:
+            obs['head_cam_global'] = samples['head_camera_global'].to(
+                device, non_blocking=True) / 255.0
+        return {'obs': obs, 'action': action}
 
 def _batch_sample_sequence(data: np.ndarray, input_arr: np.ndarray, indices: np.ndarray, idx: np.ndarray, sequence_length: int):
     """
