@@ -1,6 +1,10 @@
 """
 Unified HDF5 -> zarr converter for diffusion-policy training.
 
+Streams episode data directly into zarr arrays so peak RAM stays bounded by
+one episode (~150 MB for LP 4-arm+global). This lets multiple parsers run in
+parallel on a 64 GB login node without OOM.
+
 Produces either:
   * joint zarr   (centralised; one policy over all N arms)
   * per-agent zarr (decentralised; one policy per arm)
@@ -42,6 +46,8 @@ CAM_KEY = {
     "wristcam":  "hand_camera_{i}",
 }
 
+COMPRESSOR = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+
 
 def _resize_batch(rgb_thwc: np.ndarray, size: int) -> np.ndarray:
     """Resize (T, H, W, 3) -> (T, 3, size, size) uint8."""
@@ -55,82 +61,107 @@ def _resize_batch(rgb_thwc: np.ndarray, size: int) -> np.ndarray:
     return np.moveaxis(out, -1, 1).astype(np.uint8, copy=False)
 
 
-def _parse_joint(f, n_agents, cam_family, include_global, resize, load_num):
-    traj_keys = sorted(f.keys(), key=lambda k: int(k.split("_")[1]))[:load_num]
-    per_cam = [[] for _ in range(n_agents)]
-    glob = []
-    actions = []
-    ep_ends = []
+def _measure_total_steps(f, traj_keys, n_agents):
     total = 0
+    for tk in traj_keys:
+        T = f[tk][f"actions/panda-{0}"].shape[0]
+        total += T
+    return total
+
+
+def _create_zarr(out_path, schema, total_steps, resize):
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    root = zarr.group(out_path)
+    data = root.create_group("data")
+    meta = root.create_group("meta")
+
+    def _cam(name):
+        data.create_dataset(
+            name, shape=(total_steps, 3, resize, resize), dtype="uint8",
+            chunks=(100, 3, resize, resize), compressor=COMPRESSOR, overwrite=True,
+        )
+
+    if schema["mode"] == "joint":
+        N = schema["n_agents"]
+        for i in range(N):
+            _cam(f"head_camera_{i}")
+        if schema["include_global"]:
+            _cam("head_camera_global")
+        dim = 8 * N
+        data.create_dataset("action", shape=(total_steps, dim), dtype="float32",
+                            chunks=(100, dim), compressor=COMPRESSOR, overwrite=True)
+        data.create_dataset("state",  shape=(total_steps, dim), dtype="float32",
+                            chunks=(100, dim), compressor=COMPRESSOR, overwrite=True)
+    else:
+        _cam("head_camera")
+        if schema["include_global"]:
+            _cam("head_camera_global")
+        data.create_dataset("action", shape=(total_steps, 8), dtype="float32",
+                            chunks=(100, 8), compressor=COMPRESSOR, overwrite=True)
+        data.create_dataset("state",  shape=(total_steps, 8), dtype="float32",
+                            chunks=(100, 8), compressor=COMPRESSOR, overwrite=True)
+        data.create_dataset("tcp_action", shape=(total_steps, 8), dtype="float32",
+                            chunks=(100, 8), compressor=COMPRESSOR, overwrite=True)
+    return root, data, meta
+
+
+def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resize, total_steps):
     tpl = CAM_KEY[cam_family]
+    cursor = 0
+    episode_ends = []
     for ep_idx, tk in enumerate(traj_keys):
         tr = f[tk]
         acts = [np.asarray(tr[f"actions/panda-{i}"], dtype=np.float32) for i in range(n_agents)]
         T = acts[0].shape[0]
         if not all(a.shape == (T, 8) for a in acts):
-            raise ValueError(f"{tk}: action shapes mismatch {[a.shape for a in acts]}")
+            raise ValueError(f"{tk}: action shapes {[a.shape for a in acts]}")
         joint = np.concatenate(acts, axis=1)  # (T, 8N)
-        actions.append(joint)
+        sl = slice(cursor, cursor + T)
+        data["action"][sl] = joint
+        data["state"][sl] = joint
         for i in range(n_agents):
             rgb = np.asarray(tr[f"obs/sensor_data/{tpl.format(i=i)}/rgb"])
             if rgb.shape[0] < T:
-                raise ValueError(f"{tk}: cam{i} has {rgb.shape[0]} frames, need >= {T}")
-            per_cam[i].append(_resize_batch(rgb[:T], resize))
+                raise ValueError(f"{tk}: cam{i} {rgb.shape[0]} < T={T}")
+            data[f"head_camera_{i}"][sl] = _resize_batch(rgb[:T], resize)
         if include_global:
             gr = np.asarray(tr["obs/sensor_data/head_camera_global/rgb"])
-            glob.append(_resize_batch(gr[:T], resize))
-        total += T
-        ep_ends.append(total)
+            data["head_camera_global"][sl] = _resize_batch(gr[:T], resize)
+        cursor += T
+        episode_ends.append(cursor)
         if (ep_idx + 1) % 10 == 0 or ep_idx == len(traj_keys) - 1:
-            print(f"  ep {ep_idx+1}/{len(traj_keys)}  total_steps={total}", flush=True)
-
-    action_arr = np.concatenate(actions, axis=0)
-    state_arr = action_arr.copy()
-    cam_arrs = [np.concatenate(c, axis=0) for c in per_cam]
-    glob_arr = np.concatenate(glob, axis=0) if include_global else None
-    return {
-        "cams": cam_arrs, "global": glob_arr,
-        "state": state_arr, "action": action_arr,
-        "episode_ends": np.asarray(ep_ends, dtype=np.int64),
-        "mode": "joint",
-    }
+            print(f"  ep {ep_idx+1}/{len(traj_keys)}  total_steps={cursor}", flush=True)
+    assert cursor == total_steps, f"cursor {cursor} != total {total_steps}"
+    return np.asarray(episode_ends, dtype=np.int64)
 
 
-def _parse_per_agent(f, agent_id, cam_family, include_global, resize, load_num):
-    traj_keys = sorted(f.keys(), key=lambda k: int(k.split("_")[1]))[:load_num]
-    head_chunks = []
-    glob_chunks = []
-    act_chunks = []
-    ep_ends = []
-    total = 0
-    cam_key = CAM_KEY[cam_family].format(i=agent_id)
+def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, resize, total_steps):
+    tpl = CAM_KEY[cam_family]
+    cam_key = tpl.format(i=agent_id)
+    cursor = 0
+    episode_ends = []
     for ep_idx, tk in enumerate(traj_keys):
         tr = f[tk]
         act = np.asarray(tr[f"actions/panda-{agent_id}"], dtype=np.float32)
         T = act.shape[0]
         rgb = np.asarray(tr[f"obs/sensor_data/{cam_key}/rgb"])
         if rgb.shape[0] < T:
-            raise ValueError(f"{tk}: cam {cam_key} has {rgb.shape[0]} frames, need >= {T}")
-        head_chunks.append(_resize_batch(rgb[:T], resize))
-        act_chunks.append(act)
+            raise ValueError(f"{tk}: cam {cam_key} {rgb.shape[0]} < T={T}")
+        sl = slice(cursor, cursor + T)
+        data["action"][sl] = act
+        data["state"][sl] = act
+        data["tcp_action"][sl] = act
+        data["head_camera"][sl] = _resize_batch(rgb[:T], resize)
         if include_global:
             gr = np.asarray(tr["obs/sensor_data/head_camera_global/rgb"])
-            glob_chunks.append(_resize_batch(gr[:T], resize))
-        total += T
-        ep_ends.append(total)
+            data["head_camera_global"][sl] = _resize_batch(gr[:T], resize)
+        cursor += T
+        episode_ends.append(cursor)
         if (ep_idx + 1) % 10 == 0 or ep_idx == len(traj_keys) - 1:
-            print(f"  ep {ep_idx+1}/{len(traj_keys)}  total_steps={total}", flush=True)
-
-    head_arr = np.concatenate(head_chunks, axis=0)
-    glob_arr = np.concatenate(glob_chunks, axis=0) if include_global else None
-    action_arr = np.concatenate(act_chunks, axis=0)
-    state_arr = action_arr.copy()
-    return {
-        "head": head_arr, "global": glob_arr,
-        "state": state_arr, "action": action_arr, "tcp_action": action_arr.copy(),
-        "episode_ends": np.asarray(ep_ends, dtype=np.int64),
-        "mode": "per_agent",
-    }
+            print(f"  ep {ep_idx+1}/{len(traj_keys)}  total_steps={cursor}", flush=True)
+    assert cursor == total_steps, f"cursor {cursor} != total {total_steps}"
+    return np.asarray(episode_ends, dtype=np.int64)
 
 
 def main():
@@ -153,51 +184,40 @@ def main():
     if args.mode == "per_agent" and args.agent_id is None:
         ap.error("--agent-id is required for --mode per_agent")
 
-    if os.path.exists(args.out_zarr):
-        shutil.rmtree(args.out_zarr)
-
     print(f"[unified-converter] reading {args.h5_path}")
     print(f"[unified-converter] mode={args.mode} family={args.camera_family} "
           f"global={args.include_global} resize={args.resize}")
     print(f"[unified-converter] writing {args.out_zarr}")
 
+    schema = {
+        "mode": args.mode,
+        "n_agents": args.n_agents,
+        "include_global": args.include_global,
+    }
+
     with h5py.File(args.h5_path, "r") as f:
+        traj_keys = sorted(f.keys(), key=lambda k: int(k.split("_")[1]))[:args.load_num]
+        probe_n = args.n_agents if args.mode == "joint" else 1
+        total_steps = _measure_total_steps(f, traj_keys, probe_n)
+        print(f"[unified-converter] total_steps={total_steps} over {len(traj_keys)} eps")
+
+        root, data, meta = _create_zarr(args.out_zarr, schema, total_steps, args.resize)
+
         if args.mode == "joint":
-            out = _parse_joint(f, args.n_agents, args.camera_family,
-                               args.include_global, args.resize, args.load_num)
+            ep_ends = _stream_joint(
+                f, traj_keys, data, args.n_agents, args.camera_family,
+                args.include_global, args.resize, total_steps)
         else:
-            out = _parse_per_agent(f, args.agent_id, args.camera_family,
-                                   args.include_global, args.resize, args.load_num)
+            ep_ends = _stream_per_agent(
+                f, traj_keys, data, args.agent_id, args.camera_family,
+                args.include_global, args.resize, total_steps)
 
-    root = zarr.group(args.out_zarr)
-    data = root.create_group("data")
-    meta = root.create_group("meta")
-    compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+    meta.create_dataset("episode_ends", data=ep_ends, dtype="int64",
+                        chunks=(len(ep_ends),), compressor=COMPRESSOR, overwrite=True)
 
-    def _save(name, arr, chunk_first=100):
-        data.create_dataset(name, data=arr,
-                            chunks=(chunk_first, *arr.shape[1:]),
-                            dtype=arr.dtype, overwrite=True, compressor=compressor)
-
-    if out["mode"] == "joint":
-        for i, arr in enumerate(out["cams"]):
-            _save(f"head_camera_{i}", arr)
-        if out["global"] is not None:
-            _save("head_camera_global", out["global"])
-    else:
-        _save("head_camera", out["head"])
-        if out["global"] is not None:
-            _save("head_camera_global", out["global"])
-        _save("tcp_action", out["tcp_action"])
-
-    _save("action", out["action"])
-    _save("state", out["state"])
-    meta.create_dataset("episode_ends", data=out["episode_ends"],
-                        dtype="int64", overwrite=True, compressor=compressor)
-
-    total = int(out["episode_ends"][-1]) if len(out["episode_ends"]) else 0
-    print(f"[unified-converter] done. n_eps={len(out['episode_ends'])} "
-          f"total_steps={total} action_dim={out['action'].shape[1]}")
+    action_dim = 8 * args.n_agents if args.mode == "joint" else 8
+    print(f"[unified-converter] done. n_eps={len(ep_ends)} "
+          f"total_steps={total_steps} action_dim={action_dim}")
 
 
 if __name__ == "__main__":
