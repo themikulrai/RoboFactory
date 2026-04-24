@@ -63,11 +63,32 @@ class RobotWorkspace(BaseWorkspace):
         # pdb.set_trace()
 
         # resume training
-        if cfg.training.resume:
+        explicit_load = cfg.training.get('load_ckpt', None) if hasattr(cfg.training, 'get') else None
+        if explicit_load:
+            load_path = pathlib.Path(explicit_load)
+            if not load_path.is_file():
+                raise FileNotFoundError(f"training.load_ckpt does not exist: {load_path}")
+            print(f"Resuming from explicit checkpoint {load_path}")
+            self.load_checkpoint(path=load_path)
+        elif cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+            else:
+                zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem
+                fallback_dir = pathlib.Path('checkpoints') / zarr_stem
+                if fallback_dir.is_dir():
+                    numeric_ckpts = []
+                    for p in fallback_dir.glob('*.ckpt'):
+                        try:
+                            numeric_ckpts.append((int(p.stem), p))
+                        except ValueError:
+                            continue
+                    if numeric_ckpts:
+                        _, latest_num_ckpt = max(numeric_ckpts, key=lambda x: x[0])
+                        print(f"Resuming from fallback checkpoint {latest_num_ckpt}")
+                        self.load_checkpoint(path=latest_num_ckpt)
 
         # configure dataset
         dataset: BaseImageDataset
@@ -186,6 +207,9 @@ class RobotWorkspace(BaseWorkspace):
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
+                if self.epoch >= cfg.training.num_epochs:
+                    print(f"[resume] self.epoch={self.epoch} already at num_epochs={cfg.training.num_epochs}; stopping.")
+                    break
                 step_log = dict()
                 epoch_start_time = time.time()
                 epoch_samples = 0
