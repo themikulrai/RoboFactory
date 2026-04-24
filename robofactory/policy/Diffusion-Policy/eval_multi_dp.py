@@ -91,6 +91,18 @@ class Args:
     max_steps: int = 250
     """Maximum number of steps to run the simulation"""
 
+    ckpt_suffix: str = ""
+    """Suffix inside decent-DP ckpt dir name, e.g. 'd2_wristcam' -> checkpoints/{task}_agent{id}_d2_wristcam_{data_num}/. Empty = stock 'Agent{id}_{data_num}' path."""
+
+    jsonl_path: Optional[str] = None
+    """Path to append per-episode JSON lines; if None a timestamped file under /iris/u/mikulrai/logs/ is created."""
+
+    wandb: bool = False
+    """Enable W&B logging to project 'diffusion-robofactory' job_type='eval'."""
+
+    wandb_tags: str = "eval,baseline,decentralised-dp"
+    """Comma-separated W&B tags."""
+
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
     payload = torch.load(open('./'+checkpoint, 'rb'), pickle_module=dill)
@@ -113,9 +125,14 @@ def get_policy(checkpoint, output_dir, device):
 
 
 class DP:
-    def __init__(self, task_name, checkpoint_num: int, data_num: int, id: int = 0):
-        self.policy = get_policy(f'checkpoints/{task_name}_Agent{id}_{data_num}/{checkpoint_num}.ckpt', None, 'cuda:0')
+    def __init__(self, task_name, checkpoint_num: int, data_num: int, id: int = 0, ckpt_suffix: str = ""):
+        if ckpt_suffix:
+            ckpt_dir = f'checkpoints/{task_name}_agent{id}_{ckpt_suffix}_{data_num}'
+        else:
+            ckpt_dir = f'checkpoints/{task_name}_Agent{id}_{data_num}'
+        self.policy = get_policy(f'{ckpt_dir}/{checkpoint_num}.ckpt', None, 'cuda:0')
         self.runner = DPRunner(output_dir=None)
+        self.ckpt_path = f'{ckpt_dir}/{checkpoint_num}.ckpt'
 
     def update_obs(self, observation):
         self.runner.update_obs(observation)
@@ -127,13 +144,20 @@ class DP:
     def get_last_obs(self):
         return self.runner.obs[-1]
 
-def get_model_input(observation, agent_pos, agent_id):
-    camera_name = 'head_camera' + '_agent' + str(agent_id)
-    head_cam = np.moveaxis(observation['sensor_data'][camera_name]['rgb'].squeeze(0).numpy(), -1, 0) / 255
-    return dict(
-        head_cam = head_cam,
+def _rgb_chw(rgb_tensor):
+    arr = rgb_tensor.squeeze(0).numpy() if hasattr(rgb_tensor, 'numpy') else np.asarray(rgb_tensor).squeeze(0)
+    return np.moveaxis(arr, -1, 0) / 255.0
+
+
+def get_model_input(observation, agent_pos, agent_id, include_global: bool = True):
+    per_agent_key = f'head_camera_agent{agent_id}'
+    out = dict(
+        head_cam = _rgb_chw(observation['sensor_data'][per_agent_key]['rgb']),
         agent_pos = agent_pos,
     )
+    if include_global and 'head_camera_global' in observation['sensor_data']:
+        out['head_cam_global'] = _rgb_chw(observation['sensor_data']['head_camera_global']['rgb'])
+    return out
 
 def main(args: Args):
     np.set_printoptions(suppress=True, precision=5)
