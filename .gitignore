@@ -63,7 +63,9 @@ htmlcov/
 guide
 
 # Heavy / runtime artifacts
-robofactory/logs/
+robofactory/logs
+robofactory/wandb
+robofactory/slurm
 robofactory/.slurm_scripts/
 robofactory/site
 scripts/feasibility_wrist_replay/rollouts_out
