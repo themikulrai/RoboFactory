@@ -5,7 +5,7 @@ scene:
   env:
     scene_idx: 0
     layout_idx: 3  # 0-9
-    style_idx: 3  # 0-11
+    style_idx: 0  # 0-11 (matched visually to HF d2_wristcam training data: wood-plank floor)
     customized_layout: ${CONFIG_DIR}/robocasa/customized_layout.yaml 
   primitives:
     - name: goal_region

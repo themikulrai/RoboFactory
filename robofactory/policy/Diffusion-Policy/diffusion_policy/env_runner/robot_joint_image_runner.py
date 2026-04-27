@@ -52,10 +52,12 @@ class RobotJointImageRunner:
         fps: int = 20,
         device: str = "cuda:0",
         tqdm_interval_sec: float = 5.0,
+        robot_uids: Optional[tuple] = None,
     ):
         self.output_dir = output_dir
         self.env_id = env_id
         self.config_path = config_path
+        self.robot_uids = robot_uids
         self.n_agents = n_agents
         self.include_global = include_global
         assert camera_family in CAM_KEY_TPL, f"bad camera_family={camera_family}"
@@ -106,6 +108,8 @@ class RobotJointImageRunner:
             sim_backend="cpu",
             enable_shadow=True,
         )
+        if self.robot_uids is not None:
+            env_kwargs["robot_uids"] = self.robot_uids
         return gym.make(self.env_id, **env_kwargs)
 
     # ------------------- obs extraction -------------------
@@ -116,8 +120,16 @@ class RobotJointImageRunner:
         return cv2.resize(rgb_hwc, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
 
     @staticmethod
+    def _agent_prefix(raw_obs: dict) -> str:
+        """Infer agent key prefix from obs dict (e.g. 'panda' or 'panda_wristcam_multi')."""
+        keys = list(raw_obs["agent"].keys())
+        # keys look like 'panda-0', 'panda_wristcam_multi-0', etc.
+        return keys[0].rsplit("-", 1)[0]
+
+    @staticmethod
     def _initial_agent_pos_one(raw_obs, agent_id: int) -> np.ndarray:
-        qpos = raw_obs["agent"][f"panda-{agent_id}"]["qpos"]
+        prefix = RobotJointImageRunner._agent_prefix(raw_obs)
+        qpos = raw_obs["agent"][f"{prefix}-{agent_id}"]["qpos"]
         if hasattr(qpos, "squeeze"):
             qpos = qpos.squeeze(0)
         qpos_np = qpos.cpu().numpy() if hasattr(qpos, "cpu") else np.asarray(qpos)
@@ -175,18 +187,18 @@ class RobotJointImageRunner:
     # ------------------- rendering -------------------
 
     @staticmethod
-    def _render_frame(env) -> Optional[np.ndarray]:
+    def _frame_from_obs(raw_obs: dict) -> Optional[np.ndarray]:
         try:
-            frame = env.render()
+            rgb = raw_obs["sensor_data"]["head_camera_global"]["rgb"]
+            if hasattr(rgb, "cpu"):
+                rgb = rgb.cpu().numpy()
+            else:
+                rgb = np.asarray(rgb)
+            while rgb.ndim > 3:
+                rgb = rgb[0]
+            return rgb.astype(np.uint8)
         except Exception:
             return None
-        if hasattr(frame, "cpu"):
-            frame = frame.cpu().numpy()
-        else:
-            frame = np.asarray(frame)
-        while frame.ndim > 3:
-            frame = frame[0]
-        return frame.astype(np.uint8)
 
     @staticmethod
     def _check_success(info: dict) -> bool:
@@ -215,13 +227,14 @@ class RobotJointImageRunner:
 
         frames: List[np.ndarray] = []
         if record_frames:
-            f0 = self._render_frame(env)
+            f0 = self._frame_from_obs(raw_obs)
             if f0 is not None:
                 frames.append(f0)
 
         success = False
         steps = 0
         info: dict = {}
+        action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
 
         while steps < self.max_episode_steps:
             joint_action_chunk = self._predict_joint_action(policy, obs_history)
@@ -230,13 +243,13 @@ class RobotJointImageRunner:
 
             for t in range(min(self.n_action_exec, self.n_action_steps)):
                 action_dict = {
-                    f"panda-{i}": np.asarray(per_arm[i][t], dtype=np.float64)
+                    f"{action_prefix}-{i}": np.asarray(per_arm[i][t], dtype=np.float64)
                     for i in range(self.n_agents)
                 }
                 raw_obs, _, term, trunc, info = env.step(action_dict)
                 steps += 1
                 if record_frames:
-                    fr = self._render_frame(env)
+                    fr = self._frame_from_obs(raw_obs)
                     if fr is not None:
                         frames.append(fr)
                 last_joint = joint_action_chunk[t]

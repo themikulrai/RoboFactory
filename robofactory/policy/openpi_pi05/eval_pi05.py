@@ -69,16 +69,18 @@ class Args:
     num_arms: int = 3
     active_dim: int = 0  # 0 => num_arms * 8
     camera_mapping: str = ""  # path to JSON; empty => DEFAULT_CAMERA_MAPPING
+    robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
+    robot_uids_csv: str = ""  # comma-separated UIDs for gym.make; empty = use default
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
     return float((qpos_step[7] + qpos_step[8]) / 2.0)
 
 
-def _build_state(obs: dict, num_arms: int) -> np.ndarray:
+def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda") -> np.ndarray:
     state_parts: list[np.ndarray] = []
     for i in range(num_arms):
-        q = np.asarray(obs["agent"][f"panda-{i}"]["qpos"]).squeeze()
+        q = np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()
         state_parts.append(q[:7].astype(np.float32))
         state_parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
     return np.concatenate(state_parts).astype(np.float32)
@@ -94,9 +96,9 @@ def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str]) -> dict:
+def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str], robot_uid: str = "panda") -> dict:
     out: dict = {
-        "state": _build_state(obs, num_arms),
+        "state": _build_state(obs, num_arms, robot_uid),
         "prompt": prompt,
     }
     for slot in IMAGE_SLOTS:
@@ -105,7 +107,7 @@ def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, st
 
 
 def _delta_to_absolute_action(
-    chunk_step: np.ndarray, current_qpos_per_arm: list[np.ndarray], num_arms: int
+    chunk_step: np.ndarray, current_qpos_per_arm: list[np.ndarray], num_arms: int, robot_uid: str = "panda"
 ) -> dict:
     """chunk_step: (num_arms*8,) = per-arm [delta_joints(7), gripper(1)]."""
     out: dict[str, np.ndarray] = {}
@@ -114,13 +116,13 @@ def _delta_to_absolute_action(
         delta = chunk_step[s : s + 7]
         gripper = chunk_step[s + 7]
         target = np.concatenate([current_qpos_per_arm[i] + delta, np.array([gripper], dtype=np.float32)])
-        out[f"panda-{i}"] = target.astype(np.float32)
+        out[f"{robot_uid}-{i}"] = target.astype(np.float32)
     return out
 
 
-def _current_qpos_per_arm(obs: dict, num_arms: int) -> list[np.ndarray]:
+def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str = "panda") -> list[np.ndarray]:
     return [
-        np.asarray(obs["agent"][f"panda-{i}"]["qpos"]).squeeze()[:7].astype(np.float32)
+        np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()[:7].astype(np.float32)
         for i in range(num_arms)
     ]
 
@@ -144,13 +146,13 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
 
     for step in range(args.max_env_steps):
         if chunk is None or chunk_idx >= args.replan_after:
-            obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map)
+            obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
             result = policy.infer(obs_dict)
             chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
             chunk_idx = 0
 
-        cur_qpos = _current_qpos_per_arm(obs, args.num_arms)
-        action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms)
+        cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
+        action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, args.robot_uid)
         chunk_idx += 1
 
         obs, reward, terminated, truncated, info = env.step(action_dict)
@@ -180,6 +182,8 @@ def main(args: Args) -> None:
         num_envs=1,
         sim_backend=args.sim_backend,
     )
+    if args.robot_uids_csv:
+        env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
     env = gym.make(args.task, **env_kwargs)
 
     policy = WebsocketClientPolicy(host=args.host, port=args.port)

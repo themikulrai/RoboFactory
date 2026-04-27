@@ -9,6 +9,7 @@ import hydra
 from pathlib import Path
 from collections import deque, defaultdict
 from robofactory.tasks import *
+import robofactory.agents  # register panda_wristcam_multi
 import traceback
 
 import yaml
@@ -103,6 +104,18 @@ class Args:
     wandb_tags: str = "eval,baseline,decentralised-dp"
     """Comma-separated W&B tags."""
 
+    obs_cam_family: str = "workspace"
+    """Which cameras supply 'head_cam' to the policy: 'workspace' (scene-mounted head_camera_agent{i}) or 'wristcam' (robot-mounted hand_camera_{i}). d2_wristcam ckpts require 'wristcam'."""
+
+    include_global: bool = True
+    """Whether to include head_cam_global in the model input. Dataset 1 (default_task.yaml) models were NOT trained with head_cam_global — set --no-include-global for those."""
+
+    img_height: int = 224
+    """Height to resize camera frames before feeding to the policy. Dataset 1 (default_task.yaml) uses 240; Dataset 2 (wristcam) uses 224."""
+
+    img_width: int = 224
+    """Width to resize camera frames before feeding to the policy. Dataset 1 (default_task.yaml) uses 320; Dataset 2 (wristcam) uses 224."""
+
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
     payload = torch.load(open('./'+checkpoint, 'rb'), pickle_module=dill)
@@ -144,28 +157,170 @@ class DP:
     def get_last_obs(self):
         return self.runner.obs[-1]
 
-def _rgb_chw(rgb_tensor):
-    arr = rgb_tensor.squeeze(0).numpy() if hasattr(rgb_tensor, 'numpy') else np.asarray(rgb_tensor).squeeze(0)
-    return np.moveaxis(arr, -1, 0) / 255.0
+import cv2 as _cv2
+
+def _rgb_chw(rgb_tensor, img_h: int = 224, img_w: int = 224):
+    t = rgb_tensor.squeeze(0)
+    arr = t.cpu().numpy() if hasattr(t, 'numpy') else np.asarray(t)
+    # arr is HxWx3 uint8; cv2.resize takes (width, height)
+    if arr.shape[0] != img_h or arr.shape[1] != img_w:
+        arr = _cv2.resize(arr, (img_w, img_h), interpolation=_cv2.INTER_AREA)
+    return np.moveaxis(arr, -1, 0).astype(np.float32) / 255.0
 
 
-def get_model_input(observation, agent_pos, agent_id, include_global: bool = True):
-    per_agent_key = f'head_camera_agent{agent_id}'
+_CAM_TPL = {"workspace": "head_camera_agent{i}", "wristcam": "hand_camera_{i}"}
+
+
+def get_model_input(observation, agent_pos, agent_id, include_global: bool = True, cam_family: str = "workspace", img_h: int = 224, img_w: int = 224):
+    sd = observation['sensor_data']
+    per_agent_key = _CAM_TPL[cam_family].format(i=agent_id)
+    if per_agent_key not in sd:
+        raise KeyError(f"sensor_data missing {per_agent_key}; available={list(sd.keys())}")
     out = dict(
-        head_cam = _rgb_chw(observation['sensor_data'][per_agent_key]['rgb']),
+        head_cam = _rgb_chw(sd[per_agent_key]['rgb'], img_h=img_h, img_w=img_w),
         agent_pos = agent_pos,
     )
-    if include_global and 'head_camera_global' in observation['sensor_data']:
-        out['head_cam_global'] = _rgb_chw(observation['sensor_data']['head_camera_global']['rgb'])
+    if include_global:
+        if 'head_camera_global' not in sd:
+            raise KeyError(f"sensor_data missing head_camera_global; available={list(sd.keys())}")
+        out['head_cam_global'] = _rgb_chw(sd['head_camera_global']['rgb'], img_h=img_h, img_w=img_w)
     return out
 
+def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix='panda', action_prefix='panda', video_path: str = None):
+    """Run one episode. Returns dict(success, steps, wallclock_s, infer_ms_per_arm, vram_peak_mb)."""
+    import time as _t
+    torch.cuda.reset_peak_memory_stats()
+    t_ep = _t.perf_counter()
+    raw_obs, _ = env.reset(seed=seed)
+    if env.action_space is not None:
+        env.action_space.seed(seed)
+    if args.render_mode is not None:
+        viewer = env.render()
+        if isinstance(viewer, sapien.utils.Viewer):
+            viewer.paused = args.pause
+        env.render()
+    # Reset DP runners' obs deque and planner gripper state
+    for m in dp_models:
+        m.runner.reset_obs()
+    try:
+        from robofactory.planner.motionplanner import OPEN
+        planner.gripper_state = [OPEN] * agent_num
+    except Exception:
+        pass
+    # Seed planner state
+    for id in range(agent_num):
+        initial_qpos = raw_obs['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+        initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
+        obs_dict = get_model_input(raw_obs, initial_qpos, id, include_global=args.include_global, cam_family=args.obs_cam_family, img_h=args.img_height, img_w=args.img_width)
+        dp_models[id].update_obs(obs_dict)
+
+    infer_times_ms = [[] for _ in range(agent_num)]
+    cnt = 0
+    success = False
+    info = {}
+    _video_frames = []
+    while True:
+        if verbose:
+            print("Iteration:", cnt)
+        cnt += 1
+        if cnt > args.max_steps:
+            break
+        action_dict = defaultdict(list)
+        action_step_dict = defaultdict(list)
+        for id in range(agent_num):
+            t0 = _t.perf_counter()
+            action_list = dp_models[id].get_action()
+            infer_times_ms[id].append((_t.perf_counter() - t0) * 1000.0)
+            for i in range(6):
+                now_action = action_list[i]
+                raw_obs = env.get_obs()
+                if i == 0:
+                    current_qpos = raw_obs['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+                else:
+                    current_qpos = action_list[i - 1][:-1]
+                path = np.vstack((current_qpos, now_action[:-1]))
+                try:
+                    times, position, right_vel, acc, duration = planner.planner[id].TOPP(path, 0.05, verbose=True)
+                except Exception as e:
+                    # TOPP fails on near-zero or degenerate paths; fall back to executing
+                    # the policy target directly (1 env step) rather than freezing in place.
+                    action_dict[f'{action_prefix}-{id}'].append(now_action)
+                    action_step_dict[f'{action_prefix}-{id}'].append(1)
+                    continue
+                n_step = position.shape[0]
+                action_step_dict[f'{action_prefix}-{id}'].append(n_step)
+                gripper_state = now_action[-1]
+                if n_step == 0:
+                    action_dict[f'{action_prefix}-{id}'].append(now_action)
+                for j in range(n_step):
+                    true_action = np.hstack([position[j], gripper_state])
+                    action_dict[f'{action_prefix}-{id}'].append(true_action)
+
+        start_idx = [0 for _ in range(agent_num)]
+        for i in range(6):
+            max_step = 0
+            for id in range(agent_num):
+                max_step = max(max_step, action_step_dict[f'{action_prefix}-{id}'][i])
+            for j in range(max_step):
+                true_action = dict()
+                for id in range(agent_num):
+                    now_step = min(j, action_step_dict[f'{action_prefix}-{id}'][i] - 1)
+                    true_action[f'{action_prefix}-{id}'] = action_dict[f'{action_prefix}-{id}'][start_idx[id] + now_step]
+                observation, reward, terminated, truncated, info = env.step(true_action)
+                if video_path is not None:
+                    _gframe = observation['sensor_data'].get('head_camera_global', {}).get('rgb')
+                    if _gframe is not None:
+                        _f = _gframe[0]
+                        if hasattr(_f, 'cpu'): _f = _f.cpu().numpy()
+                        _video_frames.append(_f.astype(np.uint8))
+                if verbose:
+                    env.render_human()
+            if verbose:
+                print(true_action)
+                print("max_step", max_step)
+            for id in range(agent_num):
+                start_idx[id] += action_step_dict[f'{action_prefix}-{id}'][i]
+                if action_step_dict[f'{action_prefix}-{id}'][i] == 0:
+                    continue
+                obs_dict = get_model_input(observation, true_action[f'{action_prefix}-{id}'], id, include_global=args.include_global, cam_family=args.obs_cam_family, img_h=args.img_height, img_w=args.img_width)
+                dp_models[id].update_obs(obs_dict)
+        if verbose:
+            print("info", info)
+        if args.render_mode is not None:
+            env.render()
+        if info.get('success', False) == True:
+            success = True
+            break
+
+    if video_path is not None and _video_frames:
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        h, w = _video_frames[0].shape[:2]
+        vw = _cv2.VideoWriter(video_path, _cv2.VideoWriter_fourcc(*'mp4v'), 20, (w, h))
+        for _f in _video_frames:
+            vw.write(_cv2.cvtColor(_f, _cv2.COLOR_RGB2BGR))
+        vw.release()
+    wallclock = _t.perf_counter() - t_ep
+    vram_peak_mb = torch.cuda.max_memory_allocated() / 1e6
+    infer_ms_mean = [float(np.mean(v)) if v else 0.0 for v in infer_times_ms]
+    return dict(
+        seed=int(seed),
+        success=int(success),
+        steps=int(cnt - 1),
+        wallclock_s=round(wallclock, 3),
+        infer_ms_mean_per_arm=[round(x, 2) for x in infer_ms_mean],
+        vram_peak_mb=round(vram_peak_mb, 1),
+    )
+
+
 def main(args: Args):
+    import time, json, subprocess, socket
+    from datetime import datetime
     np.set_printoptions(suppress=True, precision=5)
     verbose = not args.quiet
     if isinstance(args.seed, int):
         args.seed = [args.seed]
-    if args.seed is not None:
-        np.random.seed(args.seed[0])
+    seeds = list(args.seed) if args.seed is not None else [10000]
+    np.random.seed(seeds[0])
     parallel_in_single_scene = args.render_mode == "human"
     if args.render_mode == "human" and args.obs_mode in ["sensor_data", "rgb", "rgbd", "depth", "point_cloud"]:
         print("Disabling parallel single scene/GUI render as observation mode is a visual one. Change observation mode to state or state_dict to see a parallel env render")
@@ -178,7 +333,7 @@ def main(args: Args):
             config = yaml.safe_load(f)
             env_id = config['task_name'] + '-rf'
     env_kwargs = dict(
-        config=args.config, 
+        config=args.config,
         obs_mode=args.obs_mode,
         reward_mode=args.reward_mode,
         control_mode=args.control_mode,
@@ -195,11 +350,11 @@ def main(args: Args):
         env_kwargs["robot_uids"] = tuple(args.robot_uids.split(","))
     env: BaseEnv = gym.make(env_id, **env_kwargs)
 
-    record_dir = args.record_dir + '/' + str(args.seed) + '_' + str(args.data_num) + '_' + str(args.checkpoint_num)
-    if record_dir:
-        record_dir = record_dir.format(env_id=env_id)
-        env = RecordEpisodeMA(env, record_dir, info_on_video=False, save_trajectory=False, max_steps_per_video=30000)
-    raw_obs, _ = env.reset(seed=args.seed[0])
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    record_root = args.record_dir.format(env_id=env_id) + f'/eval_{ts}_data{args.data_num}_ckpt{args.checkpoint_num}'
+    env = RecordEpisodeMA(env, record_root, info_on_video=False, save_trajectory=False, save_video=False, max_steps_per_video=30000)
+
+    raw_obs, _ = env.reset(seed=seeds[0])
     planner = PandaArmMotionPlanningSolver(
         env,
         debug=False,
@@ -210,99 +365,101 @@ def main(args: Args):
         is_multi_agent=True
     )
 
-    # Load multi dp policy
+    # Load decentralised DP policies once (reused across all seeds)
     agent_num = planner.agent_num
     dp_models = []
     for i in range(agent_num):
-        dp_models.append(DP(env_id, args.checkpoint_num, args.data_num, id=i))
+        dp_models.append(DP(env_id, args.checkpoint_num, args.data_num, id=i, ckpt_suffix=args.ckpt_suffix))
+    print(f"Loaded {agent_num} decentralised DP policies. VRAM now: {torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
 
-    if args.seed is not None and env.action_space is not None:
-        env.action_space.seed(args.seed[0])
-    if args.render_mode is not None:
-        viewer = env.render()
-        if isinstance(viewer, sapien.utils.Viewer):
-            viewer.paused = args.pause
-        env.render()
-    for id in range(agent_num):
-        initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].numpy()
-        initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
-        obs = get_model_input(raw_obs, initial_qpos, id)
-        dp_models[id].update_obs(obs)
-    cnt = 0
-    while True:
-        if verbose:
-            print("Iteration:", cnt)
-        cnt = cnt + 1
-        if cnt > args.max_steps:
-            break
-        action_dict = defaultdict(list)
-        action_step_dict = defaultdict(list)
-        for id in range(agent_num):
-            action_list = dp_models[id].get_action()
-            for i in range(6):
-                now_action = action_list[i]
-                raw_obs = env.get_obs()
-                if i == 0:
-                    current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].numpy()
-                else:
-                    current_qpos = action_list[i - 1][:-1]
-                path = np.vstack((current_qpos, now_action[:-1]))
-                try:
-                    times, position, right_vel, acc, duration = planner.planner[id].TOPP(path, 0.05, verbose=True)
-                except Exception as e:
-                    print(f"Error occurred: {e}")
-                    action_now = np.hstack([current_qpos, now_action[-1]])
-                    action_dict[f'panda-{id}'].append(action_now)
-                    action_step_dict[f'panda-{id}'].append(1)
-                    continue
-                n_step = position.shape[0]
-                action_step_dict[f'panda-{id}'].append(n_step)
-                gripper_state = now_action[-1]
-                if n_step == 0:
-                    action_now = np.hstack([current_qpos, gripper_state])
-                    action_dict[f'panda-{id}'].append(action_now)
-                for j in range(n_step):
-                    true_action = np.hstack([position[j], gripper_state])
-                    action_dict[f'panda-{id}'].append(true_action)
-        
-        start_idx = []
-        for id in range(agent_num):
-            start_idx.append(0)
-        for i in range(6):
-            max_step = 0
-            for id in range(agent_num):
-                max_step = max(max_step, action_step_dict[f'panda-{id}'][i])
-            for j in range(max_step):
-                true_action = dict()
-                for id in range(agent_num):
-                    now_step = min(j, action_step_dict[f'panda-{id}'][i] - 1)
-                    true_action[f'panda-{id}'] = action_dict[f'panda-{id}'][start_idx[id] + now_step]
-                observation, reward, terminated, truncated, info = env.step(true_action)
-                if verbose:
-                    env.render_human()
-            if verbose:
-                print(true_action)
-                print("max_step", max_step)
-            for id in range(agent_num):
-                start_idx[id] += action_step_dict[f'panda-{id}'][i]
-                if action_step_dict[f'panda-{id}'][i] == 0:
-                    continue
-                obs = get_model_input(observation, true_action[f'panda-{id}'], id)
-                dp_models[id].update_obs(obs)
-        if verbose:
-            print("info", info)
-        if args.render_mode is not None:
-            env.render()
-        if info['success'] == True:
-            env.close()
-            if record_dir:
-                print(f"Saving video to {record_dir}")
-            print("success")
-            return
-    env.close() 
-    if record_dir:
-        print(f"Saving video to {record_dir}")
-    print("failed")
+    # agent_prefix: used for obs dict keys (e.g. raw_obs['agent']['panda_wristcam_multi-0'])
+    try:
+        agent_prefix = env.unwrapped.agent.agents[0].uid
+    except Exception:
+        agent_prefix = 'panda'
+    # action_prefix: used for env.step() dict keys — ManiSkill uses URDF body name ('panda'),
+    # NOT the registered agent uid, so derive it from the actual action space keys.
+    action_prefix = list(env.action_space.spaces.keys())[0].rsplit('-', 1)[0]
+    print(f"agent_prefix='{agent_prefix}' action_prefix='{action_prefix}'", flush=True)
+
+    # Provenance + sinks
+    try:
+        git_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/iris/u/mikulrai/projects/RoboFactory').decode().strip()
+    except Exception:
+        git_sha = 'unknown'
+    jsonl_path = args.jsonl_path or f'/iris/u/mikulrai/logs/eval_{env_id}_ckpt{args.checkpoint_num}_{ts}.jsonl'
+    os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+    manifest = dict(
+        task=env_id, scene_config=args.config,
+        data_num=args.data_num, checkpoint_num=args.checkpoint_num,
+        ckpt_suffix=args.ckpt_suffix,
+        ckpt_paths=[m.ckpt_path for m in dp_models],
+        max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
+        sim_backend=args.sim_backend, obs_mode=args.obs_mode,
+        git_sha=git_sha, host=socket.gethostname(),
+        start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
+    )
+    with open(jsonl_path, 'w') as f:
+        f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
+    print('MANIFEST:', json.dumps(manifest, indent=2), flush=True)
+
+    # Optional W&B
+    wandb_run = None
+    if args.wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project='diffusion-robofactory', job_type='eval',
+            name=f'eval_decent_{env_id}_ckpt{args.checkpoint_num}_{ts}',
+            group=f'eval_decent_{env_id}_ckpt{args.checkpoint_num}',
+            tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
+            config=manifest,
+        )
+
+    # Seed loop (reuses env + policies)
+    results = []
+    for idx, seed in enumerate(seeds):
+        video_path = os.path.join(record_root, f'seed{seed:07d}_global.mp4')
+        metrics = run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix=agent_prefix, action_prefix=action_prefix, video_path=video_path)
+        metrics['episode_idx'] = idx
+        results.append(metrics)
+        with open(jsonl_path, 'a') as f:
+            f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
+        if wandb_run is not None:
+            wandb.log({
+                'episode/success': metrics['success'],
+                'episode/steps': metrics['steps'],
+                'episode/wallclock_s': metrics['wallclock_s'],
+                'episode/vram_peak_mb': metrics['vram_peak_mb'],
+                'episode/seed': metrics['seed'],
+                **{f'episode/infer_ms_arm{i}': v for i, v in enumerate(metrics['infer_ms_mean_per_arm'])},
+            })
+        n_succ = sum(r['success'] for r in results)
+        print(f"[seed {seed}] success={metrics['success']} steps={metrics['steps']} wallclock={metrics['wallclock_s']}s vram_mb={metrics['vram_peak_mb']} | running SR {n_succ}/{len(results)} = {100.0*n_succ/len(results):.2f}%", flush=True)
+
+    env.close()
+
+    # Aggregate
+    n_total = len(results)
+    n_succ = sum(r['success'] for r in results)
+    sr = n_succ / n_total if n_total else 0.0
+    # Wilson 95% CI half-width approximation via normal
+    from math import sqrt
+    ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
+    steps_succ = [r['steps'] for r in results if r['success']]
+    mean_steps_succ = float(np.mean(steps_succ)) if steps_succ else float('nan')
+    summary = dict(
+        n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
+        mean_steps_on_success=mean_steps_succ,
+        mean_episode_wallclock_s=float(np.mean([r['wallclock_s'] for r in results])) if results else 0.0,
+    )
+    with open(jsonl_path, 'a') as f:
+        f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+    print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
+    if wandb_run is not None:
+        wandb.log({f'summary/{k}': v for k, v in summary.items()})
+        wandb_run.finish()
+    # Preserve legacy stdout marker for eval_multi.sh compatibility (last line parse)
+    print('success' if sr > 0 else 'failed')
 
 if __name__ == "__main__":
     parsed_args = tyro.cli(Args)
