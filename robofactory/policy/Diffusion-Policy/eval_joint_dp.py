@@ -53,6 +53,12 @@ class Args:
     camera_family: str = "workspace"
     """'workspace' for D1 (head_camera_agent{i}) or 'wristcam' for D2 (hand_camera_{i})."""
 
+    env_id: str = "ThreeRobotsStackCube-rf"
+    """Registered env id; e.g. 'ThreeRobotsStackCube-rf' (3 arms) or 'LongPipelineDelivery-rf' (4 arms)."""
+
+    n_agents: int = 3
+    """Number of arms; 3 for TSC, 4 for LongPipelineDelivery."""
+
     robot_uids: Optional[str] = None
     """Comma-separated robot UIDs to override env defaults. D2 wristcam requires 'panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi'."""
 
@@ -124,9 +130,9 @@ def main(args: Args):
     robot_uids_tuple = tuple(args.robot_uids.split(",")) if args.robot_uids else None
     runner = RobotJointImageRunner(
         output_dir=None,
-        env_id="ThreeRobotsStackCube-rf",
+        env_id=args.env_id,
         config_path=args.config,
-        n_agents=3,
+        n_agents=args.n_agents,
         include_global=True,
         camera_family=args.camera_family,
         resize=224,
@@ -139,7 +145,7 @@ def main(args: Args):
     env = runner._make_env()
 
     dataset_tag = "d1" if args.camera_family == "workspace" else "d2"
-    env_id = "ThreeRobotsStackCube-rf"
+    env_id = args.env_id
     record_root = args.record_dir.format(env_id=env_id) + f"/eval_{ts}_{dataset_tag}_ckpt{os.path.basename(args.ckpt_path).replace('.ckpt','')}"
 
     try:

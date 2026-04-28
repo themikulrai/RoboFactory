@@ -49,22 +49,42 @@ CAM_KEY = {
 COMPRESSOR = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
 
 
-def _resize_batch(rgb_thwc: np.ndarray, size: int) -> np.ndarray:
-    """Resize (T, H, W, 3) -> (T, 3, size, size) uint8."""
+def _resize_batch(rgb_thwc: np.ndarray, size) -> np.ndarray:
+    """Resize (T, H, W, 3) -> (T, 3, out_h, out_w) uint8.
+
+    `size` is either an int (square out_h=out_w=size) or (out_h, out_w) tuple.
+    """
+    out_h, out_w = (size, size) if isinstance(size, int) else size
     T, H, W, _ = rgb_thwc.shape
-    if H == size and W == size:
+    if H == out_h and W == out_w:
         out = rgb_thwc
     else:
-        out = np.empty((T, size, size, 3), dtype=np.uint8)
+        out = np.empty((T, out_h, out_w, 3), dtype=np.uint8)
         for t in range(T):
-            out[t] = cv2.resize(rgb_thwc[t], (size, size), interpolation=cv2.INTER_AREA)
+            out[t] = cv2.resize(rgb_thwc[t], (out_w, out_h), interpolation=cv2.INTER_AREA)
     return np.moveaxis(out, -1, 1).astype(np.uint8, copy=False)
+
+
+def _action_key(tr, agent_id):
+    """Multi-agent format: actions/panda-{i}; single-agent: actions."""
+    if "actions/panda-0" in tr:
+        return f"actions/panda-{agent_id}"
+    return "actions"
+
+
+def _camera_key(tr, family, agent_id):
+    """Multi-agent: head_camera_agent{i}; single-agent: head_camera."""
+    multi = CAM_KEY[family].format(i=agent_id)
+    if f"obs/sensor_data/{multi}" in tr:
+        return multi
+    return "head_camera" if family == "workspace" else f"hand_camera_{agent_id}"
 
 
 def _measure_total_steps(f, traj_keys, n_agents):
     total = 0
     for tk in traj_keys:
-        T = f[tk][f"actions/panda-{0}"].shape[0]
+        tr = f[tk]
+        T = tr[_action_key(tr, 0)].shape[0]
         total += T
     return total
 
@@ -76,10 +96,12 @@ def _create_zarr(out_path, schema, total_steps, resize):
     data = root.create_group("data")
     meta = root.create_group("meta")
 
+    out_h, out_w = (resize, resize) if isinstance(resize, int) else resize
+
     def _cam(name):
         data.create_dataset(
-            name, shape=(total_steps, 3, resize, resize), dtype="uint8",
-            chunks=(100, 3, resize, resize), compressor=COMPRESSOR, overwrite=True,
+            name, shape=(total_steps, 3, out_h, out_w), dtype="uint8",
+            chunks=(100, 3, out_h, out_w), compressor=COMPRESSOR, overwrite=True,
         )
 
     if schema["mode"] == "joint":
@@ -137,14 +159,13 @@ def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resi
 
 
 def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, resize, total_steps):
-    tpl = CAM_KEY[cam_family]
-    cam_key = tpl.format(i=agent_id)
     cursor = 0
     episode_ends = []
     for ep_idx, tk in enumerate(traj_keys):
         tr = f[tk]
-        act = np.asarray(tr[f"actions/panda-{agent_id}"], dtype=np.float32)
+        act = np.asarray(tr[_action_key(tr, agent_id)], dtype=np.float32)
         T = act.shape[0]
+        cam_key = _camera_key(tr, cam_family, agent_id)
         rgb = np.asarray(tr[f"obs/sensor_data/{cam_key}/rgb"])
         if rgb.shape[0] < T:
             raise ValueError(f"{tk}: cam {cam_key} {rgb.shape[0]} < T={T}")
@@ -175,7 +196,10 @@ def main():
                     help="required for --mode per_agent")
     ap.add_argument("--camera-family", choices=["workspace", "wristcam"], required=True)
     ap.add_argument("--include-global", action="store_true")
-    ap.add_argument("--resize", type=int, default=224)
+    ap.add_argument("--resize", type=int, default=224,
+                    help="square resize (ignored if --resize-h and --resize-w are set)")
+    ap.add_argument("--resize-h", type=int, default=None)
+    ap.add_argument("--resize-w", type=int, default=None)
     ap.add_argument("--load-num", type=int, default=150)
     args = ap.parse_args()
 
@@ -183,10 +207,13 @@ def main():
         ap.error("--n-agents is required for --mode joint")
     if args.mode == "per_agent" and args.agent_id is None:
         ap.error("--agent-id is required for --mode per_agent")
+    if (args.resize_h is None) ^ (args.resize_w is None):
+        ap.error("--resize-h and --resize-w must be set together")
+    resize = (args.resize_h, args.resize_w) if args.resize_h is not None else args.resize
 
     print(f"[unified-converter] reading {args.h5_path}")
     print(f"[unified-converter] mode={args.mode} family={args.camera_family} "
-          f"global={args.include_global} resize={args.resize}")
+          f"global={args.include_global} resize={resize}")
     print(f"[unified-converter] writing {args.out_zarr}")
 
     schema = {
@@ -201,16 +228,16 @@ def main():
         total_steps = _measure_total_steps(f, traj_keys, probe_n)
         print(f"[unified-converter] total_steps={total_steps} over {len(traj_keys)} eps")
 
-        root, data, meta = _create_zarr(args.out_zarr, schema, total_steps, args.resize)
+        root, data, meta = _create_zarr(args.out_zarr, schema, total_steps, resize)
 
         if args.mode == "joint":
             ep_ends = _stream_joint(
                 f, traj_keys, data, args.n_agents, args.camera_family,
-                args.include_global, args.resize, total_steps)
+                args.include_global, resize, total_steps)
         else:
             ep_ends = _stream_per_agent(
                 f, traj_keys, data, args.agent_id, args.camera_family,
-                args.include_global, args.resize, total_steps)
+                args.include_global, resize, total_steps)
 
     meta.create_dataset("episode_ends", data=ep_ends, dtype="int64",
                         chunks=(len(ep_ends),), compressor=COMPRESSOR, overwrite=True)
