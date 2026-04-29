@@ -42,3 +42,33 @@ PY
 
 # Smoke test
 python -c "import sapien; print('sapien import OK')"
+
+# Also install the conda activate.d hook (survives pip reinstalls)
+ENV_DIR="$(python -c 'import sys; print(sys.prefix)')"
+ACTIVATE_D="$ENV_DIR/etc/conda/activate.d"
+DEACTIVATE_D="$ENV_DIR/etc/conda/deactivate.d"
+mkdir -p "$ACTIVATE_D" "$DEACTIVATE_D"
+
+cat > "$ACTIVATE_D/vulkan_icd.sh" <<'HOOK'
+#!/usr/bin/env bash
+export _CONDA_RF_ORIG_VK_ICD="${VK_ICD_FILENAMES:-__UNSET__}"
+if [ -z "${VK_ICD_FILENAMES:-}" ]; then
+    if [ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]; then
+        :
+    elif [ -f /etc/vulkan/icd.d/nvidia_icd.json ]; then
+        export VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
+    fi
+fi
+HOOK
+
+cat > "$DEACTIVATE_D/vulkan_icd.sh" <<'HOOK'
+#!/usr/bin/env bash
+if [ "${_CONDA_RF_ORIG_VK_ICD:-__UNSET__}" = "__UNSET__" ]; then
+    unset VK_ICD_FILENAMES
+else
+    export VK_ICD_FILENAMES="$_CONDA_RF_ORIG_VK_ICD"
+fi
+unset _CONDA_RF_ORIG_VK_ICD
+HOOK
+
+echo "activate.d hook installed at $ACTIVATE_D/vulkan_icd.sh"
