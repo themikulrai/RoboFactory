@@ -31,6 +31,7 @@ import tyro
 from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
+import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
 
 
 DEFAULT_PROMPT = "stack the three cubes using three robot arms"
@@ -58,6 +59,8 @@ class Args:
     prompt: str = DEFAULT_PROMPT
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
+    video_dir: str = ""  # if set, save mp4 per episode (global cam)
+    run_id: str = ""  # disambiguates videos across runs; "" => $SLURM_JOB_ID or unix-ts
     num_arms: int = 3
     camera_mapping: str = ""
     robot_uid: str = "panda_wristcam_multi"
@@ -104,6 +107,27 @@ def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str) -> list[np.n
     ]
 
 
+def _write_mp4(path: str, frames: list[np.ndarray]) -> None:
+    import cv2
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    h, w = frames[0].shape[:2]
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w, h))
+    for f in frames:
+        vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    vw.release()
+
+
+def _resolve_run_id(run_id: str) -> str:
+    import os
+    if run_id:
+        return run_id
+    return os.environ.get("SLURM_JOB_ID") or str(int(time.time()))
+
+
+def _video_filename(task: str, run_id: str, seed_base: int, ep_i: int) -> str:
+    return f"{task}_run{run_id}_seed{seed_base}_ep{ep_i:03d}.mp4"
+
+
 def _resolve_camera_mapping(path: str) -> dict[str, str]:
     if not path:
         return dict(DEFAULT_CAMERA_MAPPING)
@@ -114,7 +138,7 @@ def _resolve_camera_mapping(path: str) -> dict[str, str]:
     return {slot: mapping[slot] for slot in IMAGE_SLOTS}
 
 
-def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: int) -> dict:
+def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: int, action_prefix: str, video_path: str = "") -> dict:
     """Run one episode with 3 per-arm policy servers."""
     obs, _ = env.reset(seed=seed)
     success = False
@@ -122,8 +146,12 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
 
     chunks: list[np.ndarray | None] = [None] * args.num_arms
     chunk_idxs: list[int] = [args.replan_after] * args.num_arms
+    video_frames: list[np.ndarray] = []
+    global_cam = cam_map["base_0_rgb_raw"]
 
     for step in range(args.max_env_steps):
+        if video_path:
+            video_frames.append(_extract_image(obs, global_cam))
         # Replan arms whose chunk is exhausted
         obs_dict = None
         for i in range(args.num_arms):
@@ -141,7 +169,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
             delta = step_i[:7]
             gripper = step_i[7]
             target = np.concatenate([cur_qpos[i] + delta, np.array([gripper], dtype=np.float32)])
-            action_dict[f"{args.robot_uid}-{i}"] = target.astype(np.float32)
+            action_dict[f"{action_prefix}-{i}"] = target.astype(np.float32)
             chunk_idxs[i] += 1
 
         obs, _, terminated, truncated, info = env.step(action_dict)
@@ -151,6 +179,9 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
         success = bool(succ_field)
         if success or terminated or truncated:
             break
+
+    if video_path and video_frames:
+        _write_mp4(video_path, video_frames)
 
     return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
 
@@ -175,18 +206,26 @@ def main(args: Args) -> None:
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
     env = gym.make(args.task, **env_kwargs)
+    # ManiSkill uses URDF body name (e.g. "panda") for action_space keys but the
+    # registered agent uid (e.g. "panda_wristcam_multi") for obs["agent"] keys.
+    action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
+    print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}'", flush=True)
 
     policies = [WebsocketClientPolicy(host=args.host, port=p) for p in ports]
     for i, p in enumerate(policies):
         print(f"[arm{i}] server metadata: {p.get_server_metadata()}")
     print(f"num_arms={args.num_arms} ports={ports} cam_map={cam_map}")
 
+    run_id = _resolve_run_id(args.run_id)
     results: list[dict] = []
     for seed in seeds:
         for ep_i in range(args.num_episodes):
             ep_seed = seed * 100_000 + ep_i
+            video_path = ""
+            if args.video_dir:
+                video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
             try:
-                r = run_episode(env, policies, args, cam_map, ep_seed)
+                r = run_episode(env, policies, args, cam_map, ep_seed, action_prefix, video_path)
             except Exception as e:  # noqa: BLE001
                 r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
             results.append(r)

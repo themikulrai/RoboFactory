@@ -56,6 +56,10 @@ class TableSceneBuilder(RFSceneBuilder):
                     )
                     initial_ppos = asset_cfg['pos']['ppos']['p']
                     if 'randp_scale' in asset_cfg['pos']:
+                        # NOTE: not patched to self.env._episode_rng because (a) build() runs at
+                        # env construction time, before reset()/_set_episode_rng, so _episode_rng
+                        # is None here; and (b) all asset randp_scale values in configs/table/*.yaml
+                        # are [0, 0, 0], so this multiplication is a no-op regardless of RNG source.
                         initial_ppos = np.array(initial_ppos) + np.array(asset_cfg['pos']['randp_scale']) * np.random.rand((len(initial_ppos)))
                         initial_ppos = initial_ppos.tolist()
                     builder.initial_pose = sapien.Pose(

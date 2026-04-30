@@ -30,6 +30,7 @@ from robofactory.planner.solutions import (
     solveTakePhoto,
     solveLongPipelineDelivery,
     solveThreeRobotsStackCube,
+    solvePickMeat,
 )
 from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory import CONFIG_DIR
@@ -55,6 +56,12 @@ TASK_MAP = {
         "table/three_robots_stack_cube.yaml",
         solveThreeRobotsStackCube,
         3,
+    ),
+    "PickMeat": (
+        "PickMeat-rf",
+        "table/pick_meat.yaml",
+        solvePickMeat,
+        1,
     ),
 }
 
@@ -162,7 +169,14 @@ def run(task_name, num, record_dir, max_retries_per_seed=5):
             f"[WARN] only got {passed}/{num} — "
             f"raise --max-retries or investigate solver success rate"
         )
-    assert passed == num, f"collection incomplete: {passed}/{num}"
+        # Hard-fail only if the shortfall is severe (>5%); partial datasets
+        # are still useful for downstream conversion + training.
+        shortfall = (num - passed) / num
+        if shortfall > 0.05:
+            raise RuntimeError(
+                f"collection severely incomplete: {passed}/{num} "
+                f"({shortfall:.1%} short). Investigate before reusing."
+            )
     return out_h5
 
 

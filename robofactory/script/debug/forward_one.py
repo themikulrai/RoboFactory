@@ -76,7 +76,8 @@ def _from_env(config, seed, n_obs=3):
         cfg = yaml.safe_load(f)
     env_id = cfg['task_name'] + '-rf'
     env = gym.make(env_id, config=config, obs_mode='rgb', control_mode='pd_joint_pos',
-                   render_mode='sensors', num_envs=1, sim_backend='cpu', enable_shadow=True)
+                   render_mode='sensors', num_envs=1, sim_backend='cpu', enable_shadow=False,
+                   sensor_configs=dict(shader_pack='default'))
     obs, _ = env.reset(seed=seed)
     rgb = obs['sensor_data']['head_camera']['rgb']
     rgb_np = rgb.cpu().numpy() if hasattr(rgb, 'cpu') else np.asarray(rgb)

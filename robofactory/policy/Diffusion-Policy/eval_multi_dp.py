@@ -174,6 +174,9 @@ _CAM_TPL = {"workspace": "head_camera_agent{i}", "wristcam": "hand_camera_{i}"}
 def get_model_input(observation, agent_pos, agent_id, include_global: bool = True, cam_family: str = "workspace", img_h: int = 224, img_w: int = 224):
     sd = observation['sensor_data']
     per_agent_key = _CAM_TPL[cam_family].format(i=agent_id)
+    # Single-agent tasks (e.g. PickMeat) use head_camera instead of head_camera_agent0
+    if per_agent_key not in sd and 'head_camera' in sd:
+        per_agent_key = 'head_camera'
     if per_agent_key not in sd:
         raise KeyError(f"sensor_data missing {per_agent_key}; available={list(sd.keys())}")
     out = dict(
@@ -343,7 +346,7 @@ def main(args: Args):
         viewer_camera_configs=dict(shader_pack=args.shader),
         num_envs=args.num_envs,
         sim_backend=args.sim_backend,
-        enable_shadow=True,
+        enable_shadow=False,  # training data was collected with shadow=False (env default)
         parallel_in_single_scene=parallel_in_single_scene,
     )
     if args.robot_uids is not None:

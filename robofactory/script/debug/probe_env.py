@@ -134,7 +134,7 @@ def main():
         render_mode='sensors',
         num_envs=1,
         sim_backend=args.sim_backend,
-        enable_shadow=True,
+        enable_shadow=False,  # match training data collection default
     )
     env: BaseEnv = gym.make(env_id, **env_kwargs)
 

@@ -111,11 +111,11 @@ class RFSceneBuilder(SceneBuilder):
                     raise AttributeError(f'Attribute "{primitive_cfg["name"]}" not found in SceneBuilder.')
                 ppos = primitive_cfg['pos']['ppos']['p']
                 if 'randp_scale' in primitive_cfg['pos']:
-                    ppos = np.array(ppos) + np.array(primitive_cfg['pos']['randp_scale']) * np.random.rand((len(ppos)))
+                    ppos = np.array(ppos) + np.array(primitive_cfg['pos']['randp_scale']) * self.env._episode_rng.rand((len(ppos)))
                     ppos = ppos.tolist()
                 qpos = np.array(primitive_cfg['pos']['qpos'])
                 if 'randq_scale' in primitive_cfg:
-                    qpos = np.array(qpos) + np.array(primitive_cfg['pos']['randq_scale'])* np.random.rand((len(qpos)))
+                    qpos = np.array(qpos) + np.array(primitive_cfg['pos']['randq_scale'])* self.env._episode_rng.rand((len(qpos)))
                 if 'random_quaternions' in primitive_cfg['pos']:
                     qpos = random_quaternions(
                         b,
@@ -135,11 +135,11 @@ class RFSceneBuilder(SceneBuilder):
                     raise AttributeError(f'Attribute "{asset_cfg["name"]}" not found in SceneBuilder.')
                 ppos = asset_cfg['pos']['ppos']['p']
                 if 'randp_scale' in asset_cfg['pos']:
-                    ppos = np.array(ppos) + np.array(asset_cfg['pos']['randp_scale']) * np.random.rand((len(ppos)))
+                    ppos = np.array(ppos) + np.array(asset_cfg['pos']['randp_scale']) * self.env._episode_rng.rand((len(ppos)))
                     ppos = ppos.tolist()
                 qpos = asset_cfg['pos']['qpos']
                 if 'randq_scale' in asset_cfg['pos']:
-                    qpos = np.array(qpos) + np.array(asset_cfg['pos']['randq_scale'])* np.random.rand((len(qpos)))
+                    qpos = np.array(qpos) + np.array(asset_cfg['pos']['randq_scale'])* self.env._episode_rng.rand((len(qpos)))
                 if 'random_quaternions' in asset_cfg['pos']:
                     qpos = random_quaternions(
                         b,
@@ -159,12 +159,12 @@ class RFSceneBuilder(SceneBuilder):
                 pos_cfg = agent_cfg['pos']
                 ppos = pos_cfg['ppos']['p']
                 if 'randp_scale' in pos_cfg:
-                    ppos = np.array(ppos) + np.array(agent_cfg['pos']['randp_scale']) * np.random.rand((len(ppos)))
+                    ppos = np.array(ppos) + np.array(agent_cfg['pos']['randp_scale']) * self.env._episode_rng.rand((len(ppos)))
                     ppos = ppos.tolist()
                 ppos = sapien.Pose(ppos, q=euler2quat(*pos_cfg['ppos']['q']))
                 qpos = np.array((pos_cfg['qpos']))
                 if 'randq_scale' in pos_cfg:
-                    qpos = np.tile(qpos, (b, 1)) + np.tile(np.array(agent_cfg['pos']['randq_scale']), (b, 1)) * np.random.rand(b, (len(qpos)))
+                    qpos = np.tile(qpos, (b, 1)) + np.tile(np.array(agent_cfg['pos']['randq_scale']), (b, 1)) * self.env._episode_rng.rand(b, (len(qpos)))
                 if 'random_quaternions' in agent_cfg['pos']:
                     qpos = random_quaternions(
                         b,
