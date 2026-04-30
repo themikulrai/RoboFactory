@@ -2,6 +2,7 @@
 __pycache__
 robofactory/assets/*
 robofactory/demos/
+robofactory/demos_*
 assets/*
 robofactory/demos
 robofactory/data
