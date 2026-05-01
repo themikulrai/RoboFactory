@@ -65,6 +65,7 @@ class Args:
     camera_mapping: str = ""
     robot_uid: str = "panda_wristcam_multi"
     robot_uids_csv: str = ""
+    trajectory_log_path: str = ""  # if set, write JSONL per-step trajectory data
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -138,6 +139,28 @@ def _resolve_camera_mapping(path: str) -> dict[str, str]:
     return {slot: mapping[slot] for slot in IMAGE_SLOTS}
 
 
+def _cube_xyz(env, name: str) -> list[float]:
+    try:
+        actor = getattr(env.unwrapped, name)
+        p = actor.pose.p
+        if hasattr(p, "cpu"):
+            p = p.cpu().numpy()
+        p = np.asarray(p)
+        if p.ndim == 2:
+            p = p[0]
+        return [float(p[0]), float(p[1]), float(p[2])]
+    except Exception:
+        return [0.0, 0.0, 0.0]
+
+
+def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix: str) -> list[list[float]]:
+    out: list[list[float]] = []
+    for i in range(num_arms):
+        a = np.asarray(action_dict[f"{action_prefix}-{i}"]).reshape(-1).astype(float)
+        out.append([float(x) for x in a.tolist()])
+    return out
+
+
 def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: int, action_prefix: str, video_path: str = "") -> dict:
     """Run one episode with 3 per-arm policy servers."""
     obs, _ = env.reset(seed=seed)
@@ -149,36 +172,78 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
     video_frames: list[np.ndarray] = []
     global_cam = cam_map["base_0_rgb_raw"]
 
-    for step in range(args.max_env_steps):
-        if video_path:
-            video_frames.append(_extract_image(obs, global_cam))
-        # Replan arms whose chunk is exhausted
-        obs_dict = None
-        for i in range(args.num_arms):
-            if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
-                if obs_dict is None:
-                    obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
-                result = policies[i].infer(obs_dict)
-                chunks[i] = np.asarray(result["actions"])  # (H, 8)
-                chunk_idxs[i] = 0
+    traj_fp = None
+    if args.trajectory_log_path:
+        Path(args.trajectory_log_path).parent.mkdir(parents=True, exist_ok=True)
+        traj_fp = open(args.trajectory_log_path, "a")
 
-        cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
-        action_dict: dict[str, np.ndarray] = {}
-        for i in range(args.num_arms):
-            step_i = chunks[i][chunk_idxs[i]]  # (8,)
-            delta = step_i[:7]
-            gripper = step_i[7]
-            target = np.concatenate([cur_qpos[i] + delta, np.array([gripper], dtype=np.float32)])
-            action_dict[f"{action_prefix}-{i}"] = target.astype(np.float32)
-            chunk_idxs[i] += 1
+    try:
+        for step in range(args.max_env_steps):
+            if video_path:
+                video_frames.append(_extract_image(obs, global_cam))
+            # Replan arms whose chunk is exhausted
+            obs_dict = None
+            replanned_per_arm = [False] * args.num_arms
+            for i in range(args.num_arms):
+                if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
+                    if obs_dict is None:
+                        obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                    result = policies[i].infer(obs_dict)
+                    chunks[i] = np.asarray(result["actions"])  # (H, 8)
+                    chunk_idxs[i] = 0
+                    replanned_per_arm[i] = True
 
-        obs, _, terminated, truncated, info = env.step(action_dict)
-        succ_field = info.get("success", False)
-        if hasattr(succ_field, "item"):
-            succ_field = succ_field.item()
-        success = bool(succ_field)
-        if success or terminated or truncated:
-            break
+            cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
+            action_dict: dict[str, np.ndarray] = {}
+            local_chunk_idxs = list(chunk_idxs)
+            for i in range(args.num_arms):
+                step_i = chunks[i][chunk_idxs[i]]  # (8,)
+                delta = step_i[:7]
+                gripper = step_i[7]
+                target = np.concatenate([cur_qpos[i] + delta, np.array([gripper], dtype=np.float32)])
+                action_dict[f"{action_prefix}-{i}"] = target.astype(np.float32)
+                chunk_idxs[i] += 1
+
+            if traj_fp is not None:
+                state_24 = _build_state(obs, args.num_arms, args.robot_uid)
+                action_chunks_per_arm = [
+                    ([[float(v) for v in r] for r in chunks[i].tolist()] if replanned_per_arm[i] else None)
+                    for i in range(args.num_arms)
+                ]
+                row = {
+                    "seed": int(seed),
+                    "step": int(step),
+                    "chunk_idx": int(min(local_chunk_idxs)),  # use min as a proxy; per-arm in chunk_idxs_per_arm
+                    "chunk_idxs_per_arm": [int(x) for x in local_chunk_idxs],
+                    "replanned": bool(any(replanned_per_arm)),
+                    "replanned_per_arm": [bool(x) for x in replanned_per_arm],
+                    "state_24": [float(x) for x in state_24.tolist()],
+                    "action_chunks_per_arm": action_chunks_per_arm,
+                    "applied_action_per_arm": _action_dict_to_per_arm_list(action_dict, args.num_arms, action_prefix),
+                    "cube_xyz": {
+                        "cubeA": _cube_xyz(env, "cubeA"),
+                        "cubeB": _cube_xyz(env, "cubeB"),
+                        "cubeC": _cube_xyz(env, "cubeC"),
+                    },
+                    "success_far": False,
+                }
+
+            obs, _, terminated, truncated, info = env.step(action_dict)
+            succ_field = info.get("success", False)
+            if hasattr(succ_field, "item"):
+                succ_field = succ_field.item()
+            success = bool(succ_field)
+
+            if traj_fp is not None:
+                row["success_far"] = bool(success)
+                traj_fp.write(json.dumps(row) + "\n")
+                traj_fp.flush()
+
+            if success or terminated or truncated:
+                break
+    finally:
+        if traj_fp is not None:
+            traj_fp.close()
 
     if video_path and video_frames:
         _write_mp4(video_path, video_frames)

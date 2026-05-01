@@ -75,6 +75,7 @@ class Args:
     camera_mapping: str = ""  # path to JSON; empty => DEFAULT_CAMERA_MAPPING
     robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
     robot_uids_csv: str = ""  # comma-separated UIDs for gym.make; empty = use default
+    trajectory_log_path: str = ""  # if set (and num_envs==1), write JSONL per-step trajectory data
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -191,6 +192,29 @@ def _resolve_camera_mapping(path: str) -> dict[str, str]:
     return {slot: mapping[slot] for slot in IMAGE_SLOTS}
 
 
+def _cube_xyz(env, name: str) -> list[float]:
+    """Read cube xyz from env.unwrapped.<name> (e.g. 'cubeA'). Returns [x,y,z] floats."""
+    try:
+        actor = getattr(env.unwrapped, name)
+        p = actor.pose.p
+        if hasattr(p, "cpu"):
+            p = p.cpu().numpy()
+        p = np.asarray(p)
+        if p.ndim == 2:
+            p = p[0]
+        return [float(p[0]), float(p[1]), float(p[2])]
+    except Exception:
+        return [0.0, 0.0, 0.0]
+
+
+def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix: str) -> list[list[float]]:
+    out: list[list[float]] = []
+    for i in range(num_arms):
+        a = np.asarray(action_dict[f"{action_prefix}-{i}"]).reshape(-1).astype(float)
+        out.append([float(x) for x in a.tolist()])
+    return out
+
+
 def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: int, seed: int, action_prefix: str, video_path: str = "") -> dict:
     obs, _ = env.reset(seed=seed)
     success = False
@@ -200,26 +224,63 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
     video_frames: list[np.ndarray] = []
     global_cam = cam_map["base_0_rgb_raw"]
 
-    for step in range(args.max_env_steps):
-        if video_path:
-            video_frames.append(_extract_image(obs, global_cam))
-        if chunk is None or chunk_idx >= args.replan_after:
-            obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
-            result = policy.infer(obs_dict)
-            chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
-            chunk_idx = 0
+    # ---- trajectory logging (only when num_envs == 1) ----
+    traj_fp = None
+    if args.trajectory_log_path and args.num_envs == 1:
+        Path(args.trajectory_log_path).parent.mkdir(parents=True, exist_ok=True)
+        traj_fp = open(args.trajectory_log_path, "a")
 
-        cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
-        action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, action_prefix)
-        chunk_idx += 1
+    try:
+        for step in range(args.max_env_steps):
+            if video_path:
+                video_frames.append(_extract_image(obs, global_cam))
+            replanned = False
+            if chunk is None or chunk_idx >= args.replan_after:
+                obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                result = policy.infer(obs_dict)
+                chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
+                chunk_idx = 0
+                replanned = True
 
-        obs, reward, terminated, truncated, info = env.step(action_dict)
-        succ_field = info.get("success", False)
-        if hasattr(succ_field, "item"):
-            succ_field = succ_field.item()
-        success = bool(succ_field)
-        if success or terminated or truncated:
-            break
+            cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
+            action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, action_prefix)
+            local_chunk_idx = chunk_idx
+            chunk_idx += 1
+
+            if traj_fp is not None:
+                state_24 = _build_state(obs, args.num_arms, args.robot_uid)
+                row = {
+                    "seed": int(seed),
+                    "step": int(step),
+                    "chunk_idx": int(local_chunk_idx),
+                    "replanned": bool(replanned),
+                    "state_24": [float(x) for x in state_24.tolist()],
+                    "action_chunk": ([[float(v) for v in r] for r in chunk.tolist()] if replanned else None),
+                    "applied_action_per_arm": _action_dict_to_per_arm_list(action_dict, args.num_arms, action_prefix),
+                    "cube_xyz": {
+                        "cubeA": _cube_xyz(env, "cubeA"),
+                        "cubeB": _cube_xyz(env, "cubeB"),
+                        "cubeC": _cube_xyz(env, "cubeC"),
+                    },
+                    "success_far": False,  # filled after env.step below
+                }
+
+            obs, reward, terminated, truncated, info = env.step(action_dict)
+            succ_field = info.get("success", False)
+            if hasattr(succ_field, "item"):
+                succ_field = succ_field.item()
+            success = bool(succ_field)
+
+            if traj_fp is not None:
+                row["success_far"] = bool(success)
+                traj_fp.write(json.dumps(row) + "\n")
+                traj_fp.flush()
+
+            if success or terminated or truncated:
+                break
+    finally:
+        if traj_fp is not None:
+            traj_fp.close()
 
     if video_path and video_frames:
         _write_mp4(video_path, video_frames)
