@@ -31,6 +31,55 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 import pdb
 
+
+def _init_wandb_with_resume(output_dir, cfg):
+    """Initialise wandb, resuming the prior run if `<output_dir>/wandb_id.txt` exists.
+
+    Mirrors openpi/scripts/train.py:init_wandb. On first launch the freshly-created
+    `wandb.run.id` is persisted to disk so subsequent launches (orion preempt
+    requeue, manual relaunch) call `wandb.init(id=..., resume="must")` and
+    continue logging into the same run instead of fragmenting metrics across
+    fresh runs.
+    """
+    output_dir = pathlib.Path(output_dir)
+    wandb_id_file = output_dir / "wandb_id.txt"
+    logging_kwargs = OmegaConf.to_container(cfg.logging, resolve=True) or {}
+
+    saved_id = None
+    if wandb_id_file.is_file():
+        saved_id = wandb_id_file.read_text().strip() or None
+
+    if saved_id:
+        logging_kwargs["id"] = saved_id
+        logging_kwargs["resume"] = "must"
+        print(f"[wandb] resuming existing run id={saved_id}", flush=True)
+    else:
+        logging_kwargs.pop("id", None)
+        if logging_kwargs.get("resume") is True:
+            # first launch: "True" would force resume by exp_name (fragile);
+            # "allow" lets wandb start fresh while still resuming if the id
+            # happens to be set later.
+            logging_kwargs["resume"] = "allow"
+
+    wandb_run = wandb.init(
+        dir=str(output_dir),
+        config=OmegaConf.to_container(cfg, resolve=True),
+        **logging_kwargs,
+    )
+
+    # Persist the run id so the next launch can resume.  Idempotent: a no-op
+    # if the file already matches.
+    try:
+        current_id = wandb.run.id
+    except Exception:
+        current_id = None
+    if current_id and (saved_id != current_id):
+        wandb_id_file.parent.mkdir(parents=True, exist_ok=True)
+        wandb_id_file.write_text(current_id)
+
+    return wandb_run
+
+
 class RobotWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
@@ -135,12 +184,11 @@ class RobotWorkspace(BaseWorkspace):
             print(f"[env_runner] init failed, skipping rollouts: {e}")
             env_runner = None
 
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
+        # configure logging — resume into the existing wandb run on relaunch
+        # so orion preempt / manual requeue don't fragment metrics across new runs.
+        # Pattern mirrors openpi/scripts/train.py:init_wandb (id stored at
+        # <output_dir>/wandb_id.txt, set resume="must" when the file exists).
+        wandb_run = _init_wandb_with_resume(self.output_dir, cfg)
         wandb.config.update(
             {
                 "output_dir": self.output_dir,
