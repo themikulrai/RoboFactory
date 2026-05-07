@@ -23,7 +23,8 @@ from PIL import Image
 
 DATASET_DIR = Path("/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam")
 PROMPT = "stack the three cubes using three robot arms"
-OUT_DIR = Path("/iris/u/mikulrai/logs/tsc_debug")
+# Module-level placeholder; rebound in __main__ from --output_dir.
+OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 PORT = 8000
 N_EPISODES = 5
 # Maximum frames per episode to avoid OOM
@@ -172,4 +173,13 @@ def _plot_errors(all_err: np.ndarray, out_dir: Path) -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    from robofactory.utils.paths import debug_output_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output_dir", type=Path, default=debug_output_dir(__file__),
+        help="Directory for outputs (default: debug_output/<script>_<YYYYMMDD>/).",
+    )
+    args = parser.parse_args()
+    OUT_DIR = args.output_dir
     main()

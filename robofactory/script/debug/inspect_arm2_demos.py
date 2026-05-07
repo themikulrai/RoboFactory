@@ -6,7 +6,7 @@ plots/statistics that should reveal whether arm2's training signal is
 qualitatively different from arm0/1 (which would explain why arm2 specifically
 fails at eval).
 
-Output: PNGs + a JSON summary in /iris/u/mikulrai/logs/tsc_debug/arm2_demos/.
+Output: PNGs + a JSON summary to --output_dir (default: debug_output/<script>_<date>/).
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import numpy as np
 import pandas as pd
 
 DATA_DIR = Path("/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam/data/chunk-000")
-OUT_DIR = Path("/iris/u/mikulrai/logs/tsc_debug/arm2_demos")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Module-level placeholder; rebound in __main__ from --output_dir.
+OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 
 NUM_ARMS = 3
 
@@ -180,4 +180,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    from robofactory.utils.paths import debug_output_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output_dir", type=Path, default=debug_output_dir(__file__),
+        help="Directory for outputs (default: debug_output/<script>_<YYYYMMDD>/).",
+    )
+    args = parser.parse_args()
+    OUT_DIR = args.output_dir
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     main()

@@ -1,10 +1,16 @@
 """Publication-quality figures for the RoboFactory pi0.5 TSC debug study.
 
-Outputs (all in /iris/u/mikulrai/logs/tsc_debug/atlas/):
+Outputs (all in --output_dir, default: debug_output/<script>_<date>/):
   fig1_sr_comparison.png      — SR bar chart across all experiments
   fig2_arm_imbalance.png      — Per-arm activity / gripper bias
   fig3_cube_scatter.png       — cubeC initial positions, success vs failure
   fig4_gripper_heatmap.png    — Gripper command heatmap per arm (all 150 demos)
+
+Note: this script still reads sister-script outputs from hardcoded legacy paths
+under /iris/u/mikulrai/logs/tsc_debug/{arm2_demos,seed_poses}/. To consume
+freshly-regenerated inputs from sister scripts run with their new --output_dir
+defaults, copy or symlink them into the legacy paths until those reads get
+their own --input_dir flags.
 """
 from __future__ import annotations
 
@@ -26,8 +32,8 @@ mpl.rcParams.update({
     "grid.linestyle": "--",
 })
 
-OUT_DIR = Path("/iris/u/mikulrai/logs/tsc_debug/atlas")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Module-level placeholder; rebound in __main__ from --output_dir.
+OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 
 ARM_LABELS = ["Arm 0\n(picks cubeA)", "Arm 1\n(picks cubeB)", "Arm 2\n(picks cubeC)"]
 ARM_COLORS = ["#4C72B0", "#DD8452", "#55A868"]
@@ -240,6 +246,16 @@ def fig4_gripper_heatmap() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    from robofactory.utils.paths import debug_output_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output_dir", type=Path, default=debug_output_dir(__file__),
+        help="Directory for figures (default: debug_output/<script>_<YYYYMMDD>/).",
+    )
+    args = parser.parse_args()
+    OUT_DIR = args.output_dir
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     fig1_sr_comparison()
     fig2_arm_imbalance()
     fig3_cube_scatter()

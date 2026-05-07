@@ -8,7 +8,7 @@ only numpy:
   rand(3) × cubeB        (scale [0.05,  0.05, 0])
   rand(3) × cubeC        (scale [0.05,  0.05, 0])
 
-Outputs: JSON + scatter PNG at /iris/u/mikulrai/logs/tsc_debug/seed_poses/
+Outputs: JSON + scatter PNG to --output_dir (default: debug_output/<script>_<date>/).
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-OUT_DIR = Path("/iris/u/mikulrai/logs/tsc_debug/seed_poses")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Module-level placeholder; rebound in __main__ from --output_dir.
+OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 
 SEEDS = list(range(10010, 10040))  # 30 eval seeds
 
@@ -137,4 +137,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    from robofactory.utils.paths import debug_output_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output_dir", type=Path, default=debug_output_dir(__file__),
+        help="Directory for outputs (default: debug_output/<script>_<YYYYMMDD>/).",
+    )
+    args = parser.parse_args()
+    OUT_DIR = args.output_dir
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     main()

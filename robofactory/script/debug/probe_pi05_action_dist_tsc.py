@@ -29,7 +29,8 @@ CAM_MAPPING = "/iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mapp
 TASK_CONFIG = "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/three_robots_stack_cube.yaml"
 SEEDS = list(range(10010, 10040))
 PROMPT = "stack the three cubes using three robot arms"
-OUT_DIR = Path("/iris/u/mikulrai/logs/tsc_debug")
+# Module-level placeholder; rebound in __main__ from --output_dir.
+OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 PORT = 8000
 
 
@@ -137,4 +138,13 @@ def _plot_heatmap(chunks: np.ndarray, std: np.ndarray, out_dir: Path) -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    from robofactory.utils.paths import debug_output_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output_dir", type=Path, default=debug_output_dir(__file__),
+        help="Directory for outputs (default: debug_output/<script>_<YYYYMMDD>/).",
+    )
+    args = parser.parse_args()
+    OUT_DIR = args.output_dir
     main()

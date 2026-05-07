@@ -5,10 +5,12 @@ debugging cycles. Kept on purpose — these are the tools that produced the
 encoder-collapse, scene-mismatch, and pipeline-parity findings, and will be
 re-run when similar bugs recur.
 
-Output paths: most scripts default to writing under `/iris/u/mikulrai/logs/tsc_debug/...`.
-That is a footgun — see the section at the bottom. A future commit will
-parameterize each `OUT_DIR` constant to an `--output_dir` argparse arg and
-default to `/iris/u/mikulrai/scratch/<topic>_<date>/`.
+Output paths: scripts that write artifacts accept `--output_dir`; default is
+`/iris/u/mikulrai/debug_output/<script-stem>_<YYYYMMDD>/` via
+`robofactory.utils.paths.debug_output_dir(__file__)`. That root is swept
+nightly: files older than 30 days are removed (cron installed via
+`robofactory/utils/install_debug_output_cron.sh`). Pin anything you want to
+keep by passing `--output_dir` to a path outside `debug_output/`.
 
 ## Python scripts
 
@@ -57,20 +59,35 @@ default to `/iris/u/mikulrai/scratch/<topic>_<date>/`.
 | `run_spawn_and_stochasticity_diagnostics.sh` | Run spawn reconstruction + TSC probe + DDPM stochasticity test in sequence. |
 | `watch_ckpt.sh` | Watch checkpoint directory for new ckpts and trigger downstream eval. |
 
-## Footguns — hardcoded paths
+## Footguns — remaining hardcoded paths
 
-These scripts hardcode an output or checkpoint path under `/iris/u/mikulrai/`.
-A future commit will replace each with an `--output_dir` / `--ckpt` argparse
-arg defaulting to `/iris/u/mikulrai/scratch/<topic>_<date>/`. Until then, edit
-the constant in-place if you want output elsewhere — passing `OUT_DIR=...` on
-the command line will not work.
+Five scripts (`dump_seed_poses.py`, `inspect_arm2_demos.py`,
+`plot_atlas_figures.py`, `probe_pi05_action_dist_tsc.py`,
+`teacher_force_pi05_tsc.py`) now take `--output_dir` and default to
+`debug_output/<script-stem>_<YYYYMMDD>/`. Two paths still hardcoded
+intentionally; one residual carry-over.
+
+### Pinned checkpoints (intentional — leave alone)
+
+These reference a specific canonical PickMeat ckpt. Pass a different ckpt by
+editing the constant if you need to.
 
 | Script | Line | Hardcoded path |
 |---|---|---|
 | `check_diffusion_stochasticity.py` | L31 | `/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/300.ckpt` |
-| `dump_seed_poses.py` | L21 | `/iris/u/mikulrai/logs/tsc_debug/seed_poses` |
-| `inspect_arm2_demos.py` | L21 | `/iris/u/mikulrai/logs/tsc_debug/arm2_demos` |
-| `plot_atlas_figures.py` | L29 | `/iris/u/mikulrai/logs/tsc_debug/atlas` |
-| `probe_pi05_action_dist_tsc.py` | L32 | `/iris/u/mikulrai/logs/tsc_debug` |
-| `teacher_force_pi05_tsc.py` | L26 | `/iris/u/mikulrai/logs/tsc_debug` |
 | `test_step_n_conditioning.py` | L34 | `/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/300.ckpt` |
+
+### Cross-script input-read carry-over (will be parameterized later)
+
+`plot_atlas_figures.py` reads outputs from `inspect_arm2_demos.py` and
+`dump_seed_poses.py` from their *legacy* paths under
+`/iris/u/mikulrai/logs/tsc_debug/`. After the `--output_dir` refactor those
+sister scripts default elsewhere — so to consume freshly-regenerated inputs,
+copy or symlink them into the legacy paths, or wait for `plot_atlas_figures.py`
+to grow `--seed_poses_dir` and `--arm2_demos_dir` flags.
+
+| Script | Line | Hardcoded read |
+|---|---|---|
+| `plot_atlas_figures.py` | L93 | `/iris/u/mikulrai/logs/tsc_debug/arm2_demos/summary.json` |
+| `plot_atlas_figures.py` | L157 | `/iris/u/mikulrai/logs/tsc_debug/seed_poses/seed_poses.json` |
+| `plot_atlas_figures.py` | L195 | `/iris/u/mikulrai/logs/tsc_debug/arm2_demos` |
