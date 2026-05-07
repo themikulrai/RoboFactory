@@ -28,6 +28,7 @@ import gymnasium as gym
 import numpy as np
 import sapien  # noqa: F401
 import tyro
+import wandb
 from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
@@ -66,6 +67,9 @@ class Args:
     robot_uid: str = "panda_wristcam_multi"
     robot_uids_csv: str = ""
     trajectory_log_path: str = ""  # if set, write JSONL per-step trajectory data
+    wandb: bool = False
+    wandb_project: str = "openpi-robofactory"
+    wandb_tags: str = "eval,pi05,decent"
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -282,7 +286,18 @@ def main(args: Args) -> None:
     print(f"num_arms={args.num_arms} ports={ports} cam_map={cam_map}")
 
     run_id = _resolve_run_id(args.run_id)
+
+    if args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            job_type="eval",
+            name=f"eval_decent_{args.task}_run{run_id}",
+            tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
+            config=dataclasses.asdict(args),
+        )
+
     results: list[dict] = []
+    episode_global_idx = 0
     for seed in seeds:
         for ep_i in range(args.num_episodes):
             ep_seed = seed * 100_000 + ep_i
@@ -298,6 +313,16 @@ def main(args: Args) -> None:
                 f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
                 f"steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}"
             )
+            if args.wandb:
+                wandb.log({
+                    "episode/idx": episode_global_idx,
+                    "episode/seed_base": seed,
+                    "episode/seed_full": ep_seed,
+                    "episode/success": int(bool(r["success"])),
+                    "episode/steps": int(r["steps"]),
+                    "episode/wall_s": float(r.get("wall_s", -1)),
+                })
+            episode_global_idx += 1
 
     n = len(results)
     n_succ = sum(1 for r in results if r["success"])
@@ -306,6 +331,16 @@ def main(args: Args) -> None:
     out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
     out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
     print(f"Saved {out_file}")
+
+    if args.wandb:
+        wandb.log({
+            "summary/success_rate": (n_succ / n) if n else 0.0,
+            "summary/n_episodes": n,
+            "summary/n_success": n_succ,
+            "summary/results_json_path": str(out_file),
+        })
+        wandb.finish()
+
     env.close()
 
 
