@@ -168,66 +168,68 @@ def main(args: Args):
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
     print('MANIFEST:', json.dumps(manifest, indent=2), flush=True)
 
-    wandb_run = None
-    if args.wandb:
-        import wandb
-        wandb_run = wandb.init(
-            project='diffusion-robofactory', job_type='eval',
-            name=f'eval_joint_{dataset_tag}_{ts}',
-            group=f'eval_joint_{dataset_tag}',
-            tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
-            config=manifest,
-        )
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+    from policy._shared.eval_context import WandbRun, VideoRecorder
 
-    results = []
-    for idx, seed in enumerate(seeds):
-        if not args.quiet:
-            print(f"[seed {seed}] running...", flush=True)
-        torch.cuda.reset_peak_memory_stats()
-        result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
-        vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+    with WandbRun(
+        enabled=args.wandb,
+        project='diffusion-robofactory',
+        job_type='eval',
+        name=f'eval_joint_{dataset_tag}_{ts}',
+        group=f'eval_joint_{dataset_tag}',
+        tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
+        config=manifest,
+    ) as wandb_run, VideoRecorder(
+        record_root, max_recorded=getattr(args, 'video_max', 3), all_seeds=getattr(args, 'video_all', False),
+    ) as videos:
+        results = []
+        for idx, seed in enumerate(seeds):
+            if not args.quiet:
+                print(f"[seed {seed}] running...", flush=True)
+            torch.cuda.reset_peak_memory_stats()
+            result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
+            vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
-        video_path = os.path.join(record_root, f'seed{seed:07d}_global.mp4')
-        save_mp4(result['frames'], video_path)
-        gif_path = save_gif(video_path) if result['frames'] else None
+            video_path = videos.video_path_for(idx, seed, suffix='_global')
+            gif_path = None
+            if video_path is not None:
+                save_mp4(result['frames'], video_path)
+                gif_path = save_gif(video_path) if result['frames'] else None
 
-        metrics = dict(
-            seed=int(seed), success=int(result['success']),
-            steps=int(result['length']), vram_peak_mb=vram_mb, episode_idx=idx,
-        )
-        results.append(metrics)
-        with open(jsonl_path, 'a') as f:
-            f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
+            metrics = dict(
+                seed=int(seed), success=int(result['success']),
+                steps=int(result['length']), vram_peak_mb=vram_mb, episode_idx=idx,
+            )
+            results.append(metrics)
+            with open(jsonl_path, 'a') as f:
+                f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
 
+            n_succ = sum(r['success'] for r in results)
+            print(
+                f"[seed {seed}] success={metrics['success']} steps={metrics['steps']} "
+                f"vram_mb={vram_mb} video={video_path} | SR {n_succ}/{len(results)}={100.*n_succ/len(results):.1f}%",
+                flush=True,
+            )
+            wandb_run.log_episode(idx, **{k: v for k, v in metrics.items() if k != 'episode_idx'})
+            if wandb_run.run is not None and gif_path and video_path and os.path.exists(gif_path):
+                import wandb as _wandb
+                wandb_run.log_raw({'episode/video': _wandb.Video(video_path, fps=20, format='mp4')})
+
+        env.close()
+
+        n_total = len(results)
         n_succ = sum(r['success'] for r in results)
-        print(
-            f"[seed {seed}] success={metrics['success']} steps={metrics['steps']} "
-            f"vram_mb={vram_mb} video={video_path} | SR {n_succ}/{len(results)}={100.*n_succ/len(results):.1f}%",
-            flush=True,
-        )
-        if wandb_run is not None:
-            import wandb
-            log = {f'episode/{k}': v for k, v in metrics.items()}
-            if gif_path and os.path.exists(gif_path):
-                log['episode/video'] = wandb.Video(video_path, fps=20, format='mp4')
-            wandb.log(log)
-
-    env.close()
-
-    n_total = len(results)
-    n_succ = sum(r['success'] for r in results)
-    sr = n_succ / n_total if n_total else 0.0
-    from math import sqrt
-    ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
-    summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci)
-    with open(jsonl_path, 'a') as f:
-        f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
-    print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
-    if wandb_run is not None:
-        import wandb
-        wandb.log({f'summary/{k}': v for k, v in summary.items()})
-        wandb_run.finish()
-    print('success' if sr > 0 else 'failed')
+        sr = n_succ / n_total if n_total else 0.0
+        from math import sqrt
+        ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
+        summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci)
+        with open(jsonl_path, 'a') as f:
+            f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+        print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
+        wandb_run.log_summary(**summary)
+        print('success' if sr > 0 else 'failed')
 
 
 if __name__ == '__main__':

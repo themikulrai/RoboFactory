@@ -40,6 +40,11 @@ from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403  (registers env IDs with gym)
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
+
 
 DEFAULT_PROMPT = "stack the three cubes using three robot arms"
 
@@ -76,6 +81,11 @@ class Args:
     robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
     robot_uids_csv: str = ""  # comma-separated UIDs for gym.make; empty = use default
     trajectory_log_path: str = ""  # if set (and num_envs==1), write JSONL per-step trajectory data
+    wandb: bool = False
+    wandb_project: str = "openpi-robofactory"
+    wandb_tags: str = "eval,pi05,cent"
+    video_max: int = 3
+    video_all: bool = False
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -412,53 +422,91 @@ def main(args: Args) -> None:
     print(f"Server metadata: {policy.get_server_metadata()}", flush=True)
     print(f"num_arms={args.num_arms} active_dim={active_dim} cam_map={cam_map}")
 
-    results: list[dict] = []
-    if args.num_envs > 1:
-        # Vectorised path: one batch of size num_envs, all seeds run in lockstep.
-        all_ep_seeds = [seed * 100_000 + ep_i for seed in seeds for ep_i in range(args.num_episodes)]
-        for batch_start in range(0, len(all_ep_seeds), args.num_envs):
-            batch = all_ep_seeds[batch_start : batch_start + args.num_envs]
-            if len(batch) < args.num_envs:
-                # Pad with last seed to fill batch (vectorised env requires fixed N)
-                batch = batch + [batch[-1]] * (args.num_envs - len(batch))
-                pad_count = batch_start + args.num_envs - len(all_ep_seeds)
-            else:
-                pad_count = 0
-            try:
-                rs = run_batch_episodes(env, policy, args, cam_map, active_dim, batch, action_prefix, args.video_dir)
-            except Exception as e:  # noqa: BLE001
-                rs = [{"seed": int(s), "success": False, "steps": -1, "error": repr(e)} for s in batch]
-            if pad_count:
-                rs = rs[: args.num_envs - pad_count]
-            for r in rs:
-                results.append(r)
-                print(f"[seed={r['seed']}] success={r['success']} steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}")
-    else:
-        run_id = _resolve_run_id(args.run_id)
-        for seed in seeds:
-            for ep_i in range(args.num_episodes):
-                ep_seed = seed * 100_000 + ep_i
-                video_path = ""
-                if args.video_dir:
-                    video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
+    run_id = _resolve_run_id(args.run_id)
+
+    with WandbRun(
+        enabled=args.wandb,
+        project=args.wandb_project,
+        job_type="eval",
+        name=f"eval_cent_{args.task}_run{run_id}",
+        tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
+        config=dataclasses.asdict(args),
+    ) as wandb_run, VideoRecorder(
+        args.video_dir, max_recorded=args.video_max, all_seeds=args.video_all,
+    ) as videos:
+        results: list[dict] = []
+        episode_global_idx = 0
+        if args.num_envs > 1:
+            # Vectorised path: one batch of size num_envs, all seeds run in lockstep.
+            all_ep_seeds = [seed * 100_000 + ep_i for seed in seeds for ep_i in range(args.num_episodes)]
+            for batch_start in range(0, len(all_ep_seeds), args.num_envs):
+                batch = all_ep_seeds[batch_start : batch_start + args.num_envs]
+                if len(batch) < args.num_envs:
+                    # Pad with last seed to fill batch (vectorised env requires fixed N)
+                    batch = batch + [batch[-1]] * (args.num_envs - len(batch))
+                    pad_count = batch_start + args.num_envs - len(all_ep_seeds)
+                else:
+                    pad_count = 0
                 try:
-                    r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path)
+                    rs = run_batch_episodes(env, policy, args, cam_map, active_dim, batch, action_prefix, args.video_dir)
                 except Exception as e:  # noqa: BLE001
-                    r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
-                results.append(r)
-                print(
-                    f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
-                    f"steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}"
-                )
+                    rs = [{"seed": int(s), "success": False, "steps": -1, "error": repr(e)} for s in batch]
+                if pad_count:
+                    rs = rs[: args.num_envs - pad_count]
+                for r in rs:
+                    results.append(r)
+                    print(f"[seed={r['seed']}] success={r['success']} steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}")
+                    wandb_run.log_episode(
+                        episode_global_idx,
+                        seed=int(r["seed"]),
+                        success=int(bool(r["success"])),
+                        steps=int(r["steps"]),
+                        wall_s=float(r.get("wall_s", -1)),
+                    )
+                    episode_global_idx += 1
+        else:
+            for seed_idx, seed in enumerate(seeds):
+                for ep_i in range(args.num_episodes):
+                    ep_seed = seed * 100_000 + ep_i
+                    if (args.video_all or seed_idx < args.video_max) and args.video_dir:
+                        video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
+                    else:
+                        video_path = ""
+                    try:
+                        r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path)
+                    except Exception as e:  # noqa: BLE001
+                        r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
+                    results.append(r)
+                    print(
+                        f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
+                        f"steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}"
+                    )
+                    wandb_run.log_episode(
+                        episode_global_idx,
+                        seed_base=seed,
+                        seed_full=ep_seed,
+                        success=int(bool(r["success"])),
+                        steps=int(r["steps"]),
+                        wall_s=float(r.get("wall_s", -1)),
+                    )
+                    episode_global_idx += 1
 
-    n = len(results)
-    n_succ = sum(1 for r in results if r["success"])
-    print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
+        n = len(results)
+        n_succ = sum(1 for r in results if r["success"])
+        print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
-    out_file = out_dir / f"eval_{args.task}_{int(time.time())}.json"
-    out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
-    print(f"Saved {out_file}")
-    env.close()
+        out_file = out_dir / f"eval_{args.task}_{int(time.time())}.json"
+        out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
+        print(f"Saved {out_file}")
+
+        wandb_run.log_summary(
+            success_rate=(n_succ / n) if n else 0.0,
+            n_episodes=n,
+            n_success=n_succ,
+            results_json_path=str(out_file),
+        )
+
+        env.close()
 
 
 if __name__ == "__main__":

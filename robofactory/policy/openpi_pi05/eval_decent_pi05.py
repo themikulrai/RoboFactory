@@ -28,11 +28,15 @@ import gymnasium as gym
 import numpy as np
 import sapien  # noqa: F401
 import tyro
-import wandb
 from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
+
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
 
 
 DEFAULT_PROMPT = "stack the three cubes using three robot arms"
@@ -70,6 +74,8 @@ class Args:
     wandb: bool = False
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,decent"
+    video_max: int = 3
+    video_all: bool = False
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -287,61 +293,67 @@ def main(args: Args) -> None:
 
     run_id = _resolve_run_id(args.run_id)
 
-    if args.wandb:
-        wandb.init(
-            project=args.wandb_project,
-            job_type="eval",
-            name=f"eval_decent_{args.task}_run{run_id}",
-            tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
-            config=dataclasses.asdict(args),
+    with WandbRun(
+        enabled=args.wandb,
+        project=args.wandb_project,
+        job_type="eval",
+        name=f"eval_decent_{args.task}_run{run_id}",
+        tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
+        config=dataclasses.asdict(args),
+    ) as wandb_run, VideoRecorder(
+        args.video_dir, max_recorded=args.video_max, all_seeds=args.video_all,
+    ) as videos:
+        results: list[dict] = []
+        episode_global_idx = 0
+        for seed_idx, seed in enumerate(seeds):
+            for ep_i in range(args.num_episodes):
+                ep_seed = seed * 100_000 + ep_i
+                # cap maps to (seed, ep_i): record first N (seed_idx, ep_i==0) pairs only
+                if args.video_all or seed_idx < args.video_max:
+                    if args.video_dir:
+                        video_path = str(
+                            Path(args.video_dir)
+                            / _video_filename(args.task, run_id, seed, ep_i)
+                        )
+                    else:
+                        video_path = ""
+                else:
+                    video_path = ""
+                try:
+                    r = run_episode(env, policies, args, cam_map, ep_seed, action_prefix, video_path)
+                except Exception as e:  # noqa: BLE001
+                    r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
+                results.append(r)
+                print(
+                    f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
+                    f"steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}"
+                )
+                wandb_run.log_episode(
+                    episode_global_idx,
+                    seed_base=seed,
+                    seed_full=ep_seed,
+                    success=int(bool(r["success"])),
+                    steps=int(r["steps"]),
+                    wall_s=float(r.get("wall_s", -1)),
+                )
+                episode_global_idx += 1
+
+        n = len(results)
+        n_succ = sum(1 for r in results if r["success"])
+        print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
+
+        out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
+        out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
+        print(f"Saved {out_file}")
+
+        wandb_run.log_summary(
+            success_rate=(n_succ / n) if n else 0.0,
+            n_episodes=n,
+            n_success=n_succ,
+            results_json_path=str(out_file),
         )
 
-    results: list[dict] = []
-    episode_global_idx = 0
-    for seed in seeds:
-        for ep_i in range(args.num_episodes):
-            ep_seed = seed * 100_000 + ep_i
-            video_path = ""
-            if args.video_dir:
-                video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
-            try:
-                r = run_episode(env, policies, args, cam_map, ep_seed, action_prefix, video_path)
-            except Exception as e:  # noqa: BLE001
-                r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
-            results.append(r)
-            print(
-                f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
-                f"steps={r['steps']} wall_s={r.get('wall_s', -1):.1f}"
-            )
-            if args.wandb:
-                wandb.log({
-                    "episode/idx": episode_global_idx,
-                    "episode/seed_base": seed,
-                    "episode/seed_full": ep_seed,
-                    "episode/success": int(bool(r["success"])),
-                    "episode/steps": int(r["steps"]),
-                    "episode/wall_s": float(r.get("wall_s", -1)),
-                })
-            episode_global_idx += 1
-
-    n = len(results)
-    n_succ = sum(1 for r in results if r["success"])
-    print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
-
-    out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
-    out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
-    print(f"Saved {out_file}")
-
-    if args.wandb:
-        wandb.log({
-            "summary/success_rate": (n_succ / n) if n else 0.0,
-            "summary/n_episodes": n,
-            "summary/n_success": n_succ,
-            "summary/results_json_path": str(out_file),
-        })
-        wandb.finish()
-
-    env.close()
+        env.close()
 
 
 if __name__ == "__main__":

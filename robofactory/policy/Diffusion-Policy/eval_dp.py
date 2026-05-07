@@ -106,6 +106,12 @@ class Args:
     ckpt_path: Optional[str] = None
     """Override the default checkpoint path. If set, takes precedence over data_num/checkpoint_num lookup."""
 
+    video_max: int = 3
+    """Number of seeds to record video for (first N). Default capped at 3 to keep disk under control."""
+
+    video_all: bool = False
+    """If true, record video for every seed (overrides --video-max)."""
+
 
 def get_policy(checkpoint, output_dir, device):
     ckpt_full = checkpoint if os.path.isabs(checkpoint) else './' + checkpoint
@@ -345,60 +351,58 @@ def main(args: Args):
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
     print('MANIFEST:', json.dumps(manifest, indent=2), flush=True)
 
-    wandb_run = None
-    if args.wandb:
-        import wandb
-        wandb_run = wandb.init(
-            project='diffusion-robofactory', job_type='eval',
-            name=f'eval_single_{env_id}_ckpt{args.checkpoint_num}_{ts}',
-            group=f'eval_single_{env_id}_ckpt{args.checkpoint_num}',
-            tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
-            config=manifest,
-        )
+    from policy._shared.eval_context import WandbRun, VideoRecorder
 
-    results = []
-    for idx, seed in enumerate(seeds):
-        video_path = os.path.join(record_root, f'seed{seed:07d}.mp4')
-        metrics = run_episode(env, planner, dp_model, seed, args, verbose, video_path=video_path)
-        metrics['episode_idx'] = idx
-        results.append(metrics)
-        with open(jsonl_path, 'a') as f:
-            f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
-        if wandb_run is not None:
-            import wandb
-            wandb.log({
-                'episode/success': metrics['success'],
-                'episode/steps': metrics['steps'],
-                'episode/wallclock_s': metrics['wallclock_s'],
-                'episode/vram_peak_mb': metrics['vram_peak_mb'],
-                'episode/seed': metrics['seed'],
-                'episode/infer_ms': metrics['infer_ms_mean'],
-            })
+    with WandbRun(
+        enabled=args.wandb,
+        project='diffusion-robofactory',
+        job_type='eval',
+        name=f'eval_single_{env_id}_ckpt{args.checkpoint_num}_{ts}',
+        group=f'eval_single_{env_id}_ckpt{args.checkpoint_num}',
+        tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
+        config=manifest,
+    ) as wandb_run, VideoRecorder(
+        record_root, max_recorded=args.video_max, all_seeds=args.video_all,
+    ) as videos:
+        results = []
+        for idx, seed in enumerate(seeds):
+            video_path = videos.video_path_for(idx, seed)
+            metrics = run_episode(env, planner, dp_model, seed, args, verbose, video_path=video_path)
+            metrics['episode_idx'] = idx
+            results.append(metrics)
+            with open(jsonl_path, 'a') as f:
+                f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
+            wandb_run.log_episode(
+                idx,
+                success=metrics['success'],
+                steps=metrics['steps'],
+                wallclock_s=metrics['wallclock_s'],
+                vram_peak_mb=metrics['vram_peak_mb'],
+                seed=metrics['seed'],
+                infer_ms=metrics['infer_ms_mean'],
+            )
+            n_succ = sum(r['success'] for r in results)
+            print(f"[seed {seed}] success={metrics['success']} steps={metrics['steps']} wallclock={metrics['wallclock_s']}s vram_mb={metrics['vram_peak_mb']} | running SR {n_succ}/{len(results)} = {100.0*n_succ/len(results):.2f}%", flush=True)
+
+        env.close()
+
+        n_total = len(results)
         n_succ = sum(r['success'] for r in results)
-        print(f"[seed {seed}] success={metrics['success']} steps={metrics['steps']} wallclock={metrics['wallclock_s']}s vram_mb={metrics['vram_peak_mb']} | running SR {n_succ}/{len(results)} = {100.0*n_succ/len(results):.2f}%", flush=True)
-
-    env.close()
-
-    n_total = len(results)
-    n_succ = sum(r['success'] for r in results)
-    sr = n_succ / n_total if n_total else 0.0
-    from math import sqrt
-    ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
-    steps_succ = [r['steps'] for r in results if r['success']]
-    mean_steps_succ = float(np.mean(steps_succ)) if steps_succ else float('nan')
-    summary = dict(
-        n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
-        mean_steps_on_success=mean_steps_succ,
-        mean_episode_wallclock_s=float(np.mean([r['wallclock_s'] for r in results])) if results else 0.0,
-    )
-    with open(jsonl_path, 'a') as f:
-        f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
-    print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
-    if wandb_run is not None:
-        import wandb
-        wandb.log({f'summary/{k}': v for k, v in summary.items()})
-        wandb_run.finish()
-    print('success' if sr > 0 else 'failed')
+        sr = n_succ / n_total if n_total else 0.0
+        from math import sqrt
+        ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
+        steps_succ = [r['steps'] for r in results if r['success']]
+        mean_steps_succ = float(np.mean(steps_succ)) if steps_succ else float('nan')
+        summary = dict(
+            n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
+            mean_steps_on_success=mean_steps_succ,
+            mean_episode_wallclock_s=float(np.mean([r['wallclock_s'] for r in results])) if results else 0.0,
+        )
+        with open(jsonl_path, 'a') as f:
+            f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+        print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
+        wandb_run.log_summary(**summary)
+        print('success' if sr > 0 else 'failed')
 
 
 if __name__ == "__main__":
