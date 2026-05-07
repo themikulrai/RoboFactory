@@ -137,26 +137,46 @@ class TestPi05ConfigNameParser(unittest.TestCase):
         self.assertEqual(d["dataset"], "ws")  # default
         self.assertEqual(d["scheme"], "cent")
 
-    def test_decent_arm1(self):
+    def test_decent_arm1_defaults_to_tsc(self):
         d = manifest._parse_pi05_config_name(
             "pi05_robofactory_decent_lora_finetune_arm1"
         )
         self.assertEqual(d["scheme"], "decent")
         self.assertEqual(d["arm"], "1")
         self.assertEqual(d["dataset"], "ws")
+        self.assertEqual(d["task"], "tsc")  # codebase convention
+        self.assertIn("inferred", d.get("notes", ""))
 
-    def test_wristcam_decent_arm0(self):
+    def test_wristcam_decent_arm0_defaults_to_tsc(self):
         d = manifest._parse_pi05_config_name(
             "pi05_robofactory_decent_wristcam_lora_finetune_arm0"
         )
         self.assertEqual(d["scheme"], "decent")
         self.assertEqual(d["arm"], "0")
         self.assertEqual(d["dataset"], "wc")
+        self.assertEqual(d["task"], "tsc")
+        self.assertIn("inferred", d.get("notes", ""))
 
     def test_libero_marked_ablation(self):
         d = manifest._parse_pi05_config_name("pi05_libero_spatial_lora")
         self.assertEqual(d["task"], "libero")
         self.assertEqual(d["category"], "ablation")
+        self.assertNotIn("notes", d)  # libero is decisive, no inference note
+
+    def test_exp_name_disambiguates_task(self):
+        # Config dir doesn't have a task token but exp_name does
+        d = manifest._parse_pi05_config_name(
+            "pi05_robofactory_decent_lora_finetune_arm0",
+            exp_name="pi05_lp_d1_decent_arm0_v0",  # hypothetical LP exp
+        )
+        self.assertEqual(d["task"], "lp")
+        # task came from exp_name, not the decent-default fallback
+        self.assertNotIn("notes", d)
+
+    def test_explicit_pm_no_inference_note(self):
+        d = manifest._parse_pi05_config_name("pi05_robofactory_pm_lora_finetune")
+        self.assertEqual(d["task"], "pm")
+        self.assertNotIn("notes", d)  # task explicit; no inference
 
 
 class TestWalkDpCheckpoints(unittest.TestCase):

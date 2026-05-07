@@ -282,7 +282,10 @@ def walk_pi05_checkpoints(root: Path) -> Iterator[RunRecord]:
                 continue
             wandb_id_file = exp_dir / "wandb_id.txt"
             wandb_id = wandb_id_file.read_text().strip() if wandb_id_file.is_file() else ""
-            fields = _parse_pi05_config_name(cfg_dir.name)
+            fields = _parse_pi05_config_name(cfg_dir.name, exp_name=exp_dir.name)
+            # If the parser already produced a notes string, fold it into the
+            # final notes below; otherwise use only the per-dir summary.
+            parser_notes = fields.pop("notes", "")
             latest_ckpt = str(exp_dir / str(steps[-1]))
             rec = RunRecord(
                 run_id=f"legacy:pi05:{cfg_dir.name}/{exp_dir.name}",
@@ -298,14 +301,23 @@ def walk_pi05_checkpoints(root: Path) -> Iterator[RunRecord]:
                 notes=(
                     f"legacy Pi0.5 ckpt dir; {len(steps)} step ckpts; "
                     f"min_step={steps[0]}; exp={exp_dir.name}"
+                    + (f"; {parser_notes}" if parser_notes else "")
                 ),
                 **fields,
             )
             yield rec
 
 
-def _parse_pi05_config_name(name: str) -> dict[str, str]:
-    """Best-effort field extraction from a Pi0.5 openpi config dir name."""
+def _parse_pi05_config_name(
+    name: str,
+    exp_name: Optional[str] = None,
+) -> dict[str, str]:
+    """Best-effort field extraction from a Pi0.5 openpi config dir name.
+
+    `name` is the top-level config dir (e.g. ``pi05_robofactory_pm_lora_finetune``).
+    `exp_name` is the inner directory (e.g. ``pi05_pm_d1_v1``) — when provided
+    it can disambiguate the task in cases where the config dir omits it.
+    """
     out: dict[str, str] = {}
     if "wristcam" in name:
         out["dataset"] = "wc"
@@ -324,6 +336,24 @@ def _parse_pi05_config_name(name: str) -> dict[str, str]:
     if "libero" in name:
         out["task"] = "libero"  # ablation marker
         out["category"] = "ablation"
+
+    # Task disambiguation from exp_name when the config dir didn't reveal one.
+    if "task" not in out and exp_name:
+        for tok, task in (("_pm_", "pm"), ("_2sc_", "2sc"),
+                          ("_tsc_", "tsc"), ("_lp_", "lp")):
+            if tok in f"_{exp_name}_":
+                out["task"] = task
+                break
+
+    # Codebase convention (2026-05): every Pi0.5 decent finetune we've shipped
+    # is TSC. If task is still blank for a decent row, assume tsc and record
+    # the assumption in `notes` so a future 2sc/lp run is easy to flag.
+    if "task" not in out and out.get("scheme") == "decent":
+        out["task"] = "tsc"
+        out["notes"] = (
+            "task=tsc inferred from scheme=decent (codebase convention 2026-05); "
+            "verify manually if a 2sc/lp decent run lands"
+        )
     return out
 
 

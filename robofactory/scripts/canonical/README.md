@@ -27,7 +27,7 @@ ablations and similar studies.
 | `resume_dp_tsc_d2_in1k_a0_from285.sh` | Resume arm0 from epoch 285 (used 2026-05-07 to push past the orion preempt boundary). |
 | `resume_dp_tsc_d2_in1k_a1_from285.sh` | Same for arm1. |
 | `resume_dp_tsc_d2_in1k_a2_from285.sh` | Same for arm2. |
-| `tsc_d2_wristcam_table_60seeds_reeval.sh` | Re-eval the three d2_wristcam decent ckpts on the **TABLE** scene (`configs/table/three_robots_stack_cube.yaml`). **Verdict (2026-05-07, job 15359012):** 0/29 seeds at the time of writing, fully consistent — the scene-mismatch hypothesis is **rejected** and these ckpts are confirmed encoder-collapse (mirroring the D1 finding). Per plan v2 Phase B "re-eval-then-delete" rule, the d2 decent ckpts move to deletable pending the user's call. |
+| `tsc_d2_wristcam_table_60seeds_reeval.sh` | Re-eval the three d2_wristcam decent ckpts on the **TABLE** scene (`configs/table/three_robots_stack_cube.yaml`). **Verdict (2026-05-07, job 15359012):** 0/29 seeds with fully consistent failure pattern; user cancelled to save GPU time once the result became conclusive. The scene-mismatch hypothesis is **rejected** and these ckpts are confirmed encoder-collapse, mirroring the D1 finding. Per plan v2 Phase B "re-eval-then-delete" rule, the d2 decent ckpts move to deletable pending the user's call. |
 
 ### Three-Robot Stack Cube d1 decentralised — DP
 
