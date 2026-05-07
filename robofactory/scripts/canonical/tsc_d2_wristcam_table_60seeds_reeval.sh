@@ -29,6 +29,11 @@ export CUDA_VISIBLE_DEVICES=0
 export HOME=/iris/u/mikulrai
 export WANDB_API_KEY=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
 
+# Stage-3 per-eval guards (plan v2 C1#10). eval_multi_dp.py computes per-arm
+# ckpt paths internally, so we verify wandb-online + scene-config-exists only.
+python -u -m robofactory.utils.preflight_eval \
+  --scene-config configs/table/three_robots_stack_cube.yaml || exit 1
+
 python -u ./policy/Diffusion-Policy/eval_multi_dp.py \
   --config=configs/table/three_robots_stack_cube.yaml \
   --data-num=150 --checkpoint-num=300 \

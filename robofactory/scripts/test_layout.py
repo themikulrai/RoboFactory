@@ -120,21 +120,10 @@ class TestEvalLaunchersHavePreflight(unittest.TestCase):
     """Stage-3 per-eval guards (plan v2 C1#10): every eval launcher in the
     canonical/ablations dirs must invoke robofactory.utils.preflight_eval
     before its eval entrypoint, so a scene-mismatch / wandb-offline / missing
-    ckpt aborts the SLURM job before any GPU work.
-
-    Exception: tsc_d2_wristcam_table_60seeds_reeval.sh was deliberately not
-    wired in this round because job 15359012 was actively running against
-    that file when C1#10 landed; it gets the preflight in a follow-up.
-    """
-
-    EXEMPT = {"tsc_d2_wristcam_table_60seeds_reeval.sh"}
+    ckpt aborts the SLURM job before any GPU work."""
 
     def _eval_launchers(self) -> list[Path]:
-        return [
-            p for p in (list(CANONICAL.glob("*eval*.sh"))
-                        + list(ABLATIONS.glob("*eval*.sh")))
-            if p.name not in self.EXEMPT
-        ]
+        return list(CANONICAL.glob("*eval*.sh")) + list(ABLATIONS.glob("*eval*.sh"))
 
     def test_each_eval_launcher_invokes_preflight(self):
         for p in self._eval_launchers():
