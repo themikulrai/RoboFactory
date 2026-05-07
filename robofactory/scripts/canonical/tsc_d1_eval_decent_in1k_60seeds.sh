@@ -24,6 +24,13 @@ export HYDRA_FULL_ERROR=1
 
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
+# Stage-3 per-eval guards (plan v2 C1#10). eval_multi_dp.py computes per-arm
+# ckpt paths internally from --data-num/--checkpoint-num, so we only verify
+# wandb-online and scene-config-exists here; per-arm ckpt-existence is the
+# entrypoint's responsibility.
+python -u -m robofactory.utils.preflight_eval \
+  --scene-config configs/table/three_robots_stack_cube.yaml || exit 1
+
 python -u ./policy/Diffusion-Policy/eval_multi_dp.py \
   --config=configs/table/three_robots_stack_cube.yaml \
   --data-num=150 \

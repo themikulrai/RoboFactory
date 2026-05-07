@@ -20,6 +20,11 @@ export HYDRA_FULL_ERROR=1
 
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
+# Stage-3 per-eval guards (plan v2 C1#10).
+python -u -m robofactory.utils.preflight_eval \
+  --ckpt-path /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_r3m.ckpt \
+  --scene-config configs/table/pick_meat.yaml || exit 1
+
 python -u ./policy/Diffusion-Policy/eval_dp.py \
   --config=configs/table/pick_meat.yaml \
   --ckpt-path=/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_r3m.ckpt \

@@ -116,6 +116,59 @@ class TestLauncherWellFormedness(unittest.TestCase):
                 )
 
 
+class TestEvalLaunchersHavePreflight(unittest.TestCase):
+    """Stage-3 per-eval guards (plan v2 C1#10): every eval launcher in the
+    canonical/ablations dirs must invoke robofactory.utils.preflight_eval
+    before its eval entrypoint, so a scene-mismatch / wandb-offline / missing
+    ckpt aborts the SLURM job before any GPU work.
+
+    Exception: tsc_d2_wristcam_table_60seeds_reeval.sh was deliberately not
+    wired in this round because job 15359012 was actively running against
+    that file when C1#10 landed; it gets the preflight in a follow-up.
+    """
+
+    EXEMPT = {"tsc_d2_wristcam_table_60seeds_reeval.sh"}
+
+    def _eval_launchers(self) -> list[Path]:
+        return [
+            p for p in (list(CANONICAL.glob("*eval*.sh"))
+                        + list(ABLATIONS.glob("*eval*.sh")))
+            if p.name not in self.EXEMPT
+        ]
+
+    def test_each_eval_launcher_invokes_preflight(self):
+        for p in self._eval_launchers():
+            with self.subTest(launcher=p.name):
+                content = p.read_text()
+                self.assertIn(
+                    "robofactory.utils.preflight_eval",
+                    content,
+                    f"{p.name} does not invoke preflight_eval",
+                )
+
+    def test_preflight_runs_before_eval_entrypoint(self):
+        # The preflight call must appear BEFORE any python invocation of
+        # eval_dp.py / eval_multi_dp.py / eval_decent_pi05.py — otherwise it
+        # can't gate compute.
+        eval_entrypoint_re = re.compile(
+            r"python\s.*\beval_(?:dp|multi_dp|decent_pi05)\.py", re.MULTILINE
+        )
+        preflight_re = re.compile(
+            r"python\s.*\brobofactory\.utils\.preflight_eval", re.MULTILINE
+        )
+        for p in self._eval_launchers():
+            with self.subTest(launcher=p.name):
+                content = p.read_text()
+                pf = preflight_re.search(content)
+                ee = eval_entrypoint_re.search(content)
+                self.assertIsNotNone(pf, f"{p.name} no preflight call")
+                self.assertIsNotNone(ee, f"{p.name} no eval entrypoint")
+                self.assertLess(
+                    pf.start(), ee.start(),
+                    f"{p.name}: preflight comes after eval entrypoint",
+                )
+
+
 class TestReadmeIndexesEveryLauncher(unittest.TestCase):
     """The README in each dir must mention every launcher in that dir."""
 
