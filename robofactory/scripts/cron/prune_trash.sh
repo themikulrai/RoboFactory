@@ -13,6 +13,7 @@ set -euo pipefail
 
 ROOTS=(
     /iris/u/mikulrai/checkpoints/openpi
+    /iris/u/mikulrai/checkpoints/RoboFactory
 )
 MAX_AGE_DAYS=14
 LOG=/iris/u/mikulrai/logs/prune_trash.log
