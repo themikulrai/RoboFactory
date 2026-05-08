@@ -28,6 +28,7 @@ import argparse
 import csv
 import dataclasses
 import datetime as _dt
+import json
 import re
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -358,6 +359,72 @@ def _parse_pi05_config_name(
 
 
 # ---------------------------------------------------------------------------
+# JSONL fallback for slurm-killed runs (workflow improvement #6)
+# ---------------------------------------------------------------------------
+
+def _eval_sr_from_jsonl(config: dict) -> tuple[Optional[float], Optional[int]]:
+    """Recover (success_rate, n_total) from the eval JSONL on disk.
+
+    The eval_dp / eval_multi_dp drivers bake `jsonl_path` into the manifest
+    they pass to `wandb.init(config=...)` (see eval_dp.py:348). When SLURM
+    kills the job before `wandb.finish()` runs, the wandb summary stays
+    empty but the JSONL on disk is intact. This helper reads it.
+
+    Layout:
+      line 1     -- {"kind": "manifest", ...}
+      lines 2..N -- {"kind": "episode", "success": 0/1, ...}
+      last line  -- {"kind": "summary", "success_rate": ..., "n_total": ...}
+                    (absent if killed mid-eval)
+
+    Strategy:
+      1. If a `summary` line exists, return its fields verbatim.
+      2. Otherwise, count episode rows + their `success` field and
+         compute SR + n_total ourselves.
+    """
+    path_str = config.get("jsonl_path") or config.get("results_json_path")
+    if not path_str:
+        return None, None
+    path = Path(str(path_str))
+    if not path.is_file():
+        return None, None
+
+    sr: Optional[float] = None
+    n: Optional[int] = None
+    n_succ = 0
+    n_total = 0
+    try:
+        with path.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = row.get("kind")
+                if kind == "summary":
+                    if "success_rate" in row:
+                        sr = float(row["success_rate"])
+                    for nk in ("n_total", "n_episodes", "n"):
+                        if nk in row:
+                            n = int(row[nk])
+                            break
+                elif kind == "episode":
+                    n_total += 1
+                    if int(row.get("success", 0)):
+                        n_succ += 1
+    except OSError:
+        return None, None
+
+    if sr is not None:
+        return sr, n
+    if n_total > 0:
+        return n_succ / n_total, n_total
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Wandb fetcher (optional — requires `wandb` package + login)
 # ---------------------------------------------------------------------------
 
@@ -457,6 +524,20 @@ def wandb_run_to_record(r, *, project: str) -> "RunRecord":
         if nk in summary:
             eval_n = str(summary[nk])
             break
+
+    # JSONL fallback (workflow improvement #6): when SLURM kills wandb mid-eval
+    # (e.g. timelimit hit before `wandb.finish()`), `summary/*` is empty even
+    # though the on-disk JSONL has every episode row. Recover by tailing the
+    # JSONL's last summary line, or — if the summary line itself is missing
+    # because the kill landed mid-eval — by computing SR from the episode
+    # rows on the fly. Path comes from the eval_dp / eval_multi_dp manifest
+    # the eval driver baked into wandb config at init time.
+    if not eval_sr:
+        sr_jsonl, n_jsonl = _eval_sr_from_jsonl(config)
+        if sr_jsonl is not None:
+            eval_sr = str(sr_jsonl)
+            if not eval_n and n_jsonl is not None:
+                eval_n = str(n_jsonl)
 
     # Phase fallback: if the run name lacks a phase token but config or
     # tags indicate an eval, mark it eval.

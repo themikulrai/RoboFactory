@@ -314,5 +314,91 @@ class TestCliDryRun(unittest.TestCase):
         self.assertEqual(rc, 0)
 
 
+class TestEvalSrFromJsonl(unittest.TestCase):
+    """Workflow improvement #6: SLURM-killed wandb run still gets SR from JSONL."""
+
+    def _write_jsonl(self, lines):
+        import json
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, dir=tempfile.gettempdir()
+        )
+        for line in lines:
+            tmp.write(json.dumps(line) + "\n")
+        tmp.close()
+        self.addCleanup(lambda p=tmp.name: Path(p).unlink(missing_ok=True))
+        return tmp.name
+
+    def test_no_path_in_config_returns_none(self):
+        sr, n = manifest._eval_sr_from_jsonl({})
+        self.assertIsNone(sr)
+        self.assertIsNone(n)
+
+    def test_missing_jsonl_file_returns_none(self):
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": "/no/such/file.jsonl"})
+        self.assertIsNone(sr)
+        self.assertIsNone(n)
+
+    def test_clean_summary_line_is_used(self):
+        path = self._write_jsonl([
+            {"kind": "manifest", "task": "PickMeat-rf"},
+            {"kind": "episode", "success": 1},
+            {"kind": "episode", "success": 0},
+            {"kind": "summary", "success_rate": 0.5, "n_total": 60},
+        ])
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path})
+        self.assertEqual(sr, 0.5)
+        self.assertEqual(n, 60)
+
+    def test_killed_mid_eval_computes_from_episodes(self):
+        # Slurm killed before summary line was written; recover from episodes.
+        rows = [{"kind": "manifest"}]
+        for i in range(27):
+            rows.append({"kind": "episode", "success": 0})
+        path = self._write_jsonl(rows)
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path})
+        self.assertEqual(sr, 0.0)
+        self.assertEqual(n, 27)
+
+    def test_killed_mid_eval_partial_success_rate(self):
+        rows = [{"kind": "manifest"}]
+        for i in range(10):
+            rows.append({"kind": "episode", "success": 1 if i < 3 else 0})
+        path = self._write_jsonl(rows)
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path})
+        self.assertAlmostEqual(sr, 0.3)
+        self.assertEqual(n, 10)
+
+    def test_results_json_path_alias_works(self):
+        # eval_decent_pi05.py uses `results_json_path` instead of `jsonl_path`.
+        path = self._write_jsonl([
+            {"kind": "manifest"},
+            {"kind": "episode", "success": 1},
+            {"kind": "summary", "success_rate": 1.0, "n_total": 1},
+        ])
+        sr, n = manifest._eval_sr_from_jsonl({"results_json_path": path})
+        self.assertEqual(sr, 1.0)
+        self.assertEqual(n, 1)
+
+    def test_malformed_lines_skipped(self):
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, dir=tempfile.gettempdir()
+        )
+        path.write('{"kind": "manifest"}\n')
+        path.write("not valid json at all\n")
+        path.write('{"kind": "episode", "success": 1}\n')
+        path.write('{"kind": "summary", "success_rate": 1.0, "n_total": 1}\n')
+        path.close()
+        self.addCleanup(lambda: Path(path.name).unlink(missing_ok=True))
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path.name})
+        self.assertEqual(sr, 1.0)
+        self.assertEqual(n, 1)
+
+    def test_zero_episodes_returns_none(self):
+        path = self._write_jsonl([{"kind": "manifest"}])
+        sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path})
+        self.assertIsNone(sr)
+        self.assertIsNone(n)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
