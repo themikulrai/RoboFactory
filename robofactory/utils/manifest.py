@@ -372,21 +372,341 @@ def fetch_wandb_runs(
         from wandb.apis.public import Api  # type: ignore
     except Exception:
         return
-    api = Api()
+    try:
+        api = Api()
+    except Exception:
+        return
     for project in projects:
         try:
             runs = api.runs(f"{entity}/{project}")
         except Exception:
             continue
         for r in runs:
-            yield RunRecord(
-                run_id=r.name or r.id,
-                model="dp" if "diffusion" in project.lower() or "dp" in project.lower() else "pi05",
-                wandb_url=r.url,
-                status="done" if r.state == "finished" else r.state,
-                created_utc=r.created_at,
-                notes=f"wandb_id={r.id}; project={project}",
-            )
+            try:
+                yield wandb_run_to_record(r, project=project)
+            except Exception:
+                # Defensive: a single malformed wandb run must not nuke the
+                # whole manifest pass. Skip and continue.
+                continue
+
+
+def wandb_run_to_record(r, *, project: str) -> "RunRecord":
+    """Convert a wandb Run object (or duck-typed equivalent) into a RunRecord.
+
+    Factored out of fetch_wandb_runs so tests can build a fake run object
+    without spinning up wandb.Api().
+    """
+    name = getattr(r, "name", None) or getattr(r, "id", "") or ""
+    state = getattr(r, "state", "") or ""
+    config = getattr(r, "config", {}) or {}
+    summary = getattr(r, "summary", {}) or {}
+    tags = list(getattr(r, "tags", []) or [])
+
+    # Status map: wandb states -> manifest statuses.
+    state_map = {
+        "finished": "done",
+        "failed": "failed",
+        "crashed": "failed",
+        "killed": "failed",
+        "running": "running",
+        "queued": "queued",
+        "preempted": "queued",
+    }
+    status = state_map.get(state, state or "unknown")
+
+    # Best-effort field extraction. Prefer canonical run_id parser; fall
+    # back to legacy DP / pi05 config-name heuristics.
+    parsed = parse_canonical_run_id(name) or {}
+    fields: dict[str, str] = {}
+    for k in (
+        "model", "dataset", "task", "encoder", "scheme", "arm",
+        "phase", "step", "seed", "git_sha",
+    ):
+        v = parsed.get(k, "")
+        if v:
+            fields[k] = v
+
+    # Project hint when canonical parser failed.
+    if not fields.get("model"):
+        plow = project.lower()
+        if "diffusion" in plow or plow.startswith("dp"):
+            fields["model"] = "dp"
+        elif "openpi" in plow or "pi05" in plow:
+            fields["model"] = "pi05"
+
+    # Common config keys that might give us extra info.
+    for cfg_key, fld in (
+        ("seed", "seed"),
+        ("git_sha", "git_sha"),
+        ("slurm_job_id", "slurm_id"),
+        ("SLURM_JOB_ID", "slurm_id"),
+    ):
+        if cfg_key in config and not fields.get(fld):
+            fields[fld] = str(config[cfg_key])
+
+    # Eval summary metrics.
+    eval_sr = ""
+    eval_n = ""
+    for sk in ("eval/success_rate", "success_rate", "eval_sr"):
+        if sk in summary:
+            eval_sr = str(summary[sk])
+            break
+    for nk in ("eval/n", "n_episodes", "eval_n"):
+        if nk in summary:
+            eval_n = str(summary[nk])
+            break
+
+    # Phase fallback: if the run name lacks a phase token but config or
+    # tags indicate an eval, mark it eval.
+    if not fields.get("phase"):
+        if any(t.lower() == "eval" for t in tags) or "eval" in name.lower():
+            fields["phase"] = "eval"
+        elif any(t.lower() == "train" for t in tags) or "train" in name.lower():
+            fields["phase"] = "train"
+
+    note_bits = [f"wandb_id={getattr(r, 'id', '')}", f"project={project}"]
+    if tags:
+        note_bits.append("tags=" + ",".join(tags))
+
+    return RunRecord(
+        run_id=name,
+        wandb_url=getattr(r, "url", "") or "",
+        status=status,
+        created_utc=str(getattr(r, "created_at", "") or ""),
+        eval_sr=eval_sr,
+        eval_n=eval_n,
+        notes="; ".join(note_bits),
+        **fields,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CkptResolver-backed scanner + merge logic for generate_manifest_csv()
+# ---------------------------------------------------------------------------
+
+
+def _ckpt_entry_to_record(entry) -> RunRecord:
+    """Build a RunRecord from one CkptEntry (per ckpt_index.jsonl row).
+
+    The framework token from CkptResolver maps directly to manifest.model.
+    """
+    framework = getattr(entry, "framework", "")
+    identifier = getattr(entry, "identifier", "")
+    epoch = getattr(entry, "epoch", "")
+    path_str = getattr(entry, "path", "")
+    mtime = getattr(entry, "mtime_unix", None)
+
+    fields: dict[str, str] = {"model": framework if framework in _VALID_MODELS else ""}
+    if framework == "dp":
+        fields.update(parse_legacy_dp_dirname(identifier.split(":", 1)[0]))
+    elif framework == "pi05":
+        # identifier is "<config>/<exp>" for pi05 entries
+        if "/" in identifier:
+            cfg_name, exp_name = identifier.split("/", 1)
+        else:
+            cfg_name, exp_name = identifier, ""
+        fields.update(_parse_pi05_config_name(cfg_name, exp_name=exp_name))
+
+    parser_notes = fields.pop("notes", "")
+    fields.setdefault("model", framework)
+
+    created = ""
+    if mtime is not None:
+        try:
+            created = _dt.datetime.utcfromtimestamp(float(mtime)).isoformat() + "Z"
+        except (OverflowError, OSError, ValueError):
+            created = ""
+
+    return RunRecord(
+        run_id=f"legacy:{framework}:{identifier}",
+        phase="train",
+        step=str(epoch),
+        ckpt_paths=path_str,
+        status="done",
+        created_utc=created,
+        notes=("ckpt_index entry" + (f"; {parser_notes}" if parser_notes else "")),
+        **fields,
+    )
+
+
+def _records_from_ckpt_index(index_path: Path) -> Iterator[RunRecord]:
+    """Yield RunRecords from the ckpt_index.jsonl produced by CkptResolver."""
+    try:
+        from robofactory.utils.ckpt_resolver import CkptResolver
+    except Exception:
+        return
+    if not Path(index_path).is_file():
+        return
+    res = CkptResolver.load(Path(index_path))
+    # Group by (framework, identifier) so we emit one row per logical run
+    # with the latest ckpt path; track ckpt count for notes.
+    by_run: dict[tuple[str, str], list] = {}
+    for e in res:
+        by_run.setdefault((e.framework, e.identifier), []).append(e)
+    for (_fw, _ident), entries in by_run.items():
+        latest = max(entries, key=lambda x: (x.epoch, x.mtime_unix))
+        rec = _ckpt_entry_to_record(latest)
+        rec.notes = (
+            (rec.notes + "; " if rec.notes else "")
+            + f"{len(entries)} ckpt rows in index; min_epoch={min(e.epoch for e in entries)}"
+        )
+        yield rec
+
+
+def _walk_run_root(run_root: Path) -> Iterator[RunRecord]:
+    """Walk RUN_ROOT/<model>/<dataset>/<task>/<run_id>/ for canonical runs.
+
+    Layout per plan v2 C1: each canonical run gets its own subdir under
+    RUN_ROOT. Empty in early phases — caller treats zero rows as fine.
+    """
+    if not Path(run_root).is_dir():
+        return
+    for model_dir in Path(run_root).iterdir():
+        if not model_dir.is_dir() or model_dir.name not in _VALID_MODELS:
+            continue
+        for ds_dir in model_dir.iterdir():
+            if not ds_dir.is_dir():
+                continue
+            for task_dir in ds_dir.iterdir():
+                if not task_dir.is_dir():
+                    continue
+                for run_dir in task_dir.iterdir():
+                    if not run_dir.is_dir():
+                        continue
+                    parsed = parse_canonical_run_id(run_dir.name) or {}
+                    rec = RunRecord(
+                        run_id=run_dir.name,
+                        status="unknown",
+                        notes=f"run_dir={run_dir}",
+                        **{k: v for k, v in parsed.items() if k in {
+                            "model", "dataset", "task", "encoder", "scheme",
+                            "arm", "phase", "step", "seed", "git_sha",
+                        }},
+                    )
+                    yield rec
+
+
+def _merge_records(
+    wandb_recs: Iterable[RunRecord],
+    ckpt_recs: Iterable[RunRecord],
+    runroot_recs: Iterable[RunRecord],
+) -> list[RunRecord]:
+    """Merge the three streams into a deduplicated list.
+
+    Strategy:
+      * primary key is run_id when canonical; for legacy ckpt rows it is
+        ``legacy:<framework>:<identifier>``.
+      * a wandb record whose run_id matches a ckpt record by exact run_id
+        OR whose notes contain the ckpt identifier merges the two — wandb
+        contributes status/url/eval metrics, ckpt contributes ckpt_paths.
+      * un-matched records pass through with their own run_ids.
+    """
+    wandb_list = list(wandb_recs)
+    ckpt_list = list(ckpt_recs)
+    runroot_list = list(runroot_recs)
+
+    # Index ckpts by run_id and by short identifier.
+    ckpt_by_id: dict[str, RunRecord] = {r.run_id: r for r in ckpt_list}
+    used_ckpt_ids: set[str] = set()
+
+    merged: list[RunRecord] = []
+
+    for wrec in wandb_list:
+        match = ckpt_by_id.get(wrec.run_id)
+        if match is None:
+            # Try to match by structural fields (model+dataset+task+arm+seed).
+            for cid, crec in ckpt_by_id.items():
+                if cid in used_ckpt_ids:
+                    continue
+                if (
+                    wrec.model and wrec.model == crec.model
+                    and wrec.task and wrec.task == crec.task
+                    and wrec.scheme and wrec.scheme == crec.scheme
+                    and wrec.arm == crec.arm
+                    and wrec.seed and wrec.seed == crec.seed
+                ):
+                    match = crec
+                    break
+        if match is not None:
+            used_ckpt_ids.add(match.run_id)
+            merged.append(_combine(wrec, match))
+        else:
+            merged.append(wrec)
+
+    for cid, crec in ckpt_by_id.items():
+        if cid not in used_ckpt_ids:
+            merged.append(crec)
+
+    # Run-root walk emits canonical-runid rows; treat as authoritative for
+    # any run_id not already present.
+    seen_ids = {r.run_id for r in merged}
+    for rrec in runroot_list:
+        if rrec.run_id not in seen_ids:
+            merged.append(rrec)
+            seen_ids.add(rrec.run_id)
+
+    return merged
+
+
+def _combine(wandb_rec: RunRecord, ckpt_rec: RunRecord) -> RunRecord:
+    """Field-wise merge: prefer wandb for metadata, ckpt for paths."""
+    out = dataclasses.replace(wandb_rec)
+    # ckpt_paths and step come from ckpt side
+    if ckpt_rec.ckpt_paths and not out.ckpt_paths:
+        out.ckpt_paths = ckpt_rec.ckpt_paths
+    if ckpt_rec.step and not out.step:
+        out.step = ckpt_rec.step
+    # fill structural fields the wandb parser missed
+    for f in ("model", "dataset", "task", "encoder", "scheme", "arm"):
+        if not getattr(out, f) and getattr(ckpt_rec, f):
+            setattr(out, f, getattr(ckpt_rec, f))
+    if ckpt_rec.created_utc and not out.created_utc:
+        out.created_utc = ckpt_rec.created_utc
+    if ckpt_rec.notes:
+        out.notes = (out.notes + "; " if out.notes else "") + ckpt_rec.notes
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Top-level generator (additive API used by `python -m robofactory.utils.manifest_csv`)
+# ---------------------------------------------------------------------------
+
+def generate_manifest_csv(
+    out_path: Optional[Path] = None,
+    *,
+    fetch_wandb: bool = True,
+    wandb_entity: str = "mikulrai-stanford-university",
+    wandb_projects: tuple[str, ...] = ("diffusion-robofactory", "openpi-robofactory"),
+    ckpt_index_path: Optional[Path] = None,
+    run_root: Optional[Path] = None,
+) -> int:
+    """Regenerate the 23-column manifest CSV from wandb + ckpt index + runs/.
+
+    Returns the number of data rows written. Wraps the wandb call in a
+    try/except so an offline/down API never crashes the manifest build.
+    """
+    if out_path is None:
+        out_path = paths.MANIFEST_PATH
+    if ckpt_index_path is None:
+        ckpt_index_path = paths.CKPT_INDEX_PATH
+    if run_root is None:
+        run_root = paths.RUN_ROOT
+
+    wandb_recs: list[RunRecord] = []
+    if fetch_wandb:
+        try:
+            wandb_recs = list(fetch_wandb_runs(wandb_entity, list(wandb_projects)))
+        except Exception as e:
+            # Soft-fail: proceed with whatever filesystem data we have.
+            print(f"manifest_csv: wandb fetch failed ({e!r}); continuing without wandb rows")
+            wandb_recs = []
+
+    ckpt_recs = list(_records_from_ckpt_index(Path(ckpt_index_path)))
+    runroot_recs = list(_walk_run_root(Path(run_root)))
+
+    merged = _merge_records(wandb_recs, ckpt_recs, runroot_recs)
+    n = write_manifest_csv(merged, Path(out_path))
+    return n
 
 
 # ---------------------------------------------------------------------------
