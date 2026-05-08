@@ -23,12 +23,13 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+from robofactory.utils.paths import CKPT_INDEX_PATH as DEFAULT_INDEX_PATH
+
 
 CKPT_ROOTS = (
     Path("/iris/u/mikulrai/checkpoints/RoboFactory"),
     Path("/iris/u/mikulrai/checkpoints/openpi"),
 )
-DEFAULT_INDEX_PATH = Path("/iris/u/mikulrai/runs/ckpt_index.jsonl")
 
 
 @dataclasses.dataclass(frozen=True)

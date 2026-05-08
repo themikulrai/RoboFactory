@@ -20,8 +20,8 @@ try:
 except ImportError:
     HAVE_YAML = False
 
+from robofactory.utils.paths import CALIB_DIR as CALIBRATION_DIR
 
-CALIBRATION_DIR = Path("/iris/u/mikulrai/runs/calibration")
 MANIFEST_PATH = CALIBRATION_DIR / "MANIFEST.yaml"
 
 

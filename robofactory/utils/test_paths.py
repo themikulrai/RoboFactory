@@ -66,5 +66,42 @@ class TestDebugOutputDir(unittest.TestCase):
         self.assertEqual(out.name, "a_20260507")
 
 
+class TestNewPathConstants(unittest.TestCase):
+    """Sanity tests for symbols added in C2 cleanup (Tier 0.4)."""
+
+    def test_home_is_alias_of_user_home(self):
+        # HOME and USER_HOME must refer to the exact same Path; new code can
+        # prefer HOME without losing parity with the legacy USER_HOME name.
+        self.assertEqual(paths.HOME, paths.USER_HOME)
+        self.assertIsInstance(paths.HOME, Path)
+
+    def test_home_buckets_are_paths_under_home(self):
+        for name in ("CHECKPOINT_ROOT", "LOGS_ROOT", "DATA_ROOT", "SCRATCH_ROOT"):
+            with self.subTest(name=name):
+                p = getattr(paths, name)
+                self.assertIsInstance(p, Path)
+                self.assertEqual(p.parent, paths.HOME)
+
+    def test_checkpoint_root_value(self):
+        self.assertEqual(paths.CHECKPOINT_ROOT, paths.HOME / "checkpoints")
+
+    def test_logs_root_value(self):
+        self.assertEqual(paths.LOGS_ROOT, paths.HOME / "logs")
+
+    def test_data_root_value(self):
+        self.assertEqual(paths.DATA_ROOT, paths.HOME / "data")
+
+    def test_scratch_root_value(self):
+        self.assertEqual(paths.SCRATCH_ROOT, paths.HOME / "scratch")
+
+    def test_calib_dir(self):
+        self.assertIsInstance(paths.CALIB_DIR, Path)
+        self.assertEqual(paths.CALIB_DIR, paths.RUN_ROOT / "calibration")
+
+    def test_ckpt_index_path(self):
+        self.assertIsInstance(paths.CKPT_INDEX_PATH, Path)
+        self.assertEqual(paths.CKPT_INDEX_PATH, paths.RUN_ROOT / "ckpt_index.jsonl")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
