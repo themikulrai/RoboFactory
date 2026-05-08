@@ -29,6 +29,17 @@ export CUDA_VISIBLE_DEVICES=0
 export HOME=/iris/u/mikulrai
 export WANDB_API_KEY=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
 
+# Stage-3 preflight guards — refuses to run on scene/camera/seed/wandb mismatch.
+EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/three_robots_stack_cube.yaml}"
+TRAIN_CFG_PATH="${TRAIN_CFG_PATH:-${EVAL_CFG_PATH}}"
+PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
+$PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
+    --train-cfg "${TRAIN_CFG_PATH}" \
+    --eval-cfg "${EVAL_CFG_PATH}" \
+    --seed-file /iris/u/mikulrai/runs/eval_seeds_60.txt \
+    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds.sha256
+if [ $? -ne 0 ]; then echo "Preflight failed; aborting."; exit 1; fi
+
 # Stage-3 per-eval guards (plan v2 C1#10). eval_multi_dp.py computes per-arm
 # ckpt paths internally, so we verify wandb-online + scene-config-exists only.
 python -u -m robofactory.utils.preflight_eval \
