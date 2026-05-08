@@ -56,11 +56,23 @@ class TableSceneBuilder(RFSceneBuilder):
                     )
                     initial_ppos = asset_cfg['pos']['ppos']['p']
                     if 'randp_scale' in asset_cfg['pos']:
-                        # NOTE: not patched to self.env._episode_rng because (a) build() runs at
-                        # env construction time, before reset()/_set_episode_rng, so _episode_rng
-                        # is None here; and (b) all asset randp_scale values in configs/table/*.yaml
-                        # are [0, 0, 0], so this multiplication is a no-op regardless of RNG source.
-                        initial_ppos = np.array(initial_ppos) + np.array(asset_cfg['pos']['randp_scale']) * np.random.rand((len(initial_ppos)))
+                        # build() runs at env construction time, before reset()/_set_episode_rng,
+                        # so self.env._episode_rng is None here. The bare np.random.rand below
+                        # would silently desync from the planner's --seed and quietly break
+                        # data-gen reproducibility. Today every table-asset randp_scale is
+                        # [0,0,0] so this is a no-op; if a future YAML adds a non-zero scale,
+                        # crash here instead of generating unreproducible data. Move the asset
+                        # to scene.objects: (handled at reset() with proper _episode_rng seeding)
+                        # or refactor build() to defer asset placement to initialize().
+                        rps = asset_cfg['pos']['randp_scale']
+                        if any(v != 0 for v in rps):
+                            raise NotImplementedError(
+                                f"Non-zero randp_scale {rps} on table asset {asset_name!r} "
+                                f"is not reproducible from the planner --seed. Either move "
+                                f"this asset under scene.objects: (which runs at reset() "
+                                f"with _episode_rng) or refactor build() to defer placement."
+                            )
+                        initial_ppos = np.array(initial_ppos) + np.array(rps) * np.random.rand((len(initial_ppos)))
                         initial_ppos = initial_ppos.tolist()
                     builder.initial_pose = sapien.Pose(
                         p=asset_cfg['pos']['ppos']['p'], q=euler2quat(*asset_cfg['pos']['ppos']['q'])
