@@ -111,6 +111,29 @@ class RobotWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         # pdb.set_trace()
 
+        # Plan v2 C1#10 — dump training config (with derived obs_cam_family)
+        # into the ckpt dir so eval-side preflight guards can do scene-match +
+        # camera-family assertions against trainer-truth instead of falling
+        # back to EVAL_CFG as the train-cfg sentinel.
+        try:
+            _zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem
+            _ckpt_dir = pathlib.Path('checkpoints') / _zarr_stem
+            _ckpt_dir.mkdir(parents=True, exist_ok=True)
+            _hydra_dump_path = _ckpt_dir / '.hydra_config.yaml'
+            if not _hydra_dump_path.exists():
+                _resolved = OmegaConf.to_container(cfg, resolve=True)
+                _fam = None
+                if '_workspace_' in _zarr_stem:
+                    _fam = 'workspace'
+                elif '_wristcam_' in _zarr_stem:
+                    _fam = 'wristcam'
+                if _fam is not None:
+                    _resolved.setdefault('task', {})['obs_cam_family'] = _fam
+                OmegaConf.save(config=OmegaConf.create(_resolved), f=str(_hydra_dump_path))
+                print(f"[hydra-dump] wrote {_hydra_dump_path} (obs_cam_family={_fam!r})")
+        except Exception as _e:
+            print(f"[hydra-dump] skipped: {_e}")
+
         # resume training
         explicit_load = cfg.training.get('load_ckpt', None) if hasattr(cfg.training, 'get') else None
         if explicit_load:
