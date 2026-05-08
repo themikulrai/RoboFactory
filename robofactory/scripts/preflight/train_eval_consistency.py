@@ -61,6 +61,15 @@ class Check:
                 message=str(e),
                 details=getattr(e, "details", {}),
             )
+        except Exception as e:
+            # A typo / KeyError / AttributeError in a check fn must not crash
+            # run_all. Record as a failure with the exception type.
+            return CheckResult(
+                name=self.name,
+                passed=False,
+                message=f"check raised {type(e).__name__}: {e}",
+                details={"exc_type": type(e).__name__},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +116,12 @@ def check_image_preprocess(train_cfg: dict, eval_cfg: dict) -> None:
 
 
 def check_action_space_semantics(train_cfg: dict, eval_cfg: dict) -> None:
-    """delta-vs-absolute, gripper 0/1 vs -1/1, joint vs eef must match."""
+    """delta-vs-absolute, gripper 0/1 vs -1/1, joint vs eef must match.
+
+    Both sides missing the field is *not* a silent pass: every action spec has
+    a mode/gripper-convention/control-target, so absence on both sides is a
+    config bug we want surfaced loudly.
+    """
     keys = (
         "action.mode",          # "delta" | "absolute"
         "action.gripper_range",  # "[0,1]" | "[-1,1]"
@@ -116,6 +130,11 @@ def check_action_space_semantics(train_cfg: dict, eval_cfg: dict) -> None:
     for key in keys:
         t = _get(train_cfg, key)
         e = _get(eval_cfg, key)
+        if t is None or e is None:
+            raise CheckFailure(
+                f"{key} missing (train={t!r}, eval={e!r}). "
+                "Required field for action-space parity."
+            )
         if t != e:
             raise CheckFailure(f"{key} mismatch: train={t!r}, eval={e!r}")
 
@@ -214,43 +233,41 @@ def run_all(
     return results
 
 
-def main() -> int:
+if __name__ == "__main__":
+    import yaml
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train-yaml", type=Path, required=True,
-                    help="Path to a YAML containing the train pipeline knobs we care about.")
-    ap.add_argument("--eval-yaml", type=Path, required=True,
-                    help="Path to a YAML containing the eval pipeline knobs we care about.")
-    ap.add_argument("--report-out", type=Path, default=None,
-                    help="Optional JSON sink for the full report.")
-    ap.add_argument("--strict", action="store_true",
-                    help="Exit non-zero if any check fails (default: strict).")
-    ap.add_argument("--no-strict", dest="strict", action="store_false")
-    ap.set_defaults(strict=True)
+    ap.add_argument("--train-cfg", type=Path, required=True,
+                    help="Path to the train pipeline YAML.")
+    ap.add_argument("--eval-cfg", type=Path, required=True,
+                    help="Path to the eval pipeline YAML.")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="JSON report sink (default: <train-cfg-dir>/preflight_consistency.json).")
     args = ap.parse_args()
 
-    train_cfg = _load_yaml(args.train_yaml)
-    eval_cfg = _load_yaml(args.eval_yaml)
+    out_path: Path = args.out if args.out is not None else (
+        args.train_cfg.parent / "preflight_consistency.json"
+    )
+
+    train_cfg = yaml.safe_load(args.train_cfg.read_text())
+    eval_cfg = yaml.safe_load(args.eval_cfg.read_text())
+
     results = run_all(train_cfg, eval_cfg)
-
+    n_total = len(results)
     n_fail = sum(1 for r in results if not r.passed)
-    for r in results:
-        marker = "OK  " if r.passed else "FAIL"
-        print(f"[{marker}] {r.name}: {r.message}")
+    n_pass = n_total - n_fail
 
-    if args.report_out:
-        args.report_out.parent.mkdir(parents=True, exist_ok=True)
-        args.report_out.write_text(json.dumps(
-            {"results": [dataclasses.asdict(r) for r in results],
-             "n_total": len(results), "n_failed": n_fail,
-             "pending_heavy_checks": list(HEAVY_CHECKS_PENDING)}, indent=2))
-        print(f"\nReport: {args.report_out}")
+    report = {
+        "checks": [
+            {"name": r.name, "passed": r.passed, "message": r.message}
+            for r in results
+        ],
+        "n_fail": n_fail,
+        "n_total": n_total,
+        "passed_overall": n_fail == 0,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2))
 
-    print(f"\n{len(results) - n_fail}/{len(results)} checks passed; "
-          f"{len(HEAVY_CHECKS_PENDING)} heavy checks pending.")
-    if args.strict and n_fail > 0:
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    print(f"preflight: {n_pass}/{n_total} checks passed -> {out_path}")
+    sys.exit(0 if n_fail == 0 else 1)
