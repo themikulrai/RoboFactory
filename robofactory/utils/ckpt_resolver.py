@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from robofactory.utils.paths import CKPT_INDEX_PATH as DEFAULT_INDEX_PATH
 
+
+_log = logging.getLogger(__name__)
 
 CKPT_ROOTS = (
     Path("/iris/u/mikulrai/checkpoints/RoboFactory"),
@@ -47,7 +50,9 @@ class CkptEntry:
 
 
 # Match DP-style numeric ckpt files: 5.ckpt, 300.ckpt, 300_in1k.ckpt, ...
-_DP_NUMERIC_CKPT = re.compile(r"^(\d+)(?:_[a-zA-Z0-9_-]+)?\.ckpt$")
+# Group 2 captures the optional encoder/variant suffix so we can disambiguate
+# `300_in1k.ckpt` from `300_dino_blora.ckpt` etc.
+_DP_NUMERIC_CKPT = re.compile(r"^(\d+)(?:_([a-zA-Z0-9_-]+))?\.ckpt$")
 # Pi0.5 orbax step dirs are non-zero-padded ints
 _PI05_STEP_DIR = re.compile(r"^\d+$")
 
@@ -58,9 +63,11 @@ def _scan_dp(root: Path) -> Iterator[CkptEntry]:
     for run_dir in root.iterdir():
         if not run_dir.is_dir():
             continue
-        identifier = run_dir.name
+        run_name = run_dir.name
+        if ".trash_" in run_name:
+            continue
         # task = leading "<task>-rf" segment if present, else first underscore segment
-        task = identifier.split("-rf")[0] if "-rf" in identifier else identifier.split("_")[0]
+        task = run_name.split("-rf")[0] if "-rf" in run_name else run_name.split("_")[0]
         for sub in run_dir.rglob("*.ckpt"):
             if not sub.is_file():
                 continue
@@ -69,13 +76,17 @@ def _scan_dp(root: Path) -> Iterator[CkptEntry]:
                 continue
             try:
                 epoch = int(m.group(1))
+                suffix = m.group(2)
                 stat = sub.stat()
             except (OSError, ValueError):
                 continue
+            # Encode encoder/variant suffix in the identifier so 300_in1k.ckpt
+            # and 300_dino_blora.ckpt are distinguishable to find()/latest().
+            ident = f"{run_name}:{suffix}" if suffix else run_name
             yield CkptEntry(
                 framework="dp",
                 task=task,
-                identifier=identifier,
+                identifier=ident,
                 epoch=epoch,
                 path=str(sub),
                 size_bytes=stat.st_size,
@@ -129,18 +140,18 @@ class CkptResolver:
         self._entries: list[CkptEntry] = list(entries) if entries else []
 
     @classmethod
+    def _entry_from_dict(cls, d: dict) -> CkptEntry:
+        """Forward-compat constructor: silently drop unknown fields so an index
+        produced by a newer writer is still loadable by an older reader."""
+        known = {f.name for f in dataclasses.fields(CkptEntry)}
+        return CkptEntry(**{k: v for k, v in d.items() if k in known})
+
+    @classmethod
     def load(cls, path: Path | str = DEFAULT_INDEX_PATH) -> "CkptResolver":
         path = Path(path)
         if not path.is_file():
             return cls()
-        entries: list[CkptEntry] = []
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entries.append(CkptEntry(**json.loads(line)))
-        return cls(entries)
+        return cls(list(cls._iter_loaded(path)))
 
     def scan_legacy_tree(
         self,
@@ -167,11 +178,22 @@ class CkptResolver:
 
     @staticmethod
     def _iter_loaded(path: Path) -> Iterator[CkptEntry]:
+        """Robust line-by-line loader. Logs and skips malformed JSON lines so
+        a single corrupted row does not nuke the whole index."""
         with path.open() as f:
-            for line in f:
+            for lineno, line in enumerate(f, start=1):
                 line = line.strip()
-                if line:
-                    yield CkptEntry(**json.loads(line))
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError as e:
+                    _log.warning(
+                        "ckpt_index %s line %d: skipping malformed JSON (%s)",
+                        path, lineno, e,
+                    )
+                    continue
+                yield CkptResolver._entry_from_dict(d)
 
     def find(
         self,
