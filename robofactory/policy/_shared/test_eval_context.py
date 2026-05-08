@@ -165,5 +165,78 @@ class TestVideoRecorder(unittest.TestCase):
                 self.assertTrue(p.endswith("seed1234567_global.mp4"))
 
 
+class TestDeriveTagsFromName(unittest.TestCase):
+    """Workflow improvement #3 — tags inferred from run name at init time."""
+
+    def test_dp_pm_workspace_train(self):
+        tags = eval_context._derive_tags_from_name("dp_ws_pm_in1k_cent_train_s100_a3c736d")
+        self.assertIn("dp", tags)
+        self.assertIn("ws", tags)
+        self.assertIn("pm", tags)
+        self.assertIn("in1k", tags)
+        self.assertIn("cent", tags)
+        self.assertIn("train", tags)
+
+    def test_pi05_decent_tsc_eval(self):
+        tags = eval_context._derive_tags_from_name(
+            "pi05_wc_tsc_decent_eval_c19999_s100_a3c736d"
+        )
+        self.assertIn("pi05", tags)
+        self.assertIn("wc", tags)
+        self.assertIn("tsc", tags)
+        self.assertIn("decent", tags)
+        self.assertIn("eval", tags)
+
+    def test_substring_does_not_falsely_match(self):
+        # "dp" should not match arbitrary "depth"-like words; word-boundary check.
+        tags = eval_context._derive_tags_from_name("depthsensor_predefined_run")
+        self.assertNotIn("dp", tags)
+        self.assertNotIn("pm", tags)
+
+    def test_legacy_dp_dirname_style(self):
+        # Existing on-disk DP run dirs follow 'PickMeat-rf_150' / 'ThreeRobotsStackCube-rf_agent0_d2_wristcam_150'
+        # — derived tags should still surface useful tokens.
+        tags = eval_context._derive_tags_from_name(
+            "ThreeRobotsStackCube-rf_agent0_d2_wristcam_150"
+        )
+        self.assertIn("agent0", tags)
+        self.assertIn("d2", tags)
+        self.assertIn("wristcam", tags)
+
+    def test_freezeenc_token(self):
+        tags = eval_context._derive_tags_from_name(
+            "ThreeRobotsStackCube-rf_agent1_freezeenc_150"
+        )
+        self.assertIn("freezeenc", tags)
+        self.assertIn("agent1", tags)
+
+    def test_empty_name_returns_empty(self):
+        self.assertEqual(eval_context._derive_tags_from_name(""), [])
+        self.assertEqual(eval_context._derive_tags_from_name(None or ""), [])
+
+    def test_tags_sorted_dedup(self):
+        # Same token appearing twice (eval_eval_pm) shouldn't show twice.
+        tags = eval_context._derive_tags_from_name("eval_eval_pm_pm")
+        self.assertEqual(tags, sorted(tags))
+        self.assertEqual(tags.count("eval"), 1)
+        self.assertEqual(tags.count("pm"), 1)
+
+    def test_explicit_tags_merge_with_derived_in_wandbrun(self):
+        # Run is disabled so we can introspect self.tags without hitting wandb.
+        run = eval_context.WandbRun(
+            enabled=False,
+            project="diffusion-robofactory",
+            job_type="eval",
+            name="dp_ws_pm_in1k_cent_eval_c300_s100",
+            tags=["custom-tag", "in1k"],  # in1k overlaps; 'custom-tag' is novel
+        )
+        self.assertIn("custom-tag", run.tags)
+        self.assertIn("dp", run.tags)
+        self.assertIn("eval", run.tags)
+        self.assertIn("in1k", run.tags)
+        # No duplicates.
+        self.assertEqual(len(run.tags), len(set(run.tags)))
+
+
 if __name__ == "__main__":
     unittest.main()

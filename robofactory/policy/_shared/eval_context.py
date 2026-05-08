@@ -52,6 +52,50 @@ def assert_wandb_live() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Workflow improvement #3 — auto-derive wandb tags from run name
+# ---------------------------------------------------------------------------
+
+# Tokens we want as wandb tags whenever they appear in the run name. Order
+# is fixed so tag sets sort consistently across runs. Token matching is
+# case-insensitive and word-boundary aware (so "in1k" doesn't match "in1k_").
+# Add tokens here as new training axes appear; nothing else needs to change.
+_TAG_TOKENS = (
+    # encoder choice
+    "in1k", "freezeenc", "dinos", "dino", "r3m", "lora",
+    # task
+    "pm", "tsc", "2sc", "lp", "libero",
+    # dataset variant
+    "d1", "d2",
+    # camera family
+    "ws", "wc", "workspace", "wristcam",
+    # control scheme
+    "cent", "decent", "joint", "agent0", "agent1", "agent2", "arm0", "arm1", "arm2",
+    # phase / job kind
+    "train", "eval", "retrain", "resume", "calibration",
+    # model
+    "dp", "pi05",
+)
+
+
+def _derive_tags_from_name(name: str) -> list[str]:
+    """Pick out structural tokens from a run name → list of wandb tags.
+
+    Token matching is case-insensitive and word-boundary aware to avoid
+    surprising substring hits ("dp" should not match "depth"; "agent0"
+    should not match "agent00"). Result is deduplicated + sorted.
+    """
+    if not name:
+        return []
+    import re
+    low = name.lower()
+    out = set()
+    for tok in _TAG_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", low):
+            out.add(tok)
+    return sorted(out)
+
+
 class WandbRun:
     """Context manager around `wandb.init` / `wandb.finish`.
 
@@ -75,7 +119,13 @@ class WandbRun:
         self.job_type = job_type
         self.name = name
         self.group = group
-        self.tags = list(tags) if tags else []
+        # Workflow improvement #3: auto-derive structural tags from the run
+        # name so future filterability ("show me all decent TSC runs") is free
+        # from day one and doesn't require retroactive `wandb api set-tags`
+        # passes (the Tier-3 purge needed 9 such by-hand updates).
+        derived = _derive_tags_from_name(name)
+        explicit = list(tags) if tags else []
+        self.tags = sorted(set(derived) | set(explicit))
         self.config = dict(config) if config else {}
         self.run = None
 
