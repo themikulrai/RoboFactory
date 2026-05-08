@@ -53,14 +53,19 @@ export HYDRA_FULL_ERROR=1
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
 # -----------------------------------------------------------------------------
-# Stage-3 preflight guards. The d1 decent ckpts have no .hydra_config.yaml on
-# disk (known C1 hole); fall back to using EVAL_CFG as the train-cfg sentinel.
-# scene-match passes trivially; camera-family check degrades to a warning
-# because eval-cfg lacks _workspace_/_wristcam_ tokens — that's the documented
-# C1 hole, surface verbatim, don't paper over.
+# Stage-3 preflight guards. C1#10 (commit 9710f9a) added a trainer-side
+# .hydra_config.yaml dump so the camera-family check becomes a real
+# workspace-vs-wristcam assertion. _resolve_train_cfg.sh prefers that file
+# when present; legacy ckpts (trained pre-9710f9a — like the d1 decent v0
+# set below) lack the dump and the helper falls back to eval-cfg with
+# soft-warn. Future Pi0.5 retrains will surface a hard error here.
 # -----------------------------------------------------------------------------
 EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/three_robots_stack_cube.yaml}"
-TRAIN_CFG_PATH="${TRAIN_CFG_PATH:-${EVAL_CFG_PATH}}"
+# Pi0.5 ckpt dirs hold an `assets/` symlink + `params/` weights tree; point
+# CKPT_FOR_PREFLIGHT at the per-arm step dir so dirname() lands on the run
+# dir where a future trainer-side dump would live.
+CKPT_FOR_PREFLIGHT="${CKPT_FOR_PREFLIGHT:-/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_lora_finetune_arm0/pi05_d1_decent_arm0_v0/19999}"
+source "$(dirname "$0")/_resolve_train_cfg.sh"
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \

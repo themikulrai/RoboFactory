@@ -22,7 +22,8 @@ cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
 # Stage-3 preflight guards — refuses to run on scene/camera/seed/wandb mismatch.
 EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/pick_meat.yaml}"
-TRAIN_CFG_PATH="${TRAIN_CFG_PATH:-${EVAL_CFG_PATH}}"
+CKPT_FOR_PREFLIGHT="${CKPT_FOR_PREFLIGHT:-/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_in1k.ckpt}"
+source "$(dirname "$0")/_resolve_train_cfg.sh"
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \
