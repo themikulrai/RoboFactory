@@ -32,7 +32,7 @@ export WANDB_API_KEY=wandb_v1_LgfY1E5jkeMCKwn2vgwEGGH7nQq_SlXAGwWFnjD0wgyyqBX7Nl
 # Stage-3 preflight guards — refuses to run on scene/camera/seed/wandb mismatch.
 EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/three_robots_stack_cube.yaml}"
 CKPT_FOR_PREFLIGHT="${CKPT_FOR_PREFLIGHT:-/iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150/300.ckpt}"
-source "$(dirname "$0")/_resolve_train_cfg.sh"
+source /iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/canonical/_resolve_train_cfg.sh
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \
