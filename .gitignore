@@ -10,6 +10,10 @@ robofactory/eval_video
 robofactory/checkpoints
 
 docs/
+# But DO track plan files migrated from ~/.claude/plans/ (workflow#10).
+!robofactory/docs/
+!robofactory/docs/plans/
+!robofactory/docs/plans/**
 _ext
 *.pyc
 *.so
