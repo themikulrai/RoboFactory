@@ -444,14 +444,16 @@ def wandb_run_to_record(r, *, project: str) -> "RunRecord":
         if cfg_key in config and not fields.get(fld):
             fields[fld] = str(config[cfg_key])
 
-    # Eval summary metrics.
+    # Eval summary metrics. eval_decent_pi05.py + eval_multi_dp.py both log
+    # final SR under `summary/success_rate` (literal slash in key name); accept
+    # those plus any flat `success_rate` / `eval/success_rate` aliases.
     eval_sr = ""
     eval_n = ""
-    for sk in ("eval/success_rate", "success_rate", "eval_sr"):
+    for sk in ("summary/success_rate", "eval/success_rate", "success_rate", "eval_sr"):
         if sk in summary:
             eval_sr = str(summary[sk])
             break
-    for nk in ("eval/n", "n_episodes", "eval_n"):
+    for nk in ("summary/n_total", "summary/n_episodes", "eval/n", "n_episodes", "eval_n"):
         if nk in summary:
             eval_n = str(summary[nk])
             break
