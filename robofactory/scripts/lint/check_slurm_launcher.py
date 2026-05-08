@@ -134,8 +134,16 @@ RULES = [
 
 
 def lint_one(path: Path) -> list[str]:
-    """Return list of '<rule>: <message>' for path; empty if clean."""
+    """Return list of '<rule>: <message>' for path; empty if clean.
+
+    Files with no `#SBATCH` directives at all are wrappers (e.g.
+    submit_with_preflights.sh) and skip the SLURM-specific rules.
+    """
     text = path.read_text()
+    if not re.search(r"^#SBATCH\s", text, re.MULTILINE):
+        # Still apply R1 (relative source paths) — wrappers can have that bug too.
+        errs = rule_R1_no_relative_source(text)
+        return [f"R1_no_relative_source: {e}" for e in errs]
     out = []
     for name, fn in RULES:
         if fn is rule_R2_wandb_api_key_exported:
