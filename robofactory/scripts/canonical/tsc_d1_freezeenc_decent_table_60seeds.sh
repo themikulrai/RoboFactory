@@ -6,6 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 #SBATCH --exclude=iris-hp-z8,iris-hgx-1,iris-hgx-2
 
 # Tier 2.1 — Decentralised TSC eval, D1 workspace, FROZEN ImageNet ResNet18 encoder.

@@ -6,6 +6,8 @@
 #SBATCH --gres=gpu:a40:3
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 #SBATCH --exclude=iris-hp-z8,iris-hgx-1,iris-hgx-2
 # gres=gpu:a40:3 forces 48 GB cards — Pi0.5 LoRA OOM'd on 8 GB RTX 2070 (job 15366954).
 

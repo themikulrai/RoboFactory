@@ -6,6 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 #SBATCH --exclude=iris-hp-z8,iris-hgx-1,iris-hgx-2
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh

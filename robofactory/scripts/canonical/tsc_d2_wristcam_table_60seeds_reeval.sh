@@ -7,6 +7,8 @@
 #SBATCH --time=8:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 
 # Re-eval of the 0%-SR DP TSC d2_wristcam ckpts on the *correct* TABLE scene.
 # Hypothesis under test: prior 0% SR was scene-mismatch (eval ran on robocasa kitchen,

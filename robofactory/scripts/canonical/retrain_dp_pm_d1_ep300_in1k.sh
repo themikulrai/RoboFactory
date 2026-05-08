@@ -7,6 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:a40:1
 #SBATCH --mem=96G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 #SBATCH --time=24:00:00
 #SBATCH --output=/iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_%j.out
 #SBATCH --error=/iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_%j.err

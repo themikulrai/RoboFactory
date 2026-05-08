@@ -6,6 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mikulrai+spam@gmail.com
 #SBATCH --exclude=iris-hp-z8,iris-hgx-1
 
 # D1 workspace decentralised TSC eval — ImageNet ResNet18 ckpts at epoch 300.
