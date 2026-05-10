@@ -113,6 +113,10 @@ training:
   max_val_steps: 20
   tqdm_interval_sec: 1.0
   use_bf16: True
+  # Workflow #4: auto-drop runs/calibration/<wandb_id>.npz after the final
+  # epoch save. Default ON for canonical configs; flip to False for ablation
+  # / debug runs whose ckpts you don't want polluting the calibration set.
+  capture_calibration: True
 
 logging:
   project: diffusion_policy_joint

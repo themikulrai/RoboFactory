@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import subprocess
 import time
 import hydra
 import torch
@@ -30,6 +31,76 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 import pdb
+
+
+def _capture_calibration_npz(
+    *,
+    ckpt_path,
+    run_id,
+    config_path,
+    obs_cam_family,
+    include_global,
+    img_height=240,
+    img_width=320,
+    seeds=(10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007),
+    out_root="/iris/u/mikulrai/runs/calibration",
+    python_exe="/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python",
+    probe_script="script/debug/probe_decent_dp_features.py",
+    repo_root=None,
+):
+    """Workflow improvement #4: drop a calibration NPZ at the end of every clean
+    training pass so the S1 collapse probe (utils/preflight_collapse.py) gets a
+    growing reference set rather than the current 2 hand-curated ckpts.
+
+    Idempotent: skips if `<out_root>/<run_id>.npz` already exists. Subprocess
+    call so the probe's gymnasium/SAPIEN env init does not pollute the trainer
+    process. Failures are logged but never abort the training run — calibration
+    is a nice-to-have, not load-bearing.
+
+    Seed=42 not used: we instead use 8 fixed cube-spawn seeds (10000-10007)
+    that match the existing reference NPZs (see calibration/MANIFEST.yaml) so
+    cross-ckpt comparison is meaningful — different seed means different cube
+    positions, and the whole point of calibration is feature-vs-position
+    correlation. If the probe needs determinism on its diffusion-sampling RNG,
+    the probe script handles that internally via its own torch.manual_seed.
+    """
+    import sys
+    out_dir = pathlib.Path(out_root)
+    out_path = out_dir / f"{run_id}.npz"
+    if out_path.exists():
+        print(f"[capture-calibration] already captured at {out_path}; skipping.", flush=True)
+        return str(out_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_root = repo_root or os.getcwd()
+    cmd = [
+        python_exe, "-u", probe_script,
+        "--config", config_path,
+        "--ckpt-path", str(ckpt_path),
+        "--obs-cam-family", obs_cam_family,
+        ("--include-global" if include_global else "--no-include-global"),
+        "--img-height", str(img_height),
+        "--img-width", str(img_width),
+        "--seeds", *[str(s) for s in seeds],
+        "--out", str(out_path),
+    ]
+    print(f"[capture-calibration] running: {' '.join(cmd)}", flush=True)
+    try:
+        proc = subprocess.run(cmd, cwd=repo_root, check=False)
+        if proc.returncode != 0:
+            print(
+                f"[capture-calibration] probe exited rc={proc.returncode}; calibration "
+                f"NOT captured. Training run is unaffected.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+    except Exception as e:
+        print(f"[capture-calibration] subprocess raised {type(e).__name__}: {e}; "
+              f"calibration NOT captured. Training run is unaffected.",
+              file=sys.stderr, flush=True)
+        return None
+    print(f"[capture-calibration] saved {out_path}", flush=True)
+    return str(out_path)
 
 
 def _init_wandb_with_resume(output_dir, cfg):
@@ -508,6 +579,61 @@ class RobotWorkspace(BaseWorkspace):
                 wandb.log(step_log, step=self.global_step)
                 self.global_step += 1
                 self.epoch += 1
+
+        # Workflow #4: auto-capture calibration NPZ after the FINAL epoch's
+        # checkpoint exists on disk. Gated by training.capture_calibration
+        # (default True for canonical configs). Failures are non-fatal.
+        try:
+            _capture_flag = bool(cfg.training.get('capture_calibration', True))
+        except Exception:
+            _capture_flag = True
+        if _capture_flag:
+            try:
+                save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                ckpt_path = pathlib.Path('checkpoints') / save_name / f'{self.epoch}.ckpt'
+                if not ckpt_path.is_file():
+                    # checkpoint_every may not align with num_epochs — fall back to the
+                    # most recent numeric ckpt under the same dir.
+                    parent = ckpt_path.parent
+                    if parent.is_dir():
+                        cands = []
+                        for p in parent.glob('*.ckpt'):
+                            try:
+                                cands.append((int(p.stem), p))
+                            except ValueError:
+                                continue
+                        if cands:
+                            ckpt_path = max(cands, key=lambda x: x[0])[1]
+                if not ckpt_path.is_file():
+                    print(f"[capture-calibration] no final ckpt at {ckpt_path}; skipping.",
+                          flush=True)
+                else:
+                    try:
+                        run_id = wandb.run.id if wandb.run is not None else None
+                    except Exception:
+                        run_id = None
+                    if not run_id:
+                        run_id = f"dp_{int(time.time())}_{os.getpid()}"
+                    # Resolve probe args from cfg with sane fallbacks
+                    cfg_probe_path = None
+                    try:
+                        cfg_probe_path = cfg.task.env_runner.get('config_path', None)
+                    except Exception:
+                        cfg_probe_path = None
+                    if not cfg_probe_path:
+                        cfg_probe_path = 'configs/table/three_robots_stack_cube.yaml'
+                    obs_cam_family = 'wristcam' if '_wristcam_' in save_name else 'workspace'
+                    include_global = '_decent_' not in save_name  # decent => no global
+                    _capture_calibration_npz(
+                        ckpt_path=ckpt_path,
+                        run_id=run_id,
+                        config_path=cfg_probe_path,
+                        obs_cam_family=obs_cam_family,
+                        include_global=include_global,
+                    )
+            except Exception as _e:
+                print(f"[capture-calibration] hook failed (non-fatal): "
+                      f"{type(_e).__name__}: {_e}", flush=True)
 
         wandb.finish()
 
