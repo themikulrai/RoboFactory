@@ -440,7 +440,9 @@ def main(args: Args):
                     _warnings.warn(f"[collapse arm{_i}] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
                 print(f"[collapse-probe arm{_i}] {_rep.summary()}", flush=True)
         except Exception as _e:
-            print(f"[collapse-probe] skipped: {_e}", file=sys.stderr)
+            import traceback as _tb
+            print(f"[collapse-probe] skipped: {type(_e).__name__}: {_e!r}", file=sys.stderr)
+            _tb.print_exc(file=sys.stderr)
         # Seed loop (reuses env + policies)
         results = []
         for idx, seed in enumerate(seeds):

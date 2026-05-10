@@ -376,7 +376,9 @@ def main(args: Args):
                 _warnings.warn(f"[collapse] mse_zero_image/baseline = {_ratio:.2f} < 1.5 - image input may be ignored")
             print(f"[collapse-probe] {collapse.summary()}", flush=True)
         except Exception as _e:
-            print(f"[collapse-probe] skipped: {_e}", file=sys.stderr)
+            import traceback as _tb
+            print(f"[collapse-probe] skipped: {type(_e).__name__}: {_e!r}", file=sys.stderr)
+            _tb.print_exc(file=sys.stderr)
         results = []
         for idx, seed in enumerate(seeds):
             video_path = videos.video_path_for(idx, seed)

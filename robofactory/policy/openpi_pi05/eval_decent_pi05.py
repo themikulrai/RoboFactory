@@ -330,7 +330,9 @@ def main(args: Args) -> None:
                     _warnings.warn(f"[collapse arm{_i}] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
                 print(f"[collapse-probe arm{_i}] {_rep.summary()}", flush=True)
         except Exception as _e:
-            print(f"[collapse-probe] skipped: {_e}", file=_sys.stderr)
+            import traceback as _tb
+            print(f"[collapse-probe] skipped: {type(_e).__name__}: {_e!r}", file=_sys.stderr)
+            _tb.print_exc(file=_sys.stderr)
         results: list[dict] = []
         episode_global_idx = 0
         for seed_idx, seed in enumerate(seeds):
