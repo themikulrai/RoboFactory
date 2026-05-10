@@ -17,6 +17,13 @@
 
 # D2 wristcam decentralised TSC — Agent 2, ImageNet ResNet18.
 # Ckpt dir: checkpoints/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150/ — distinct from D1.
+#
+# NOTE: Heavy preflights are NOT chained for from-scratch retrain launchers.
+# The overfit_replay_sanity check requires a freshly-overfit ckpt as input,
+# which doesn't exist before the first training step. To wire this in, run
+# a 1-epoch overfit pass on 1 episode first, then point CKPT_PATH at that
+# tiny ckpt for the heavy preflights, THEN run the real retrain.
+# This 3-step chain is deferred (plan ref: workflow-improvements #2 caveat).
 
 set -euxo pipefail
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh

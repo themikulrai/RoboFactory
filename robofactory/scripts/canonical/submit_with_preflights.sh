@@ -24,6 +24,10 @@
 # For FRESH training, run a 100-step overfit pass first, then preflight
 # against THAT tiny ckpt. The same heavy-preflight artifact is reusable
 # across full training attempts on the same (model, dataset, task) combo.
+#
+# Env vars:
+#   DRYRUN=1   echo the sbatch commands instead of submitting.
+#              Use this to verify wiring before committing real GPU time.
 
 set -euo pipefail
 
@@ -81,13 +85,29 @@ PREFLIGHT_SCRIPT="/iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/pref
 # Submit heavy preflights with the inputs as env vars.
 PREFLIGHT_EXPORT="ALL,CKPT_PATH=${CKPT_PATH},DATASET_PATH=${DATASET_PATH},SCENE_CONFIG=${SCENE_CONFIG},OUT_DIR=${OUT_DIR}${EXTRA_ENV}"
 
+# DRYRUN=1 echoes the sbatch commands instead of submitting. Useful for CI
+# parse-checks and for showing the user what will happen before they commit.
+DRYRUN="${DRYRUN:-0}"
+
 echo "[submit_with_preflights] Submitting heavy preflights..."
-JID_PRE=$(sbatch --parsable --export="${PREFLIGHT_EXPORT}" "$PREFLIGHT_SCRIPT")
+if [ "$DRYRUN" = "1" ]; then
+    echo "  DRYRUN: sbatch --parsable --export=\"${PREFLIGHT_EXPORT}\" \"$PREFLIGHT_SCRIPT\""
+    JID_PRE="<DRY_PRE>"
+else
+    JID_PRE=$(sbatch --parsable --export="${PREFLIGHT_EXPORT}" "$PREFLIGHT_SCRIPT")
+fi
 echo "  preflight JID: ${JID_PRE}"
 echo "  out dir:       ${OUT_DIR}"
 
+# --kill-on-invalid-dep=yes ensures the training job is auto-cancelled if the
+# preflight job exits non-zero (instead of sitting forever in DependencyNeverSatisfied).
 echo "[submit_with_preflights] Submitting training (gated afterok:${JID_PRE})..."
-JID_TRAIN=$(sbatch --parsable --dependency="afterok:${JID_PRE}" "$TRAIN_LAUNCHER")
+if [ "$DRYRUN" = "1" ]; then
+    echo "  DRYRUN: sbatch --parsable --dependency=\"afterok:${JID_PRE}\" --kill-on-invalid-dep=yes \"$TRAIN_LAUNCHER\""
+    JID_TRAIN="<DRY_TRAIN>"
+else
+    JID_TRAIN=$(sbatch --parsable --dependency="afterok:${JID_PRE}" --kill-on-invalid-dep=yes "$TRAIN_LAUNCHER")
+fi
 echo "  training JID:  ${JID_TRAIN}"
 
 # Optionally chain calibration capture after training success (workflow#4).
@@ -106,8 +126,13 @@ if [ "$CAPTURE_CALIBRATION" -eq 1 ]; then
     CALIB_SCRIPT="/iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/canonical/auto_capture_calibration.sh"
     CALIB_EXPORT="ALL,CKPT=${TRAIN_CKPT_OUT},CONFIG=${SCENE_CONFIG},OUT_NPZ=${CALIB_NPZ}"
     echo "[submit_with_preflights] Submitting calibration capture (gated afterok:${JID_TRAIN})..."
-    JID_CALIB=$(sbatch --parsable --dependency="afterok:${JID_TRAIN}" \
-                       --export="${CALIB_EXPORT}" "$CALIB_SCRIPT")
+    if [ "$DRYRUN" = "1" ]; then
+        echo "  DRYRUN: sbatch --parsable --dependency=\"afterok:${JID_TRAIN}\" --kill-on-invalid-dep=yes --export=\"${CALIB_EXPORT}\" \"$CALIB_SCRIPT\""
+        JID_CALIB="<DRY_CALIB>"
+    else
+        JID_CALIB=$(sbatch --parsable --dependency="afterok:${JID_TRAIN}" --kill-on-invalid-dep=yes \
+                           --export="${CALIB_EXPORT}" "$CALIB_SCRIPT")
+    fi
     echo "  calibration JID: ${JID_CALIB}"
     echo "  calib NPZ:       ${CALIB_NPZ}"
 fi

@@ -14,6 +14,20 @@
 #SBATCH --error=/iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a2_%j.err
 
 # Resume of gz1g5q1o (24h walltime kill at epoch 285 of 300). Explicit load.
+#
+# IMPORTANT — submit via the heavy-preflight orchestrator, not raw `sbatch`:
+#
+#   bash scripts/canonical/submit_with_preflights.sh \
+#     --train-launcher scripts/canonical/resume_dp_tsc_d2_in1k_a2_from285.sh \
+#     --ckpt /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150/285.ckpt \
+#     --dataset /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150.zarr \
+#     --scene-config configs/table/three_robots_stack_cube.yaml
+#
+# This gates training on slurm_heavy_preflights.sh via SLURM
+# --dependency=afterok:<heavy>. If the preflights fail (init-pose drift,
+# vulkan render mismatch, or overfit-replay regression) the training job
+# is auto-cancelled before any GPU time is consumed. Workflow plan ref:
+# "Workflow improvements (compounding stress-savers)" #2.
 
 set -euxo pipefail
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
