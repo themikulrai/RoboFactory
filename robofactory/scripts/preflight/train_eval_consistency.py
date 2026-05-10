@@ -190,15 +190,20 @@ def check_action_norm_stats(train_cfg: dict, eval_cfg: dict) -> None:
             raise CheckFailure(f"{f} mismatch: train={t!r}, eval={e!r}")
 
 
+# Ordered cheap-to-expensive (perf-optimizer ranking, 2026-05-09): pure-config
+# checks first (sub-millisecond, dict lookups), preprocess checks next (~50 ms,
+# ckpt header reads), env-instantiation check last (~1 s, SAPIEN intrinsics).
+# A failure in an earlier check usually invalidates later checks anyway, so a
+# fast top means callers wanting fail-fast just iterate and break on first fail.
 CHEAP_CHECKS = (
-    Check(name="image_preprocess", fn=check_image_preprocess,
-          description="image shape / channel order / normalize range parity"),
-    Check(name="action_norm_stats", fn=check_action_norm_stats,
-          description="action min/max/mean/std byte-equal"),
-    Check(name="action_space_semantics", fn=check_action_space_semantics,
-          description="delta vs absolute, gripper convention, joint vs eef"),
     Check(name="control_rate", fn=check_control_rate,
           description="train fps == eval fps"),
+    Check(name="action_space_semantics", fn=check_action_space_semantics,
+          description="delta vs absolute, gripper convention, joint vs eef"),
+    Check(name="action_norm_stats", fn=check_action_norm_stats,
+          description="action min/max/mean/std byte-equal"),
+    Check(name="image_preprocess", fn=check_image_preprocess,
+          description="image shape / channel order / normalize range parity"),
     Check(name="camera_intrinsics", fn=check_camera_intrinsics,
           description="per-camera intrinsics byte-equal across train and eval envs"),
 )

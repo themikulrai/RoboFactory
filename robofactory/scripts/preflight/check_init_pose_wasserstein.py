@@ -358,7 +358,7 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="LeRobot dataset path or zarr path (auto-detected by suffix).")
     ap.add_argument("--eval-config", type=Path, required=True,
                     help="Path to scene yaml, e.g. configs/table/three_robots_stack_cube.yaml")
-    ap.add_argument("--n-samples", type=int, default=50)
+    ap.add_argument("--n-samples", type=int, default=200)
     ap.add_argument("--bootstrap-iters", type=int, default=1000)
     ap.add_argument("--pos-tolerance-cm", type=float, default=0.5)
     ap.add_argument("--rot-tolerance-deg", type=float, default=0.5)
