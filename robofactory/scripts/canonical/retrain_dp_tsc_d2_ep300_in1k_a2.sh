@@ -47,6 +47,25 @@ export CUDA_VISIBLE_DEVICES=0
 
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
+# Cheap-suite preflight (Plan v2 C2 S5, belt+suspenders to heavy preflights):
+# config-only checks for control_rate / action / image / camera parity. Runs
+# on the compute node so a config edit between submit and start is still
+# caught. Heavy preflights (init-pose, overfit-replay, vulkan) are gated at
+# submit time via submit_with_preflights.sh.
+PREFLIGHT_RUN_DIR="/iris/u/mikulrai/runs/preflight/${SLURM_JOB_ID:-local}"
+mkdir -p "$PREFLIGHT_RUN_DIR"
+python -m robofactory.scripts.preflight.dump_train_cfg \
+    --task-config default_task_wristcam \
+    --scene-config configs/table/three_robots_stack_cube.yaml \
+    --agent-id 2 \
+    --out-train "$PREFLIGHT_RUN_DIR/train_cheap.yaml" \
+    --out-eval  "$PREFLIGHT_RUN_DIR/eval_cheap.yaml"
+python -m robofactory.scripts.preflight.train_eval_consistency \
+    --train-cfg "$PREFLIGHT_RUN_DIR/train_cheap.yaml" \
+    --eval-cfg  "$PREFLIGHT_RUN_DIR/eval_cheap.yaml" \
+    --out       "$PREFLIGHT_RUN_DIR/preflight_consistency.json" \
+  || { echo "preflight failed; aborting training"; exit 1; }
+
 python ./policy/Diffusion-Policy/train.py \
   --config-name=robot_dp.yaml \
   task=default_task_wristcam \

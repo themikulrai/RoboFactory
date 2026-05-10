@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import yaml
 
 from robofactory.utils import preflight_eval_guards as g
@@ -225,6 +226,10 @@ class TestWandbLive(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+# Each CLI test spawns a fresh `python -m robofactory.utils.preflight_eval_guards`
+# subprocess (~5-15s due to torch/sapien import overhead). Marked slow so daily
+# `make test-fast` skips them; `make test-all` runs them.
+@pytest.mark.slow
 class TestCli(unittest.TestCase):
     @staticmethod
     def _run(argv: list[str], env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
