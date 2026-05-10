@@ -31,6 +31,9 @@ from robofactory.planner.solutions import (
     solveLongPipelineDelivery,
     solveThreeRobotsStackCube,
     solvePickMeat,
+    solveTwoRobotsStackCube,
+    solveLiftBarrier,
+    solvePlaceFood,
 )
 from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory import CONFIG_DIR
@@ -62,6 +65,24 @@ TASK_MAP = {
         "table/pick_meat.yaml",
         solvePickMeat,
         1,
+    ),
+    "TwoRobotsStackCube": (
+        "TwoRobotsStackCube-rf",
+        "table/two_robots_stack_cube.yaml",
+        solveTwoRobotsStackCube,
+        2,
+    ),
+    "LiftBarrier": (
+        "LiftBarrier-rf",
+        "table/lift_barrier.yaml",
+        solveLiftBarrier,
+        2,
+    ),
+    "PlaceFood": (
+        "PlaceFood-rf",
+        "table/place_food.yaml",
+        solvePlaceFood,
+        2,
     ),
 }
 
