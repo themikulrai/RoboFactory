@@ -18,12 +18,21 @@
 # D2 wristcam decentralised TSC — Agent 2, ImageNet ResNet18.
 # Ckpt dir: checkpoints/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150/ — distinct from D1.
 #
-# NOTE: Heavy preflights are NOT chained for from-scratch retrain launchers.
-# The overfit_replay_sanity check requires a freshly-overfit ckpt as input,
-# which doesn't exist before the first training step. To wire this in, run
-# a 1-epoch overfit pass on 1 episode first, then point CKPT_PATH at that
-# tiny ckpt for the heavy preflights, THEN run the real retrain.
-# This 3-step chain is deferred (plan ref: workflow-improvements #2 caveat).
+# Heavy-preflight chain (workflow#2): from-scratch retrains submit via
+# submit_with_preflights.sh --needs-overfit so a 1-episode overfit ckpt is
+# produced first, then heavy preflights validate train/eval pipeline parity
+# against that ckpt before the 24h retrain is allowed to launch.
+#
+# Example (TSC d2 wristcam decentralised arm2, 3-step chain):
+#   bash scripts/canonical/submit_with_preflights.sh \
+#       --train-launcher scripts/canonical/retrain_dp_tsc_d2_ep300_in1k_a2.sh \
+#       --dataset /iris/u/mikulrai/data/RoboFactory/zarr_data/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150.zarr \
+#       --scene-config configs/table/three_robots_stack_cube.yaml \
+#       --needs-overfit \
+#       --of-task-config default_task_wristcam --of-task-name ThreeRobotsStackCube-rf \
+#       --of-zarr /iris/u/mikulrai/data/RoboFactory/zarr_data/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150.zarr \
+#       --of-agent-id 2 --of-exp-name tsc-d2-ep300-in1k-a2 \
+#       --of-rgb-weights IMAGENET1K_V1
 
 set -euxo pipefail
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh

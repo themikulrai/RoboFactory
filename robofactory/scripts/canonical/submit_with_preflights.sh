@@ -18,12 +18,30 @@
 #       [--max-steps 50] [--mse-tolerance 0.01]
 #       [--skip-vulkan]   # cross-node vulkan check stays manual for now
 #
-# For RETRAIN launchers (retrain_dp_*, resume_dp_*) you typically already
-# have a baseline ckpt to preflight against — pass its path as --ckpt.
+# For RETRAIN launchers (retrain_dp_*, resume_dp_*) on a (model, dataset,
+# task, scheme) combo where a baseline ckpt already exists: pass its path
+# as --ckpt and submit_with_preflights does a 2-step chain:
+#     preflight -> train
 #
-# For FRESH training, run a 100-step overfit pass first, then preflight
-# against THAT tiny ckpt. The same heavy-preflight artifact is reusable
-# across full training attempts on the same (model, dataset, task) combo.
+# For FRESH training of a never-trained combo (no baseline ckpt): use
+# --needs-overfit. submit_with_preflights does a 3-step chain:
+#     overfit-pass -> preflight -> train
+# The overfit-pass produces a tiny ckpt at OVERFIT_CKPT_OUT (default
+# <out-dir>/overfit.ckpt), heavy preflights uses it, then real training
+# runs on green light. The overfit-pass artifact is reusable across full
+# training attempts on the same (model, dataset, task, scheme) combo;
+# pass --ckpt <path-to-prior-overfit.ckpt> on subsequent attempts to
+# skip the overfit step.
+#
+# --needs-overfit additional args (all required when set):
+#   --of-task-config <hydra group>   e.g. default_task / default_task_wristcam
+#   --of-task-name   <env id>        e.g. PickMeat-rf
+#   --of-zarr        <abs path>      training zarr path
+#   --of-agent-id    <int>           per-arm id (decentralised) or 0
+#   --of-exp-name    <wandb suffix>  exp_name base; '-overfit' is appended
+#   --of-rgb-weights <str|null>      'IMAGENET1K_V1' or 'null'
+#   --of-config-name <str>           default robot_dp.yaml; joint_dp.yaml for cent multi-arm
+#   --of-num-epochs  <int>           default 200
 #
 # Env vars:
 #   DRYRUN=1   echo the sbatch commands instead of submitting.
@@ -45,6 +63,15 @@ EXTRA_ENV=""
 CAPTURE_CALIBRATION=0
 CALIB_RUN_ID=""
 TRAIN_CKPT_OUT=""
+NEEDS_OVERFIT=0
+OF_TASK_CONFIG=""
+OF_TASK_NAME=""
+OF_ZARR=""
+OF_AGENT_ID=""
+OF_EXP_NAME=""
+OF_RGB_WEIGHTS=""
+OF_CONFIG_NAME="robot_dp.yaml"
+OF_NUM_EPOCHS="200"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,6 +86,15 @@ while [[ $# -gt 0 ]]; do
         --capture-calibration) CAPTURE_CALIBRATION=1; shift ;;
         --calib-run-id)      CALIB_RUN_ID="$2"; shift 2 ;;
         --train-ckpt-out)    TRAIN_CKPT_OUT="$2"; shift 2 ;;
+        --needs-overfit)     NEEDS_OVERFIT=1; shift ;;
+        --of-task-config)    OF_TASK_CONFIG="$2"; shift 2 ;;
+        --of-task-name)      OF_TASK_NAME="$2"; shift 2 ;;
+        --of-zarr)           OF_ZARR="$2"; shift 2 ;;
+        --of-agent-id)       OF_AGENT_ID="$2"; shift 2 ;;
+        --of-exp-name)       OF_EXP_NAME="$2"; shift 2 ;;
+        --of-rgb-weights)    OF_RGB_WEIGHTS="$2"; shift 2 ;;
+        --of-config-name)    OF_CONFIG_NAME="$2"; shift 2 ;;
+        --of-num-epochs)     OF_NUM_EPOCHS="$2"; shift 2 ;;
         -h|--help)           usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
     esac
@@ -66,9 +102,19 @@ done
 
 [ -n "$TRAIN_LAUNCHER" ] || { echo "ERROR: --train-launcher required" >&2; usage; }
 [ -f "$TRAIN_LAUNCHER" ] || { echo "ERROR: $TRAIN_LAUNCHER not found" >&2; exit 1; }
-[ -n "$CKPT_PATH" ]      || { echo "ERROR: --ckpt required" >&2; usage; }
 [ -n "$DATASET_PATH" ]   || { echo "ERROR: --dataset required" >&2; usage; }
 [ -n "$SCENE_CONFIG" ]   || { echo "ERROR: --scene-config required" >&2; usage; }
+
+if [ "$NEEDS_OVERFIT" -eq 1 ]; then
+    [ -n "$OF_TASK_CONFIG" ]  || { echo "ERROR: --of-task-config required with --needs-overfit" >&2; exit 1; }
+    [ -n "$OF_TASK_NAME" ]    || { echo "ERROR: --of-task-name required with --needs-overfit" >&2; exit 1; }
+    [ -n "$OF_ZARR" ]         || { echo "ERROR: --of-zarr required with --needs-overfit" >&2; exit 1; }
+    [ -n "$OF_AGENT_ID" ]     || { echo "ERROR: --of-agent-id required with --needs-overfit" >&2; exit 1; }
+    [ -n "$OF_EXP_NAME" ]     || { echo "ERROR: --of-exp-name required with --needs-overfit" >&2; exit 1; }
+    [ -n "$OF_RGB_WEIGHTS" ]  || { echo "ERROR: --of-rgb-weights required with --needs-overfit" >&2; exit 1; }
+else
+    [ -n "$CKPT_PATH" ] || { echo "ERROR: --ckpt required (or pass --needs-overfit to bootstrap one)" >&2; usage; }
+fi
 
 # Default OUT_DIR includes the train launcher basename + timestamp so
 # parallel preflights for different launchers don't collide.
@@ -81,20 +127,45 @@ mkdir -p "$OUT_DIR"
 
 PREFLIGHT_SCRIPT="/iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/preflight/slurm_heavy_preflights.sh"
 [ -f "$PREFLIGHT_SCRIPT" ] || { echo "ERROR: $PREFLIGHT_SCRIPT not found" >&2; exit 1; }
-
-# Submit heavy preflights with the inputs as env vars.
-PREFLIGHT_EXPORT="ALL,CKPT_PATH=${CKPT_PATH},DATASET_PATH=${DATASET_PATH},SCENE_CONFIG=${SCENE_CONFIG},OUT_DIR=${OUT_DIR}${EXTRA_ENV}"
+OVERFIT_SCRIPT="/iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/preflight/slurm_overfit_pass.sh"
+if [ "$NEEDS_OVERFIT" -eq 1 ]; then
+    [ -f "$OVERFIT_SCRIPT" ] || { echo "ERROR: $OVERFIT_SCRIPT not found" >&2; exit 1; }
+fi
 
 # DRYRUN=1 echoes the sbatch commands instead of submitting. Useful for CI
 # parse-checks and for showing the user what will happen before they commit.
 DRYRUN="${DRYRUN:-0}"
 
+# When --needs-overfit, run a 1-episode overfit pass first and feed its
+# ckpt as CKPT_PATH into heavy preflights. The overfit ckpt is published
+# to OUT_DIR/overfit.ckpt; downstream attempts can skip the overfit step
+# by passing --ckpt OUT_DIR/overfit.ckpt directly.
+JID_OF=""
+PRE_DEP=""
+if [ "$NEEDS_OVERFIT" -eq 1 ]; then
+    CKPT_PATH="${OUT_DIR}/overfit.ckpt"
+    OVERFIT_EXPORT="ALL,TASK_CONFIG=${OF_TASK_CONFIG},TASK_NAME=${OF_TASK_NAME},ZARR_PATH=${OF_ZARR},AGENT_ID=${OF_AGENT_ID},EXP_NAME=${OF_EXP_NAME},RGB_WEIGHTS=${OF_RGB_WEIGHTS},OVERFIT_CKPT_OUT=${CKPT_PATH},NUM_EPOCHS=${OF_NUM_EPOCHS},CONFIG_NAME=${OF_CONFIG_NAME}"
+    echo "[submit_with_preflights] Submitting overfit-pass (bootstrap)..."
+    if [ "$DRYRUN" = "1" ]; then
+        echo "  DRYRUN: sbatch --parsable --export=\"${OVERFIT_EXPORT}\" \"$OVERFIT_SCRIPT\""
+        JID_OF="<DRY_OF>"
+    else
+        JID_OF=$(sbatch --parsable --export="${OVERFIT_EXPORT}" "$OVERFIT_SCRIPT")
+    fi
+    echo "  overfit JID:   ${JID_OF}"
+    echo "  produces:      ${CKPT_PATH}"
+    PRE_DEP="--dependency=afterok:${JID_OF} --kill-on-invalid-dep=yes"
+fi
+
+# Submit heavy preflights with the inputs as env vars.
+PREFLIGHT_EXPORT="ALL,CKPT_PATH=${CKPT_PATH},DATASET_PATH=${DATASET_PATH},SCENE_CONFIG=${SCENE_CONFIG},OUT_DIR=${OUT_DIR}${EXTRA_ENV}"
+
 echo "[submit_with_preflights] Submitting heavy preflights..."
 if [ "$DRYRUN" = "1" ]; then
-    echo "  DRYRUN: sbatch --parsable --export=\"${PREFLIGHT_EXPORT}\" \"$PREFLIGHT_SCRIPT\""
+    echo "  DRYRUN: sbatch --parsable ${PRE_DEP} --export=\"${PREFLIGHT_EXPORT}\" \"$PREFLIGHT_SCRIPT\""
     JID_PRE="<DRY_PRE>"
 else
-    JID_PRE=$(sbatch --parsable --export="${PREFLIGHT_EXPORT}" "$PREFLIGHT_SCRIPT")
+    JID_PRE=$(sbatch --parsable ${PRE_DEP} --export="${PREFLIGHT_EXPORT}" "$PREFLIGHT_SCRIPT")
 fi
 echo "  preflight JID: ${JID_PRE}"
 echo "  out dir:       ${OUT_DIR}"
@@ -140,8 +211,13 @@ fi
 cat <<EOF
 
 Done. Job chain queued:
-  ${JID_PRE}  heavy preflights (single-node)
-  ${JID_TRAIN}  training (waits afterok)
+EOF
+if [ -n "$JID_OF" ]; then
+    echo "  ${JID_OF}  overfit-pass (bootstrap)"
+fi
+cat <<EOF
+  ${JID_PRE}  heavy preflights${JID_OF:+ (waits afterok overfit)}
+  ${JID_TRAIN}  training (waits afterok preflight)
 EOF
 if [ -n "$JID_CALIB" ]; then
     echo "  ${JID_CALIB}  calibration capture (waits afterok train)"
@@ -149,7 +225,7 @@ fi
 cat <<EOF
 
 Cancel all:
-  scancel ${JID_PRE} ${JID_TRAIN}${JID_CALIB:+ }${JID_CALIB}
+  scancel ${JID_OF:+${JID_OF} }${JID_PRE} ${JID_TRAIN}${JID_CALIB:+ ${JID_CALIB}}
 
 Reports:
   ${OUT_DIR}/init_pose_wasserstein.json
