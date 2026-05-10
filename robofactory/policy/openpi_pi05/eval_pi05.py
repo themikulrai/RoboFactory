@@ -92,18 +92,27 @@ def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
     return float((qpos_step[7] + qpos_step[8]) / 2.0)
 
 
-def _agent_key(obs: dict, robot_uid: str, i: int) -> str:
-    """Multi-arm tasks key obs['agent'] by f'<uid>-<i>'; single-arm tasks key by just <uid>."""
-    multi_key = f"{robot_uid}-{i}"
-    if multi_key in obs["agent"]:
-        return multi_key
-    return robot_uid
+def _get_qpos(obs: dict, robot_uid: str, arm_i: int) -> np.ndarray:
+    """Return qpos ndarray for arm_i. Supports three obs schemas:
+    - Flat single-arm (PickMeat-rf):       obs['agent']['qpos']
+    - Multi-arm indexed (TSC, LP, ...):    obs['agent'][f'{uid}-{i}']['qpos']
+    - Single-arm named (alt. registration): obs['agent'][uid]['qpos']
+    """
+    agent = obs["agent"]
+    if "qpos" in agent:
+        return np.asarray(agent["qpos"])
+    multi_key = f"{robot_uid}-{arm_i}"
+    if multi_key in agent:
+        return np.asarray(agent[multi_key]["qpos"])
+    if robot_uid in agent:
+        return np.asarray(agent[robot_uid]["qpos"])
+    raise KeyError(f"qpos lookup failed: arm={arm_i} uid={robot_uid} agent_keys={list(agent.keys())}")
 
 
 def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda") -> np.ndarray:
     state_parts: list[np.ndarray] = []
     for i in range(num_arms):
-        q = np.asarray(obs["agent"][_agent_key(obs, robot_uid, i)]["qpos"]).squeeze()
+        q = _get_qpos(obs, robot_uid, i).squeeze()
         state_parts.append(q[:7].astype(np.float32))
         state_parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
     return np.concatenate(state_parts).astype(np.float32)
@@ -172,14 +181,11 @@ def _flatten_action_dict_for_box(action_dict: dict, num_arms: int, action_prefix
 
 
 def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str = "panda") -> list[np.ndarray]:
-    return [
-        np.asarray(obs["agent"][_agent_key(obs, robot_uid, i)]["qpos"]).squeeze()[:7].astype(np.float32)
-        for i in range(num_arms)
-    ]
+    return [_get_qpos(obs, robot_uid, i).squeeze()[:7].astype(np.float32) for i in range(num_arms)]
 
 
 def _qpos_at(obs: dict, robot_uid: str, arm_i: int, env_idx: int) -> np.ndarray:
-    q = np.asarray(obs["agent"][_agent_key(obs, robot_uid, arm_i)]["qpos"])
+    q = _get_qpos(obs, robot_uid, arm_i)
     if q.ndim == 2:
         q = q[env_idx]
     elif q.ndim == 1:
