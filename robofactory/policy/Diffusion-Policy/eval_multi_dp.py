@@ -426,6 +426,21 @@ def main(args: Args):
     ) as wandb_run, VideoRecorder(
         record_root, max_recorded=args.video_max, all_seeds=args.video_all,
     ) as videos:
+        # S1 collapse probe (metric-only; never blocks eval). Probe each
+        # per-arm policy under namespaces collapse/arm{i}/*.
+        try:
+            import warnings as _warnings
+            from robofactory.utils.preflight_collapse import probe_collapse_with_loaded_policy
+            _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
+            for _i, _dpm in enumerate(dp_models):
+                _rep = probe_collapse_with_loaded_policy(_dpm.policy, _calib)
+                wandb_run.log_raw(_rep.to_wandb_payload(prefix=f'collapse/arm{_i}'))
+                _r = _rep.image_to_baseline_ratio
+                if _r < 1.5:
+                    _warnings.warn(f"[collapse arm{_i}] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
+                print(f"[collapse-probe arm{_i}] {_rep.summary()}", flush=True)
+        except Exception as _e:
+            print(f"[collapse-probe] skipped: {_e}", file=sys.stderr)
         # Seed loop (reuses env + policies)
         results = []
         for idx, seed in enumerate(seeds):

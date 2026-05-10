@@ -364,6 +364,19 @@ def main(args: Args):
     ) as wandb_run, VideoRecorder(
         record_root, max_recorded=args.video_max, all_seeds=args.video_all,
     ) as videos:
+        # S1 collapse probe (metric-only; never blocks eval).
+        try:
+            import warnings as _warnings
+            from robofactory.utils.preflight_collapse import probe_collapse_with_loaded_policy
+            _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
+            collapse = probe_collapse_with_loaded_policy(dp_model.policy, _calib)
+            wandb_run.log_raw(collapse.to_wandb_payload())
+            _ratio = collapse.image_to_baseline_ratio
+            if _ratio < 1.5:
+                _warnings.warn(f"[collapse] mse_zero_image/baseline = {_ratio:.2f} < 1.5 - image input may be ignored")
+            print(f"[collapse-probe] {collapse.summary()}", flush=True)
+        except Exception as _e:
+            print(f"[collapse-probe] skipped: {_e}", file=sys.stderr)
         results = []
         for idx, seed in enumerate(seeds):
             video_path = videos.video_path_for(idx, seed)

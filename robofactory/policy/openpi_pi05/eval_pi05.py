@@ -497,6 +497,34 @@ def main(args: Args) -> None:
     ) as wandb_run, VideoRecorder(
         args.video_dir, max_recorded=args.video_max, all_seeds=args.video_all,
     ) as videos:
+        # S1 collapse probe (metric-only; never blocks eval). Opaque server
+        # path: feature_rank/var unavailable, only MSE ratios are logged.
+        try:
+            import warnings as _warnings
+            from robofactory.utils.preflight_collapse import probe_collapse_pi05_loaded_policy
+            _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
+            _ref_shape = (224, 224, 3)
+            def _build_obs_for_probe(img_chw, qpos):
+                # Tile/truncate qpos to active_dim so the server's state head sees
+                # the expected length regardless of calibration P.
+                state = np.resize(np.asarray(qpos, dtype=np.float32), active_dim).astype(np.float32)
+                hwc_u8 = (np.clip(np.moveaxis(img_chw, 0, -1), 0, 1) * 255.0).astype(np.uint8)
+                out = {"state": state, "prompt": args.prompt}
+                for slot in IMAGE_SLOTS:
+                    out[slot] = hwc_u8 if cam_map.get(slot) is not None else np.zeros(_ref_shape, dtype=np.uint8)
+                return out
+            _rep = probe_collapse_pi05_loaded_policy(
+                policy, _calib,
+                build_obs_dict=_build_obs_for_probe,
+                image_slots=IMAGE_SLOTS, proprio_key="state", max_episodes=8,
+            )
+            wandb_run.log_raw(_rep.to_wandb_payload())
+            _r = _rep.image_to_baseline_ratio
+            if _r < 1.5:
+                _warnings.warn(f"[collapse] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
+            print(f"[collapse-probe] {_rep.summary()}", flush=True)
+        except Exception as _e:
+            print(f"[collapse-probe] skipped: {_e}", file=_sys.stderr)
         results: list[dict] = []
         episode_global_idx = 0
         if args.num_envs > 1:
