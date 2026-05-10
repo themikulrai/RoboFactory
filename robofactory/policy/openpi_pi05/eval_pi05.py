@@ -92,10 +92,18 @@ def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
     return float((qpos_step[7] + qpos_step[8]) / 2.0)
 
 
+def _agent_key(obs: dict, robot_uid: str, i: int) -> str:
+    """Multi-arm tasks key obs['agent'] by f'<uid>-<i>'; single-arm tasks key by just <uid>."""
+    multi_key = f"{robot_uid}-{i}"
+    if multi_key in obs["agent"]:
+        return multi_key
+    return robot_uid
+
+
 def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda") -> np.ndarray:
     state_parts: list[np.ndarray] = []
     for i in range(num_arms):
-        q = np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()
+        q = np.asarray(obs["agent"][_agent_key(obs, robot_uid, i)]["qpos"]).squeeze()
         state_parts.append(q[:7].astype(np.float32))
         state_parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
     return np.concatenate(state_parts).astype(np.float32)
@@ -111,20 +119,38 @@ def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str], robot_uid: str = "panda") -> dict:
+def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str = "panda") -> dict:
     out: dict = {
         "state": _build_state(obs, num_arms, robot_uid),
         "prompt": prompt,
     }
+    # Mirrors training-side RoboFactoryInputs: slots whose mapping is None are
+    # zero-filled with the same shape as a real image. Required for sparse
+    # configs like pick_meat.json (1-cam).
+    ref_shape: tuple[int, int, int] | None = None
     for slot in IMAGE_SLOTS:
-        out[slot] = _extract_image(obs, cam_map[slot])
+        cam_name = cam_map.get(slot)
+        if cam_name is not None:
+            img = _extract_image(obs, cam_name)
+            out[slot] = img
+            if ref_shape is None:
+                ref_shape = img.shape  # type: ignore[assignment]
+    if ref_shape is None:
+        ref_shape = (224, 224, 3)
+    for slot in IMAGE_SLOTS:
+        if slot not in out:
+            out[slot] = np.zeros(ref_shape, dtype=np.uint8)
     return out
 
 
 def _delta_to_absolute_action(
     chunk_step: np.ndarray, current_qpos_per_arm: list[np.ndarray], num_arms: int, action_prefix: str = "panda"
 ) -> dict:
-    """chunk_step: (num_arms*8,) = per-arm [delta_joints(7), gripper(1)]."""
+    """chunk_step: (num_arms*8,) = per-arm [delta_joints(7), gripper(1)].
+
+    Always returns a dict keyed by f"{action_prefix}-{i}". Caller flattens to
+    a single ndarray via _flatten_action_dict_for_box when env.action_space is Box.
+    """
     out: dict[str, np.ndarray] = {}
     for i in range(num_arms):
         s = i * 8
@@ -135,15 +161,25 @@ def _delta_to_absolute_action(
     return out
 
 
+def _flatten_action_dict_for_box(action_dict: dict, num_arms: int, action_prefix: str) -> np.ndarray:
+    """Box single-arm path: return the per-arm[0] entry as a flat (8,) array.
+
+    PickMeat is the canonical single-arm task; env.action_space is Box(8,).
+    """
+    if num_arms != 1:
+        raise RuntimeError(f"Box action space only valid for num_arms=1; got {num_arms}")
+    return np.asarray(action_dict[f"{action_prefix}-0"], dtype=np.float32).reshape(-1)
+
+
 def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str = "panda") -> list[np.ndarray]:
     return [
-        np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()[:7].astype(np.float32)
+        np.asarray(obs["agent"][_agent_key(obs, robot_uid, i)]["qpos"]).squeeze()[:7].astype(np.float32)
         for i in range(num_arms)
     ]
 
 
 def _qpos_at(obs: dict, robot_uid: str, arm_i: int, env_idx: int) -> np.ndarray:
-    q = np.asarray(obs["agent"][f"{robot_uid}-{arm_i}"]["qpos"])
+    q = np.asarray(obs["agent"][_agent_key(obs, robot_uid, arm_i)]["qpos"])
     if q.ndim == 2:
         q = q[env_idx]
     elif q.ndim == 1:
@@ -172,10 +208,21 @@ def _extract_image_at(obs: dict, cam_name: str, env_idx: int) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict_at(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str], robot_uid: str, env_idx: int) -> dict:
+def _build_obs_dict_at(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str, env_idx: int) -> dict:
     out: dict = {"state": _build_state_at(obs, num_arms, robot_uid, env_idx), "prompt": prompt}
+    ref_shape: tuple[int, int, int] | None = None
     for slot in IMAGE_SLOTS:
-        out[slot] = _extract_image_at(obs, cam_map[slot], env_idx)
+        cam_name = cam_map.get(slot)
+        if cam_name is not None:
+            img = _extract_image_at(obs, cam_name, env_idx)
+            out[slot] = img
+            if ref_shape is None:
+                ref_shape = img.shape  # type: ignore[assignment]
+    if ref_shape is None:
+        ref_shape = (224, 224, 3)
+    for slot in IMAGE_SLOTS:
+        if slot not in out:
+            out[slot] = np.zeros(ref_shape, dtype=np.uint8)
     return out
 
 
@@ -225,7 +272,7 @@ def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix
     return out
 
 
-def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: int, seed: int, action_prefix: str, video_path: str = "") -> dict:
+def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: int, seed: int, action_prefix: str, video_path: str = "", is_dict_action: bool = True) -> dict:
     obs, _ = env.reset(seed=seed)
     success = False
     t0 = time.time()
@@ -275,7 +322,8 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
                     "success_far": False,  # filled after env.step below
                 }
 
-            obs, reward, terminated, truncated, info = env.step(action_dict)
+            step_action = action_dict if is_dict_action else _flatten_action_dict_for_box(action_dict, args.num_arms, action_prefix)
+            obs, reward, terminated, truncated, info = env.step(step_action)
             succ_field = info.get("success", False)
             if hasattr(succ_field, "item"):
                 succ_field = succ_field.item()
@@ -414,9 +462,18 @@ def main(args: Args) -> None:
     env = gym.make(args.task, **env_kwargs)
     # ManiSkill uses URDF body name (e.g. "panda") for action_space keys but the
     # registered agent uid (e.g. "panda_wristcam_multi") for obs["agent"] keys.
-    # Derive action_prefix from action_space; obs prefix stays as args.robot_uid.
-    action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
-    print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}'", flush=True)
+    # Single-arm tasks (PickMeat) get a flat Box action space; multi-arm tasks
+    # get a Dict action space keyed by f"<prefix>-<i>".
+    is_dict_action = hasattr(env.action_space, "spaces")
+    if is_dict_action:
+        action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
+    else:
+        if args.num_arms != 1:
+            raise RuntimeError(
+                f"env.action_space is Box but --num-arms={args.num_arms}; expected Dict for multi-arm"
+            )
+        action_prefix = "panda"  # placeholder; flat path uses key 'panda-0' internally
+    print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}' is_dict_action={is_dict_action}", flush=True)
 
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     print(f"Server metadata: {policy.get_server_metadata()}", flush=True)
@@ -473,7 +530,7 @@ def main(args: Args) -> None:
                     else:
                         video_path = ""
                     try:
-                        r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path)
+                        r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path, is_dict_action=is_dict_action)
                     except Exception as e:  # noqa: BLE001
                         r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
                     results.append(r)
