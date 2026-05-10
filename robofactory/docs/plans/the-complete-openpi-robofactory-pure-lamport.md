@@ -71,7 +71,7 @@ PM is single-arm (cent only). 2SC / TSC / LP have both centralized (one model, a
 
 | Task             | Scheme | DP Train | DP Eval | Pi0.5 Train | Pi0.5 Eval |
 | ---------------- | :----: | :------: | :-----: | :---------: | :--------: |
-| Pick Meat        |  cent  |    ✓     |    ✓    |      T      |            |
+| Pick Meat        |  cent  |    ✓     |    ✓    |      ✓      | ✓ 88.3%    |
 | Two Stack Cube   |  cent  |          |         |             |            |
 | Two Stack Cube   | decent |          |         |             |            |
 | Three Stack Cube |  cent  |    T     |         |             |            |

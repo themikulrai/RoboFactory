@@ -124,7 +124,8 @@ class Args:
 
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
-    payload = torch.load(open('./'+checkpoint, 'rb'), pickle_module=dill)
+    ckpt_full = checkpoint if os.path.isabs(checkpoint) else './' + checkpoint
+    payload = torch.load(open(ckpt_full, 'rb'), pickle_module=dill)
     cfg = payload['cfg']
     cls = hydra.utils.get_class(cfg._target_)
     workspace = cls(cfg, output_dir=output_dir)
