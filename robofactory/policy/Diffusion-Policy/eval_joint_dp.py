@@ -88,7 +88,8 @@ class Args:
 
 
 def load_policy(ckpt_path: str, device: str = "cuda:0"):
-    payload = torch.load(open('./' + ckpt_path, 'rb'), pickle_module=dill)
+    ckpt_full = ckpt_path if os.path.isabs(ckpt_path) else './' + ckpt_path
+    payload = torch.load(open(ckpt_full, 'rb'), pickle_module=dill)
     cfg = payload['cfg']
     cls = hydra.utils.get_class(cfg._target_)
     workspace: RobotWorkspace = cls(cfg, output_dir=None)
