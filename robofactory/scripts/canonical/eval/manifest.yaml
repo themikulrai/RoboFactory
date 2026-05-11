@@ -1,0 +1,396 @@
+# =============================================================================
+# Eval-launcher manifest. One entry per (ckpt × task) launcher.
+#
+# Edited by hand for now; future contributors should keep entries grouped by
+# policy_type (pi05_single, pi05_decent, dp_single, dp_decent_multi, dp_joint_cent)
+# for diff-readability.
+#
+# Run `python -m robofactory.scripts.canonical.eval.manifest_schema
+# scripts/canonical/eval/manifest.yaml` to validate the schema.
+# =============================================================================
+
+launchers:
+
+  # ---------------------------------------------------------------------------
+  # pi05_single — 1 server, 1 GPU
+  # ---------------------------------------------------------------------------
+  pm_pi05_paired_dp_seeds:
+    policy_type: pi05_single
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_pm_lora_finetune/pi05_pm_d1_v1/19999
+      train_config: pi05_robofactory_pm_lora_finetune
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/pick_meat.json
+      num_arms: 1
+      robot_uid: panda
+      prompt: "pick the meat with the gripper"
+      max_steps: 400
+      replan_after: 8
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: ","
+    server:
+      ports: [8000]
+      gpu_indices: [0]
+      xla_mem_fraction: 0.40
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pi05, cent, pm, d1-workspace, table-scene, seedset-dp-xbucket, paired-vs-dp]
+    sbatch:
+      job_name: pi05_pm_eval_60s
+      time: "4:00:00"
+      gres: "gpu:a40:1"
+      cpus_per_task: 8
+      mem: "48G"
+      output: /iris/u/mikulrai/logs/eval_pi05/%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_pi05/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # pi05_decent — 3 servers (per-arm LoRA), 3 GPUs
+  # ---------------------------------------------------------------------------
+  tsc_pi05_d1_decent:
+    policy_type: pi05_decent
+    ckpt:
+      # arm0 dir doubles as the preflight reference (for `.hydra_config.yaml`
+      # lookup, if present).
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_lora_finetune_arm0/pi05_d1_decent_arm0_v0/19999
+      train_config: pi05_robofactory_decent_lora_finetune_arm0
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/three_robots_stack_cube.json
+      num_arms: 3
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 400
+      replan_after: 8
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
+      delim: ","
+    server:
+      ports: [8000, 8001, 8002]
+      gpu_indices: [0, 1, 2]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_decent_lora_finetune_arm0
+        - pi05_robofactory_decent_lora_finetune_arm1
+        - pi05_robofactory_decent_lora_finetune_arm2
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_lora_finetune_arm0/pi05_d1_decent_arm0_v0/19999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_lora_finetune_arm1/pi05_d1_decent_arm1_v0/19999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_lora_finetune_arm2/pi05_d1_decent_arm2_v0/19999
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pi05, decent, d1-workspace, table-scene, tier2.3, encoder-fix]
+    sbatch:
+      job_name: pi05_d1_decent_60s
+      time: "8:00:00"
+      gres: "gpu:a40:3"
+      cpus_per_task: 8
+      mem: "64G"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # dp_single — single-arm DP, eval_dp.py
+  # ---------------------------------------------------------------------------
+  pm_dp_in1k:
+    policy_type: dp_single
+    ckpt:
+      path: /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_in1k.ckpt
+      data_num: 150
+      checkpoint_num: 300
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: in1k
+      max_steps: 200
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pm, track-b, encoder-in1k, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: pm_eval_in1k_60s
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  pm_dp_dino_blora:
+    policy_type: dp_single
+    ckpt:
+      path: /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_dino_blora.ckpt
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: dino_blora
+      max_steps: 200
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pm, track-b, encoder-dino-blora, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: pm_eval_dinoblora_60s
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      exclude: "iris-hp-z8,iris-hgx-1"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  pm_dp_dino_spatch:
+    policy_type: dp_single
+    ckpt:
+      path: /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_dino_spatch.ckpt
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: dino_spatch
+      max_steps: 200
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pm, track-b, encoder-dino-spatch, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: pm_eval_dino_spatch_60s
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      exclude: "iris-hp-z8,iris-hgx-1"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  pm_dp_in1k_crop:
+    policy_type: dp_single
+    ckpt:
+      path: /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150_in1k_crop/300.ckpt
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: in1k_crop
+      max_steps: 200
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pm, track-b, encoder-in1k-crop, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: pm_eval_in1k_crop_60s
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      exclude: "iris-hp-z8,iris-hgx-1"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  pm_dp_r3m:
+    policy_type: dp_single
+    ckpt:
+      path: /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_r3m.ckpt
+    task:
+      env_id: PickMeat-rf
+      scene_config: configs/table/pick_meat.yaml
+      camera_family: r3m
+      max_steps: 200
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    env_hooks:
+      - '[ -L "$HOME/.r3m" ] || ln -sfn /iris/u/mikulrai/.cache/r3m "$HOME/.r3m"'
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pm, track-b, encoder-r3m, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: pm_eval_r3m_60s
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      exclude: "iris-hp-z8,iris-hgx-1"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # dp_decent_multi — eval_multi_dp.py (3 per-arm ckpts evaluated jointly)
+  # ---------------------------------------------------------------------------
+  tsc_dp_d1_decent_in1k:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 300
+      suffix: ""  # `_Agent_` capital-A naming; eval_multi_dp reconstructs paths
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: workspace
+      num_arms: 3
+      obs_cam_family: workspace
+      include_global: false
+      img_height: 240
+      img_width: 320
+      max_steps: 400
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, tsc, d1, decentralised-dp, encoder-in1k, 60seeds, xbucket, seedset-dp-xbucket]
+    sbatch:
+      job_name: tsc_d1_eval_decent_in1k
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      exclude: "iris-hp-z8,iris-hgx-1"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  tsc_dp_d1_freezeenc_decent:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 300
+      suffix: "freezeenc"
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: workspace
+      num_arms: 3
+      obs_cam_family: workspace
+      include_global: false
+      img_height: 240
+      img_width: 320
+      max_steps: 400
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, dp, decent, freezeenc, tsc, table-scene, tier2.1, calibration-candidate]
+    sbatch:
+      job_name: tsc_d1_freezeenc_decent_60s
+      time: "4:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 4
+      mem: "32G"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  tsc_dp_d2_wristcam_reeval:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 300
+      suffix: "d2_wristcam"
+      preflight_path: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150/300.ckpt
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: wristcam
+      num_arms: 3
+      obs_cam_family: wristcam
+      include_global: true
+      img_height: 224
+      img_width: 224
+      max_steps: 400
+      dp_backend: gpu
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, dp, tsc, d2_wristcam, table, 60seeds, reeval_2026-05, scene_match_hypothesis_test, seedset-dp-xbucket]
+    sbatch:
+      job_name: tsc_d2_table_60s_reeval
+      time: "8:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      partition: iris
+      output: /iris/u/mikulrai/logs/%x_%j.out
+      error: /iris/u/mikulrai/logs/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # dp_joint_cent — eval_joint_dp.py (single joint policy)
+  # ---------------------------------------------------------------------------
+  tsc_dp_d1_workspace_cent:
+    policy_type: dp_joint_cent
+    ckpt:
+      # eval_joint_dp.py does `open('./' + path)`, so relative-to-cwd is required.
+      path_relative: checkpoints/ThreeRobotsStackCube-rf_joint_d1_workspace_150_in1k/300.ckpt
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: workspace
+      num_arms: 3
+      max_steps: 400
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, dp, cent, tsc, d1-workspace, table-scene, tier2.2, reeval-encoder-fix]
+    sbatch:
+      job_name: tsc_d1_ws_cent_60s
+      time: "4:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 4
+      mem: "32G"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  tsc_dp_d2_wristcam_cent:
+    policy_type: dp_joint_cent
+    ckpt:
+      path_relative: checkpoints/ThreeRobotsStackCube-rf_joint_d2_wristcam_150/300.ckpt
+      preflight_path: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_joint_d2_wristcam_150/300.ckpt
+    task:
+      env_id: ThreeRobotsStackCube-rf
+      scene_config: configs/table/three_robots_stack_cube.yaml
+      camera_family: wristcam
+      num_arms: 3
+      max_steps: 400
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
+      delim: " "
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, dp, cent, tsc, d2-wristcam, table-scene, tier2.2, reeval-encoder-fix]
+    sbatch:
+      job_name: tsc_d2_wc_cent_60s
+      time: "4:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 4
+      mem: "32G"
+      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
