@@ -24,11 +24,13 @@ cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/pick_meat.yaml}"
 TRAIN_CFG_PATH="${TRAIN_CFG_PATH:-${EVAL_CFG_PATH}}"
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
+SEEDS=$(paste -sd' ' /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \
     --eval-cfg "${EVAL_CFG_PATH}" \
-    --seed-file /iris/u/mikulrai/runs/eval_seeds_60.txt \
-    --expected-sha256 "${EVAL_SEEDS_SHA256:-}"
+    --seed-file /iris/u/mikulrai/runs/eval_seeds_60_dp.txt \
+    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256 \
+    --argv-seeds "$SEEDS"
 if [ $? -ne 0 ]; then echo "Preflight failed; aborting."; exit 1; fi
 
 # Stage-3 per-eval guards (plan v2 C1#10).
@@ -43,13 +45,8 @@ python -u ./policy/Diffusion-Policy/eval_dp.py \
   --checkpoint-num=300 \
   -o rgb -b cpu -n 1 \
   --render-mode=sensors \
-  -s 10000 10001 10002 10003 10004 10005 10006 10007 10008 10009 \
-     10010 10011 10012 10013 10014 10015 10016 10017 10018 10019 \
-     10020 10021 10022 10023 10024 10025 10026 10027 10028 10029 \
-     1000  1001  1002  1003  1004  1005  1006  1007  1008  1009 \
-     1010  1011  1012  1013  1014  1015  1016  1017  1018  1019 \
-     1020  1021  1022  1023  1024  1025  1026  1027  1028  1029 \
+  -s $SEEDS \
   --quiet \
   --max-steps=200 \
   --wandb \
-  --wandb-tags='eval,pm,track-b,encoder-r3m,60seeds,xbucket'
+  --wandb-tags='eval,pm,track-b,encoder-r3m,60seeds,xbucket,seedset-dp-xbucket'

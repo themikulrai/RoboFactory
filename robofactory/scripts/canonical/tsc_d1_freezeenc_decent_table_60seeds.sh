@@ -39,11 +39,13 @@ EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/three_robots_stack_cube.yaml}"
 CKPT_FOR_PREFLIGHT="${CKPT_FOR_PREFLIGHT:-/iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent0_freezeenc_150/300.ckpt}"
 source /iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/canonical/_resolve_train_cfg.sh
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
+SEEDS=$(paste -sd' ' /iris/u/mikulrai/runs/eval_seeds_60.txt)
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \
     --eval-cfg "${EVAL_CFG_PATH}" \
     --seed-file /iris/u/mikulrai/runs/eval_seeds_60.txt \
-    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds.sha256
+    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds.sha256 \
+    --argv-seeds "$SEEDS"
 if [ $? -ne 0 ]; then echo "Preflight failed; aborting."; exit 1; fi
 
 # Stage-3 per-eval guards (plan v2 C1#10). eval_multi_dp.py computes per-arm
@@ -62,12 +64,7 @@ python -u ./policy/Diffusion-Policy/eval_multi_dp.py \
   --img-width=320 \
   -o rgb -b cpu -n 1 \
   --render-mode=sensors \
-  -s 100 101 102 103 104 105 106 107 108 109 \
-     110 111 112 113 114 115 116 117 118 119 \
-     120 121 122 123 124 125 126 127 128 129 \
-     130 131 132 133 134 135 136 137 138 139 \
-     140 141 142 143 144 145 146 147 148 149 \
-     150 151 152 153 154 155 156 157 158 159 \
+  -s $SEEDS \
   --quiet \
   --max-steps=400 \
   --wandb \

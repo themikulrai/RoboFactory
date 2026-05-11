@@ -71,6 +71,10 @@ class EvalSeedFileDriftError(PreflightGuardError):
     """sha256 of eval-seed file does not match the pinned/expected hash."""
 
 
+class EvalSeedArgvDriftError(PreflightGuardError):
+    """Seed list passed to the eval driver does not match the pinned seed file."""
+
+
 class WandbOfflineError(PreflightGuardError):
     """Wandb is offline / disabled / unauthenticated."""
 
@@ -215,17 +219,58 @@ def assert_eval_seed_file(seed_file_path: Path, expected_sha256: str) -> None:
 
     expected = expected_sha256 or EVAL_SEEDS_60_SHA256
     if not expected:
-        warnings.warn(
-            f"eval-seed-file check skipped — no expected sha256 supplied "
-            f"and EVAL_SEEDS_60_SHA256 is empty",
-            stacklevel=2,
+        # No CLI hash, no pin file, no module constant. Refuse to run rather
+        # than soft-warn — preflight without enforcement is just theater.
+        raise EvalSeedFileDriftError(
+            "eval-seed-file check has no expected sha256 (CLI empty, pin file "
+            "empty/missing, EVAL_SEEDS_60_SHA256 empty). Refusing to run."
         )
-        return
 
     actual = hashlib.sha256(seed_file_path.read_bytes()).hexdigest()
     if actual.lower() != expected.lower():
         raise EvalSeedFileDriftError(
             f"seed file {seed_file_path} sha256={actual} but expected {expected}"
+        )
+
+
+def assert_argv_matches_seed_file(argv_seeds: str, seed_file_path: Path) -> None:
+    """Crash if the seed list passed to the eval driver drifts from the pinned file.
+
+    Closes the gap where a launcher pins one seed file in preflight but passes
+    an unrelated list (or `paste`s a different file) to the eval driver.
+
+    `argv_seeds` is the literal string the eval driver was invoked with — e.g.
+    `"10000 10001 ..."` (DP `-s` nargs='+') or `"10000,10001,..."` (Pi0.5
+    `--seeds` comma-list). We split on whitespace AND comma, cast to int, and
+    require an exact-order equality with the file's int list.
+
+    Empty `argv_seeds` is allowed for back-compat with callers that don't pass
+    it yet (no cross-check performed).
+    """
+    if not argv_seeds.strip():
+        return  # opt-in cross-check; absent => no enforcement here
+    if not seed_file_path.exists():
+        raise EvalSeedArgvDriftError(f"seed file not found: {seed_file_path}")
+    raw_tokens = argv_seeds.replace(",", " ").split()
+    try:
+        argv_list = [int(tok) for tok in raw_tokens]
+    except ValueError as exc:
+        raise EvalSeedArgvDriftError(
+            f"non-integer token in --argv-seeds: {raw_tokens}"
+        ) from exc
+    try:
+        file_list = [int(tok) for tok in seed_file_path.read_text().split()]
+    except ValueError as exc:
+        raise EvalSeedArgvDriftError(
+            f"non-integer line in seed file {seed_file_path}"
+        ) from exc
+    if argv_list != file_list:
+        first_n = 3
+        raise EvalSeedArgvDriftError(
+            f"argv seeds drift from {seed_file_path}: "
+            f"argv first {first_n}={argv_list[:first_n]} "
+            f"file first {first_n}={file_list[:first_n]}; "
+            f"len argv={len(argv_list)} len file={len(file_list)}"
         )
 
 
@@ -306,11 +351,13 @@ def run_all_guards(
     seed_file_path: Path,
     expected_sha256: str,
     project: Optional[str] = None,
+    argv_seeds: str = "",
 ) -> None:
     """Run every guard. Raises on the first failure."""
     assert_scene_match(train_cfg_path, eval_cfg_path)
     assert_camera_family_match(train_cfg_path, eval_cfg_path)
     assert_eval_seed_file(seed_file_path, expected_sha256)
+    assert_argv_matches_seed_file(argv_seeds, seed_file_path)
     assert_wandb_live(project=project)
 
 
@@ -358,6 +405,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             "wandb.Api(). Empty -> skip the network round-trip."
         ),
     )
+    p.add_argument(
+        "--argv-seeds",
+        default="",
+        help=(
+            "Optional: the literal seed string passed to the eval driver "
+            "(space- or comma-separated ints). When non-empty, asserts that it "
+            "matches the seed file exactly. Closes the gap where preflight "
+            "pins file X but the driver receives an unrelated argv list."
+        ),
+    )
     args = p.parse_args(argv)
 
     expected = args.expected_sha256
@@ -371,6 +428,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.seed_file,
             expected,
             project=(args.project or None),
+            argv_seeds=args.argv_seeds,
         )
     except PreflightGuardError as exc:
         print(

@@ -52,11 +52,13 @@ EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/pick_meat.yaml}"
 CKPT_FOR_PREFLIGHT="${CKPT_FOR_PREFLIGHT:-/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_pm_lora_finetune/pi05_pm_d1_v1/19999}"
 source /iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/canonical/_resolve_train_cfg.sh
 PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
+SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
 $PREFLIGHT_PYTHON -m robofactory.utils.preflight_eval_guards \
     --train-cfg "${TRAIN_CFG_PATH}" \
     --eval-cfg "${EVAL_CFG_PATH}" \
-    --seed-file /iris/u/mikulrai/runs/eval_seeds_60.txt \
-    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds.sha256
+    --seed-file /iris/u/mikulrai/runs/eval_seeds_60_dp.txt \
+    --expected-sha256-file /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256 \
+    --argv-seeds "$SEEDS"
 if [ $? -ne 0 ]; then echo "Preflight failed; aborting."; exit 1; fi
 
 $PREFLIGHT_PYTHON -u -m robofactory.utils.preflight_eval \
@@ -113,9 +115,8 @@ echo "[wait] port 8000 up"
 # -----------------------------------------------------------------------------
 # Eval driver. PickMeat is single-arm, single-cam (head_camera). Other 3
 # IMAGE_SLOTS in pick_meat.json are null and zero-filled by patched eval_pi05.py.
+# $SEEDS was set above preflight so the cross-check sees the same list.
 # -----------------------------------------------------------------------------
-SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
-
 VIDEO_DIR=/iris/u/mikulrai/logs/eval_pi05/videos_${SLURM_JOB_ID}
 OUT_DIR=/iris/u/mikulrai/logs/eval_pi05
 mkdir -p "$VIDEO_DIR" "$OUT_DIR"
@@ -142,4 +143,4 @@ RUN_NAME=pi05_pm_eval_table_${UNIX_TS}
     --run-id "$SLURM_JOB_ID" \
     --wandb \
     --wandb-project openpi-robofactory \
-    --wandb-tags 'eval,pi05,cent,pm,d1-workspace,table-scene,first-eval'
+    --wandb-tags 'eval,pi05,cent,pm,d1-workspace,table-scene,seedset-dp-xbucket,paired-vs-dp'

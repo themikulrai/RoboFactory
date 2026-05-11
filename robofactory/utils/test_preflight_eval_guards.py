@@ -156,6 +156,94 @@ class TestEvalSeedFile(unittest.TestCase):
         self.assertEqual(g._load_pinned_sha256(Path("/no/such/x")), "")
         self.assertEqual(g._load_pinned_sha256(None), "")
 
+    def test_no_pin_anywhere_raises_instead_of_soft_warn(self):
+        # Previously: empty expected + empty constant -> warn and skip.
+        # Now: raise, because preflight without a pin is theater.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "seeds.txt"
+            p.write_bytes(b"1\n2\n3\n")
+            with mock.patch.object(g, "EVAL_SEEDS_60_SHA256", ""):
+                with self.assertRaises(g.EvalSeedFileDriftError):
+                    g.assert_eval_seed_file(p, "")
+
+
+# ---------------------------------------------------------------------------
+# Argv ↔ seed file cross-check
+# ---------------------------------------------------------------------------
+class TestArgvMatchesSeedFile(unittest.TestCase):
+    def _seed_file(self, dirpath: Path, ints: list[int]) -> Path:
+        p = dirpath / "seeds.txt"
+        p.write_text("\n".join(str(i) for i in ints) + "\n")
+        return p
+
+    def test_empty_argv_skips(self):
+        # Back-compat: callers that don't pass --argv-seeds get no cross-check.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [1, 2, 3])
+            g.assert_argv_matches_seed_file("", p)  # no raise
+            g.assert_argv_matches_seed_file("   ", p)  # whitespace also skips
+
+    def test_space_separated_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [10000, 10001, 1000])
+            g.assert_argv_matches_seed_file("10000 10001 1000", p)
+
+    def test_comma_separated_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [100, 101, 102])
+            g.assert_argv_matches_seed_file("100,101,102", p)
+
+    def test_mixed_delim_match(self):
+        # argv with both spaces and commas (Pi0.5 sometimes joins with comma
+        # but bash word-splitting can intersperse spaces)
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [1, 2, 3, 4])
+            g.assert_argv_matches_seed_file("1, 2 ,3 4", p)
+
+    def test_order_difference_raises(self):
+        # Permutation is drift — we require exact-order equality so the eval
+        # iterates in the documented order.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [1, 2, 3])
+            with self.assertRaises(g.EvalSeedArgvDriftError):
+                g.assert_argv_matches_seed_file("3 2 1", p)
+
+    def test_value_difference_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [100, 101, 102])
+            with self.assertRaises(g.EvalSeedArgvDriftError) as cm:
+                g.assert_argv_matches_seed_file("10000 10001 10002", p)
+            self.assertIn("drift", str(cm.exception))
+
+    def test_length_difference_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [1, 2, 3])
+            with self.assertRaises(g.EvalSeedArgvDriftError):
+                g.assert_argv_matches_seed_file("1 2", p)
+            with self.assertRaises(g.EvalSeedArgvDriftError):
+                g.assert_argv_matches_seed_file("1 2 3 4", p)
+
+    def test_non_integer_argv_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), [1, 2, 3])
+            with self.assertRaises(g.EvalSeedArgvDriftError):
+                g.assert_argv_matches_seed_file("1 two 3", p)
+
+    def test_missing_seed_file_raises(self):
+        with self.assertRaises(g.EvalSeedArgvDriftError):
+            g.assert_argv_matches_seed_file("1 2 3", Path("/no/such/file"))
+
+    def test_drift_caught_by_full_drift_scenario(self):
+        # Mirrors the actual live-drift bug we're fixing: launcher pins file
+        # A but driver gets argv B (different seeds). Cross-check should raise.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._seed_file(Path(d), list(range(100, 160)))  # 100..159
+            argv_dp = " ".join(str(i) for i in (
+                list(range(10000, 10030)) + list(range(1000, 1030))
+            ))
+            with self.assertRaises(g.EvalSeedArgvDriftError):
+                g.assert_argv_matches_seed_file(argv_dp, p)
+
 
 # ---------------------------------------------------------------------------
 # Wandb live
@@ -309,6 +397,43 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(r.returncode, 1)
             self.assertIn("WandbOfflineError", r.stderr)
+
+    def test_cli_fail_argv_seed_drift(self):
+        # Mirrors the live-drift bug: file pinned by sha contains seeds A,
+        # driver argv passes seeds B. New cross-check should reject.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            train = _make_train_cfg(p)
+            ev = _make_eval_cfg(p)
+            seeds = p / "seeds.txt"
+            seeds.write_text("100\n101\n102\n")
+            sha = hashlib.sha256(seeds.read_bytes()).hexdigest()
+            r = self._run([
+                "--train-cfg", str(train),
+                "--eval-cfg", str(ev),
+                "--seed-file", str(seeds),
+                "--expected-sha256", sha,
+                "--argv-seeds", "10000 10001 10002",
+            ])
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("EvalSeedArgvDriftError", r.stderr)
+
+    def test_cli_pass_argv_seed_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            train = _make_train_cfg(p)
+            ev = _make_eval_cfg(p)
+            seeds = p / "seeds.txt"
+            seeds.write_text("100\n101\n102\n")
+            sha = hashlib.sha256(seeds.read_bytes()).hexdigest()
+            r = self._run([
+                "--train-cfg", str(train),
+                "--eval-cfg", str(ev),
+                "--seed-file", str(seeds),
+                "--expected-sha256", sha,
+                "--argv-seeds", "100 101 102",
+            ])
+            self.assertEqual(r.returncode, 0, msg=f"stderr={r.stderr}\nstdout={r.stdout}")
 
     def test_cli_fail_scene_mismatch(self):
         with tempfile.TemporaryDirectory() as d:
