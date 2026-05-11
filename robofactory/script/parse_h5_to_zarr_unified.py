@@ -77,7 +77,16 @@ def _camera_key(tr, family, agent_id):
     multi = CAM_KEY[family].format(i=agent_id)
     if f"obs/sensor_data/{multi}" in tr:
         return multi
-    return "head_camera" if family == "workspace" else f"hand_camera_{agent_id}"
+    return "head_camera" if family == "workspace" else "hand_camera"
+
+
+def _global_cam_path(tr):
+    """Multi-arm H5s have obs/sensor_data/head_camera_global; PM (single-arm) does
+    not — its head view lives at obs/sensor_data/head_camera. Fall back so that
+    --include-global produces a sensible head view for PM as well."""
+    if "obs/sensor_data/head_camera_global" in tr:
+        return "obs/sensor_data/head_camera_global/rgb"
+    return "obs/sensor_data/head_camera/rgb"
 
 
 def _measure_total_steps(f, traj_keys, n_agents):
@@ -148,7 +157,7 @@ def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resi
                 raise ValueError(f"{tk}: cam{i} {rgb.shape[0]} < T={T}")
             data[f"head_camera_{i}"][sl] = _resize_batch(rgb[:T], resize)
         if include_global:
-            gr = np.asarray(tr["obs/sensor_data/head_camera_global/rgb"])
+            gr = np.asarray(tr[_global_cam_path(tr)])
             data["head_camera_global"][sl] = _resize_batch(gr[:T], resize)
         cursor += T
         episode_ends.append(cursor)
@@ -175,7 +184,7 @@ def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, 
         data["tcp_action"][sl] = act
         data["head_camera"][sl] = _resize_batch(rgb[:T], resize)
         if include_global:
-            gr = np.asarray(tr["obs/sensor_data/head_camera_global/rgb"])
+            gr = np.asarray(tr[_global_cam_path(tr)])
             data["head_camera_global"][sl] = _resize_batch(gr[:T], resize)
         cursor += T
         episode_ends.append(cursor)

@@ -104,6 +104,12 @@ class Args:
     wandb_tags: str = "eval,baseline,decentralised-dp"
     """Comma-separated W&B tags."""
 
+    wandb_project: str = "diffusion-robofactory"
+    """W&B project name. Override to keep eval runs in the same project as the matching train runs (e.g. PM-DP, 2SC-DP)."""
+
+    wandb_name: Optional[str] = None
+    """W&B run display name. If None, defaults to eval_decent_{env_id}_ckpt{N}_{ts}. Override to match train-run names (e.g. 'Eval 2SC WS DP Decent A0')."""
+
     obs_cam_family: str = "workspace"
     """Which cameras supply 'head_cam' to the policy: 'workspace' (scene-mounted head_camera_agent{i}) or 'wristcam' (robot-mounted hand_camera_{i}). d2_wristcam ckpts require 'wristcam'."""
 
@@ -178,12 +184,19 @@ def _rgb_chw(rgb_tensor, img_h: int = 224, img_w: int = 224):
 _CAM_TPL = {"workspace": "head_camera_agent{i}", "wristcam": "hand_camera_{i}"}
 
 
+_SINGLE_AGENT_CAM_FALLBACK = {"workspace": "head_camera", "wristcam": "hand_camera"}
+
+
 def get_model_input(observation, agent_pos, agent_id, include_global: bool = True, cam_family: str = "workspace", img_h: int = 224, img_w: int = 224):
     sd = observation['sensor_data']
     per_agent_key = _CAM_TPL[cam_family].format(i=agent_id)
-    # Single-agent tasks (e.g. PickMeat) use head_camera instead of head_camera_agent0
-    if per_agent_key not in sd and 'head_camera' in sd:
-        per_agent_key = 'head_camera'
+    # Single-agent tasks (e.g. PickMeat) drop the agent-id suffix. Workspace family
+    # falls back to 'head_camera', wristcam family to 'hand_camera' — mirrors the
+    # train-side zarr convention in parse_h5_to_zarr_unified.py:_camera_key.
+    if per_agent_key not in sd:
+        sa_fallback = _SINGLE_AGENT_CAM_FALLBACK.get(cam_family)
+        if sa_fallback and sa_fallback in sd:
+            per_agent_key = sa_fallback
     if per_agent_key not in sd:
         raise KeyError(f"sensor_data missing {per_agent_key}; available={list(sd.keys())}")
     out = dict(
@@ -191,9 +204,15 @@ def get_model_input(observation, agent_pos, agent_id, include_global: bool = Tru
         agent_pos = agent_pos,
     )
     if include_global:
-        if 'head_camera_global' not in sd:
-            raise KeyError(f"sensor_data missing head_camera_global; available={list(sd.keys())}")
-        out['head_cam_global'] = _rgb_chw(sd['head_camera_global']['rgb'], img_h=img_h, img_w=img_w)
+        # Multi-arm scenes expose head_camera_global; PM (single-arm) does not — train
+        # side falls back to head_camera (parse_h5_to_zarr_unified.py:_global_cam_path).
+        if 'head_camera_global' in sd:
+            global_key = 'head_camera_global'
+        elif 'head_camera' in sd:
+            global_key = 'head_camera'
+        else:
+            raise KeyError(f"sensor_data missing head_camera_global (no head_camera fallback); available={list(sd.keys())}")
+        out['head_cam_global'] = _rgb_chw(sd[global_key]['rgb'], img_h=img_h, img_w=img_w)
     return out
 
 def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix='panda', action_prefix='panda', video_path: str = None):
@@ -417,9 +436,9 @@ def main(args: Args):
 
     with WandbRun(
         enabled=args.wandb,
-        project='diffusion-robofactory',
+        project=args.wandb_project,
         job_type='eval',
-        name=f'eval_decent_{env_id}_ckpt{args.checkpoint_num}_{ts}',
+        name=args.wandb_name or f'eval_decent_{env_id}_ckpt{args.checkpoint_num}_{ts}',
         group=f'eval_decent_{env_id}_ckpt{args.checkpoint_num}',
         tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
         config=manifest,

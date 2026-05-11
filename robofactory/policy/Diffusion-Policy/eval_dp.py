@@ -97,6 +97,18 @@ class Args:
     wandb_tags: str = "eval,baseline,single-dp"
     """Comma-separated W&B tags."""
 
+    wandb_project: str = "diffusion-robofactory"
+    """W&B project name. Override to keep eval runs in the same project as the matching train run (e.g. PM-DP)."""
+
+    wandb_name: Optional[str] = None
+    """W&B run display name. If None, defaults to eval_single_{env_id}_ckpt{N}_{ts}. Override to match train-run names (e.g. 'Eval PM WC DP')."""
+
+    obs_cam_family: str = "workspace"
+    """Which scene camera supplies 'head_cam' to the policy: 'workspace' uses sensor_data['head_camera'] (the table-mounted scene cam); 'wristcam' uses sensor_data['hand_camera'] (the robot-mounted wrist cam). Must match training-data camera family."""
+
+    include_global: bool = False
+    """If True, additionally feed 'head_cam_global' to the policy. Required for models trained with default_task_wristcam (2-cam). PM scene has no head_camera_global sensor — falls back to head_camera to mirror train-side parse_h5_to_zarr_unified.py:_global_cam_path."""
+
     img_height: Optional[int] = None
     """Optional resize height before feeding to the policy. None = keep env-native resolution (typical for paper-data PickMeat: 240)."""
 
@@ -159,14 +171,29 @@ def _rgb_chw(rgb_tensor, img_h: Optional[int] = None, img_w: Optional[int] = Non
     return np.moveaxis(arr, -1, 0).astype(np.float32) / 255.0
 
 
-def get_model_input(observation, agent_pos, img_h: Optional[int] = None, img_w: Optional[int] = None):
+_SINGLE_AGENT_CAM = {"workspace": "head_camera", "wristcam": "hand_camera"}
+
+
+def get_model_input(observation, agent_pos, img_h: Optional[int] = None, img_w: Optional[int] = None, cam_family: str = "workspace", include_global: bool = False):
     sd = observation['sensor_data']
-    if 'head_camera' not in sd:
-        raise KeyError(f"sensor_data missing head_camera; available={list(sd.keys())}")
-    return dict(
-        head_cam=_rgb_chw(sd['head_camera']['rgb'], img_h=img_h, img_w=img_w),
+    per_agent_key = _SINGLE_AGENT_CAM.get(cam_family, "head_camera")
+    if per_agent_key not in sd:
+        raise KeyError(f"sensor_data missing {per_agent_key} (cam_family={cam_family}); available={list(sd.keys())}")
+    out = dict(
+        head_cam=_rgb_chw(sd[per_agent_key]['rgb'], img_h=img_h, img_w=img_w),
         agent_pos=agent_pos,
     )
+    if include_global:
+        # PM scene has no head_camera_global — fall back to head_camera, mirroring
+        # the train-side fallback in parse_h5_to_zarr_unified.py:_global_cam_path.
+        if 'head_camera_global' in sd:
+            global_key = 'head_camera_global'
+        elif 'head_camera' in sd:
+            global_key = 'head_camera'
+        else:
+            raise KeyError(f"sensor_data missing head_camera_global (no head_camera fallback); available={list(sd.keys())}")
+        out['head_cam_global'] = _rgb_chw(sd[global_key]['rgb'], img_h=img_h, img_w=img_w)
+    return out
 
 
 def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optional[str] = None):
@@ -194,7 +221,7 @@ def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optiona
     # Seed planner state with the initial proprioception
     initial_qpos = raw_obs['agent']['qpos'].squeeze(0)[:-2].cpu().numpy()
     initial_qpos = np.append(initial_qpos, planner.gripper_state)
-    obs_dict = get_model_input(raw_obs, initial_qpos, img_h=args.img_height, img_w=args.img_width)
+    obs_dict = get_model_input(raw_obs, initial_qpos, img_h=args.img_height, img_w=args.img_width, cam_family=args.obs_cam_family, include_global=args.include_global)
     dp_model.update_obs(obs_dict)
 
     infer_times_ms = []
@@ -228,7 +255,7 @@ def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optiona
                     _f = observation['sensor_data']['head_camera']['rgb'][0]
                     if hasattr(_f, 'cpu'): _f = _f.cpu().numpy()
                     _video_frames.append(_f.astype(np.uint8))
-                obs_dict = get_model_input(observation, now_action, img_h=args.img_height, img_w=args.img_width)
+                obs_dict = get_model_input(observation, now_action, img_h=args.img_height, img_w=args.img_width, cam_family=args.obs_cam_family, include_global=args.include_global)
                 dp_model.update_obs(obs_dict)
                 continue
             n_step = position.shape[0]
@@ -244,7 +271,7 @@ def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optiona
                     _video_frames.append(_f.astype(np.uint8))
                 if verbose:
                     env.render_human()
-            obs_dict = get_model_input(observation, true_action, img_h=args.img_height, img_w=args.img_width)
+            obs_dict = get_model_input(observation, true_action, img_h=args.img_height, img_w=args.img_width, cam_family=args.obs_cam_family, include_global=args.include_global)
             dp_model.update_obs(obs_dict)
         if verbose:
             print("info", info)
@@ -355,9 +382,9 @@ def main(args: Args):
 
     with WandbRun(
         enabled=args.wandb,
-        project='diffusion-robofactory',
+        project=args.wandb_project,
         job_type='eval',
-        name=f'eval_single_{env_id}_ckpt{args.checkpoint_num}_{ts}',
+        name=args.wandb_name or f'eval_single_{env_id}_ckpt{args.checkpoint_num}_{ts}',
         group=f'eval_single_{env_id}_ckpt{args.checkpoint_num}',
         tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
         config=manifest,
