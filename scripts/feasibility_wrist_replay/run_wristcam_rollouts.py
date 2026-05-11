@@ -20,10 +20,19 @@ os.environ.setdefault("SAPIEN_HEADLESS", "1")
 import argparse
 import json
 import os.path as osp
+import signal
 import sys
 
 import gymnasium as gym
 from tqdm import tqdm
+
+
+class _SolverTimeout(Exception):
+    """Raised by SIGALRM handler when a single solver attempt exceeds budget."""
+
+
+def _solver_alarm_handler(signum, frame):
+    raise _SolverTimeout()
 
 import robofactory  # registers envs + PandaWristCamMulti
 from robofactory.planner.solutions import (
@@ -104,7 +113,8 @@ def _load_seeds(task_name, num):
     return list(range(num))
 
 
-def run(task_name, num, record_dir, max_retries_per_seed=5):
+def run(task_name, num, record_dir, max_retries_per_seed=5,
+        per_attempt_timeout=300, override_seeds=None):
     env_id, yaml_rel, solver, n_agents = TASK_MAP[task_name]
     config_path = osp.join(CONFIG_DIR, yaml_rel)
 
@@ -153,36 +163,68 @@ def run(task_name, num, record_dir, max_retries_per_seed=5):
     print(f"[wristcam] output_h5={out_h5}")
 
     # --- seed list aligned with old dataset ---
-    seeds = _load_seeds(task_name, num)
+    seeds = override_seeds if override_seeds is not None else _load_seeds(task_name, num)
+    print(f"[wristcam] per_attempt_timeout={per_attempt_timeout}s "
+          f"(SIGALRM aborts solver call; periodic _h5_file.flush() after each "
+          f"successful episode persists link B-tree to disk)", flush=True)
+
+    signal.signal(signal.SIGALRM, _solver_alarm_handler)
 
     passed = 0
     total_attempts = 0
+    timeouts = 0
     pbar = tqdm(total=num, desc=task_name)
 
     for seed in seeds:
         if passed >= num:
             break
         success_this_seed = False
+        timed_out_this_seed = False
         for attempt in range(max_retries_per_seed):
             total_attempts += 1
-            res = solver(env, seed=seed, debug=False, vis=False)
+            signal.alarm(int(per_attempt_timeout))
+            try:
+                res = solver(env, seed=seed, debug=False, vis=False)
+            except _SolverTimeout:
+                timeouts += 1
+                timed_out_this_seed = True
+                print(f"  seed {seed}: TIMEOUT after {per_attempt_timeout}s "
+                      f"(attempt {attempt+1}); skipping seed entirely "
+                      f"(suspected unrecoverable hang)", flush=True)
+                try:
+                    env.flush_trajectory(save=False)
+                except Exception as e:
+                    print(f"    [WARN] could not clear in-progress trajectory "
+                          f"buffer after timeout: {type(e).__name__}: {e}",
+                          flush=True)
+                break  # don't retry; treat as deterministic hang
+            finally:
+                signal.alarm(0)
             ok = res != -1 and bool(res[-1]["success"].item())
             if ok:
                 env.flush_trajectory()
+                # Persist the group-link B-tree to disk so a SIGKILL during
+                # the next solver call leaves a valid (truncated) H5, not a
+                # corrupted one with EOA=2048.
+                try:
+                    env._h5_file.flush()
+                except AttributeError:
+                    pass
                 passed += 1
                 pbar.update(1)
                 success_this_seed = True
-                print(f"  seed {seed}: SUCCESS (attempt {attempt+1})")
+                print(f"  seed {seed}: SUCCESS (attempt {attempt+1})", flush=True)
                 break
             env.flush_trajectory(save=False)
-        if not success_this_seed:
-            print(f"  seed {seed}: FAILED after {max_retries_per_seed} attempts — skipping")
+        if not success_this_seed and not timed_out_this_seed:
+            print(f"  seed {seed}: FAILED after {max_retries_per_seed} attempts — skipping", flush=True)
 
     pbar.close()
     env.close()
 
     print()
-    print(f"[wristcam] collected {passed}/{num} demos in {total_attempts} total sim runs")
+    print(f"[wristcam] collected {passed}/{num} demos in {total_attempts} total sim runs "
+          f"(timeouts: {timeouts})")
     print(f"[wristcam] h5: {out_h5}")
 
     if passed < num:
@@ -211,5 +253,18 @@ if __name__ == "__main__":
         default="/iris/u/mikulrai/data/RoboFactory/hf_download_wristcam",
     )
     ap.add_argument("--max-retries", type=int, default=5, dest="max_retries")
+    ap.add_argument("--per-attempt-timeout", type=int, default=300, dest="per_attempt_timeout",
+                    help="seconds before SIGALRM aborts a single solver attempt; skip seed on timeout")
+    ap.add_argument("--seeds-csv", type=str, default=None, dest="seeds_csv",
+                    help="explicit comma-separated seed list; bypasses --num and legacy-JSON seeds")
     args = ap.parse_args()
-    run(args.task, args.num, args.record_dir, max_retries_per_seed=args.max_retries)
+    override_seeds = None
+    if args.seeds_csv:
+        override_seeds = [int(s) for s in args.seeds_csv.split(",") if s.strip()]
+        num_eff = len(override_seeds)
+    else:
+        num_eff = args.num
+    run(args.task, num_eff, args.record_dir,
+        max_retries_per_seed=args.max_retries,
+        per_attempt_timeout=args.per_attempt_timeout,
+        override_seeds=override_seeds)
