@@ -38,7 +38,7 @@ conda activate RoboFactory
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
 export HYDRA_FULL_ERROR=1
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY must be set in environment before submitting}"
 export CUDA_VISIBLE_DEVICES=0
 
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory

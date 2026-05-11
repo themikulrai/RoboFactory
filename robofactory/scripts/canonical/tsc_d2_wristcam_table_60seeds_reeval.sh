@@ -29,7 +29,7 @@ export CUDA_VISIBLE_DEVICES=0
 # resolution depended on the compute node's HOME (which differs from
 # /iris/u/mikulrai on iris* nodes).
 export HOME=/iris/u/mikulrai
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY must be set in environment before submitting}"
 
 # Stage-3 preflight guards — refuses to run on scene/camera/seed/wandb mismatch.
 EVAL_CFG_PATH="${EVAL_CFG_PATH:-configs/table/three_robots_stack_cube.yaml}"
