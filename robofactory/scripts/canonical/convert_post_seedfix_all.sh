@@ -170,11 +170,12 @@ case "$KIND" in
       echo "[conv] WARN  zarr exists without sentinel; removing partial ${OUT}"
       rm -rf "${OUT}"
     fi
-    echo "[conv] writing zarr -> ${OUT}"
+    echo "[conv] writing zarr -> ${OUT}  (with --include-global)"
     "${RF_PY}" "${ZARR_SCRIPT}" \
       --h5-path "${H5}" \
       --out-zarr "${OUT}" \
       --camera-family "${CAM}" \
+      --include-global \
       "${MODE_ARGS[@]}" \
       --resize 224
     {
