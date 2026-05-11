@@ -249,3 +249,18 @@ class TestDryRunFlow:
             rc = r.run_launcher(cfg, launcher_id, slurm_job_id="DRY", dry_run=True)
         assert rc == 0
         assert run_mock.call_count == 0
+
+    def test_preflight_only_runs_preflight_then_stops(self):
+        """--preflight-only should subprocess.run once (the preflight) and stop."""
+        cfg = _cfg("pm_dp_in1k")
+        with mock.patch.object(r.subprocess, "run") as run_mock:
+            run_mock.return_value.returncode = 0
+            rc = r.run_launcher(
+                cfg, "pm_dp_in1k",
+                slurm_job_id="LOCAL", dry_run=False, preflight_only=True,
+            )
+        assert rc == 0
+        # Exactly one subprocess call: the preflight. No driver, no server.
+        assert run_mock.call_count == 1
+        called_cmd = run_mock.call_args[0][0]
+        assert "preflight_eval_guards" in " ".join(called_cmd)

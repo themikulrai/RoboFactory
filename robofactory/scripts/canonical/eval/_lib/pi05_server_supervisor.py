@@ -84,10 +84,10 @@ class Pi05ServerSupervisor:
     def __init__(
         self,
         specs: list[ServerSpec],
-        log_dir: Path,
+        log_dir: "Path | str",
     ) -> None:
         self.specs = specs
-        self.log_dir = log_dir
+        self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._procs: list[subprocess.Popen] = []
         self._signal_installed = False

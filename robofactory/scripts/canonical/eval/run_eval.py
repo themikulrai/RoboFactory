@@ -332,6 +332,7 @@ def run_launcher(
     *,
     slurm_job_id: str,
     dry_run: bool = False,
+    preflight_only: bool = False,
 ) -> int:
     seeds = _load_seeds(cfg)
     print(
@@ -342,6 +343,12 @@ def run_launcher(
 
     run_env_hooks(cfg, dry_run=dry_run)
     run_preflight(cfg, argv_seeds=seeds, dry_run=dry_run)
+    if preflight_only:
+        print(
+            f"[run_eval] preflight-only mode: stopping before driver/servers.",
+            file=sys.stderr, flush=True,
+        )
+        return 0
 
     is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
     if is_pi05:
@@ -380,6 +387,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     p.add_argument("--dry-run", action="store_true",
                    help="Print argv + preflight cmd without executing.")
+    p.add_argument("--preflight-only", action="store_true",
+                   help="Run preflight + env_hooks for real, then stop. "
+                        "Useful for verifying scene/seed/wandb without burning a GPU.")
     p.add_argument("--slurm-job-id", default=os.environ.get("SLURM_JOB_ID", "local"))
     args = p.parse_args(argv)
 
@@ -392,7 +402,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
     cfg = mfst.launchers[args.launcher_id]
-    return run_launcher(cfg, args.launcher_id, slurm_job_id=args.slurm_job_id, dry_run=args.dry_run)
+    return run_launcher(
+        cfg, args.launcher_id,
+        slurm_job_id=args.slurm_job_id,
+        dry_run=args.dry_run,
+        preflight_only=args.preflight_only,
+    )
 
 
 if __name__ == "__main__":
