@@ -205,6 +205,29 @@ class RobotWorkspace(BaseWorkspace):
         except Exception as _e:
             print(f"[hydra-dump] skipped: {_e}")
 
+        # Plan v2 C2 S4: per-run UUID prevents cross-run ckpt clobber.
+        # New run  → generate uuid4 hex[:12], write to checkpoints/<zarr_stem>/run_uuid.txt.
+        # Resume   → read the persisted uuid so ckpts land in the same per-run dir.
+        # Fallback → if anything goes wrong, run_uuid=None and old zarr_stem paths are used.
+        import uuid as _uuid_mod
+        try:
+            _s4_zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem
+            _s4_uuid_file = pathlib.Path('checkpoints') / _s4_zarr_stem / 'run_uuid.txt'
+            _is_resume = bool(getattr(cfg.training, 'resume', False)) or bool(
+                cfg.training.get('load_ckpt', None) if hasattr(cfg.training, 'get') else None
+            )
+            if _is_resume and _s4_uuid_file.is_file():
+                run_uuid = _s4_uuid_file.read_text().strip()
+                print(f"[run-uuid] resuming with uuid={run_uuid}", flush=True)
+            else:
+                run_uuid = _uuid_mod.uuid4().hex[:12]
+                _s4_uuid_file.parent.mkdir(parents=True, exist_ok=True)
+                _s4_uuid_file.write_text(run_uuid)
+                print(f"[run-uuid] new run uuid={run_uuid}", flush=True)
+        except Exception as _s4_e:
+            run_uuid = None
+            print(f"[run-uuid] uuid setup failed: {_s4_e}; using zarr_stem paths", flush=True)
+
         # resume training
         explicit_load = cfg.training.get('load_ckpt', None) if hasattr(cfg.training, 'get') else None
         if explicit_load:
@@ -220,18 +243,35 @@ class RobotWorkspace(BaseWorkspace):
                 self.load_checkpoint(path=lastest_ckpt_path)
             else:
                 zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem
-                fallback_dir = pathlib.Path('checkpoints') / zarr_stem
-                if fallback_dir.is_dir():
-                    numeric_ckpts = []
-                    for p in fallback_dir.glob('*.ckpt'):
-                        try:
-                            numeric_ckpts.append((int(p.stem), p))
-                        except ValueError:
-                            continue
-                    if numeric_ckpts:
-                        _, latest_num_ckpt = max(numeric_ckpts, key=lambda x: x[0])
-                        print(f"Resuming from fallback checkpoint {latest_num_ckpt}")
-                        self.load_checkpoint(path=latest_num_ckpt)
+                # S4: check uuid-keyed dir first, then fall back to legacy zarr_stem dir.
+                _resumed_from_uuid = False
+                if run_uuid:
+                    _uuid_ckpt_dir = pathlib.Path('checkpoints') / run_uuid
+                    if _uuid_ckpt_dir.is_dir():
+                        _uuid_ckpts = []
+                        for p in _uuid_ckpt_dir.glob('*.ckpt'):
+                            try:
+                                _uuid_ckpts.append((int(p.stem), p))
+                            except ValueError:
+                                continue
+                        if _uuid_ckpts:
+                            _, _latest_uuid_ckpt = max(_uuid_ckpts, key=lambda x: x[0])
+                            print(f"Resuming from uuid-keyed checkpoint {_latest_uuid_ckpt}")
+                            self.load_checkpoint(path=_latest_uuid_ckpt)
+                            _resumed_from_uuid = True
+                if not _resumed_from_uuid:
+                    fallback_dir = pathlib.Path('checkpoints') / zarr_stem
+                    if fallback_dir.is_dir():
+                        numeric_ckpts = []
+                        for p in fallback_dir.glob('*.ckpt'):
+                            try:
+                                numeric_ckpts.append((int(p.stem), p))
+                            except ValueError:
+                                continue
+                        if numeric_ckpts:
+                            _, latest_num_ckpt = max(numeric_ckpts, key=lambda x: x[0])
+                            print(f"Resuming from fallback checkpoint {latest_num_ckpt}")
+                            self.load_checkpoint(path=latest_num_ckpt)
 
         # configure dataset
         dataset: BaseImageDataset
@@ -520,7 +560,8 @@ class RobotWorkspace(BaseWorkspace):
                 if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
                     # checkpointing
                     save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                    self.save_checkpoint(f'checkpoints/{save_name}/{self.epoch + 1}.ckpt') # TODO
+                    _s4_subdir = run_uuid if run_uuid else save_name
+                    self.save_checkpoint(f'checkpoints/{_s4_subdir}/{self.epoch + 1}.ckpt')
                 
                 # ========= eval end for this epoch ==========
                 policy.train()
@@ -590,11 +631,12 @@ class RobotWorkspace(BaseWorkspace):
         if _capture_flag:
             try:
                 save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                ckpt_path = pathlib.Path('checkpoints') / save_name / f'{self.epoch}.ckpt'
+                _s4_subdir = run_uuid if run_uuid else save_name
+                ckpt_path = pathlib.Path('checkpoints') / _s4_subdir / f'{self.epoch}.ckpt'
                 if not ckpt_path.is_file():
                     # checkpoint_every may not align with num_epochs — fall back to the
                     # most recent numeric ckpt under the same dir.
-                    parent = ckpt_path.parent
+                    parent = pathlib.Path('checkpoints') / _s4_subdir
                     if parent.is_dir():
                         cands = []
                         for p in parent.glob('*.ckpt'):
