@@ -11,6 +11,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 from robofactory.utils import manifest
 
@@ -398,6 +399,124 @@ class TestEvalSrFromJsonl(unittest.TestCase):
         sr, n = manifest._eval_sr_from_jsonl({"jsonl_path": path})
         self.assertIsNone(sr)
         self.assertIsNone(n)
+
+
+class TestCkptFormatMarker(unittest.TestCase):
+    """Phase D6 — manifest reads ``ckpt_format.json`` marker for Pi0.5 step dirs."""
+
+    def test_no_marker_means_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            step_dir = Path(td) / "10000"
+            step_dir.mkdir()
+            self.assertEqual(manifest._read_ckpt_format_marker(step_dir), "full")
+
+    def test_marker_lora_only_is_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            step_dir = Path(td) / "10000"
+            step_dir.mkdir()
+            (step_dir / manifest._MARKER_FILENAME).write_text(
+                '{"format": "lora_only", "base_weight_loader": "gs://x"}'
+            )
+            self.assertEqual(manifest._read_ckpt_format_marker(step_dir), "lora_only")
+
+    def test_marker_full_is_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            step_dir = Path(td) / "10000"
+            step_dir.mkdir()
+            (step_dir / manifest._MARKER_FILENAME).write_text(
+                '{"format": "full"}'
+            )
+            self.assertEqual(manifest._read_ckpt_format_marker(step_dir), "full")
+
+    def test_corrupted_json_falls_back_to_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            step_dir = Path(td) / "10000"
+            step_dir.mkdir()
+            (step_dir / manifest._MARKER_FILENAME).write_text("not valid json {")
+            # Manifest generation must never abort on one bad marker.
+            self.assertEqual(manifest._read_ckpt_format_marker(step_dir), "unknown")
+
+    def test_unrecognized_format_value_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            step_dir = Path(td) / "10000"
+            step_dir.mkdir()
+            (step_dir / manifest._MARKER_FILENAME).write_text(
+                '{"format": "bogus_value"}'
+            )
+            self.assertEqual(manifest._read_ckpt_format_marker(step_dir), "unknown")
+
+
+class TestPi05WalkerPopulatesCkptFormat(unittest.TestCase):
+    """Phase D6 — ``walk_pi05_checkpoints`` populates ``ckpt_format`` on each row."""
+
+    def _make_exp(self, td: str, *, marker_format: Optional[str] = None) -> Path:
+        root = Path(td)
+        cfg = root / "pi05_robofactory_pm_lora_finetune"
+        exp = cfg / "pi05_pm_d1_v1"
+        exp.mkdir(parents=True)
+        step_dir = exp / "19999"
+        step_dir.mkdir()
+        if marker_format is not None:
+            (step_dir / manifest._MARKER_FILENAME).write_text(
+                f'{{"format": "{marker_format}", "base_weight_loader": "gs://x"}}'
+            )
+        return root
+
+    def test_full_default_when_no_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._make_exp(td)
+            recs = list(manifest.walk_pi05_checkpoints(root))
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0].ckpt_format, "full")
+
+    def test_lora_only_when_marker_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._make_exp(td, marker_format="lora_only")
+            recs = list(manifest.walk_pi05_checkpoints(root))
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0].ckpt_format, "lora_only")
+
+    def test_explicit_full_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._make_exp(td, marker_format="full")
+            recs = list(manifest.walk_pi05_checkpoints(root))
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0].ckpt_format, "full")
+
+    def test_marker_only_read_from_latest_step(self):
+        """Only the latest step's marker matters; intermediate-step markers
+        don't determine the row's reported format (one row per exp dir)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exp = root / "pi05_robofactory_pm_lora_finetune" / "pi05_pm_d1_v1"
+            exp.mkdir(parents=True)
+            # Intermediate step says "lora_only" but latest has no marker.
+            (exp / "10000").mkdir()
+            (exp / "10000" / manifest._MARKER_FILENAME).write_text(
+                '{"format": "lora_only", "base_weight_loader": "gs://x"}'
+            )
+            (exp / "19999").mkdir()  # no marker → default "full"
+            recs = list(manifest.walk_pi05_checkpoints(root))
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0].step, "19999")
+            self.assertEqual(recs[0].ckpt_format, "full")
+
+    def test_csv_round_trip_carries_format_through(self):
+        """Write a manifest row with ckpt_format set; read it back; confirm
+        the column is in the CSV header and the value is preserved."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "manifest.csv"
+            recs = [
+                manifest.RunRecord(
+                    run_id="row1", model="pi05", ckpt_format="lora_only",
+                    status="done",
+                ),
+            ]
+            manifest.write_manifest_csv(recs, out)
+            with out.open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertIn("ckpt_format", rows[0])
+            self.assertEqual(rows[0]["ckpt_format"], "lora_only")
 
 
 if __name__ == "__main__":

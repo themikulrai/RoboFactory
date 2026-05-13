@@ -4,10 +4,11 @@ Plan v2 C1#9. Re-derives the manifest from the filesystem (and optionally
 wandb) on every invocation. The manifest is the single grep-able index of
 every train/eval run we have on disk or in wandb.
 
-Schema (per plan v2 — 23 columns):
+Schema (per plan v2 — 24 columns; D6 added ``ckpt_format``):
     run_id, model, dataset, task, encoder, scheme, arm, phase, step, seed,
-    git_sha, slurm_id, status, category, wandb_url, ckpt_paths, eval_sr,
-    eval_n, scene_config, camera_mapping, parent_run_id, created_utc, notes
+    git_sha, slurm_id, status, category, wandb_url, ckpt_paths, ckpt_format,
+    eval_sr, eval_n, scene_config, camera_mapping, parent_run_id,
+    created_utc, notes
 
 CLI:
     python -m robofactory.utils.manifest [--output PATH] [--source SRC]
@@ -56,6 +57,7 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "category",
     "wandb_url",
     "ckpt_paths",
+    "ckpt_format",
     "eval_sr",
     "eval_n",
     "scene_config",
@@ -90,6 +92,7 @@ class RunRecord:
     category: str = "unknown"
     wandb_url: str = ""
     ckpt_paths: str = ""
+    ckpt_format: str = ""
     eval_sr: str = ""
     eval_n: str = ""
     scene_config: str = ""
@@ -221,6 +224,39 @@ def parse_legacy_dp_dirname(name: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# ckpt_format marker reader (Phase D6)
+# ---------------------------------------------------------------------------
+
+# Phase D writes a JSON sidecar at ``<step_dir>/ckpt_format.json`` declaring
+# whether the on-disk pytree is the full PaLiGemma backbone or only the
+# LoRA-trainable subset. We read it as plain JSON (no openpi import) so this
+# module stays usable from the RoboFactory env (Python 3.9) without dragging
+# in openpi's full dependency stack.
+_MARKER_FILENAME = "ckpt_format.json"
+
+
+def _read_ckpt_format_marker(step_dir: Path) -> str:
+    """Return the format string ('lora_only' / 'full') for a Pi0.5 step dir.
+
+    - No marker file → ``"full"`` (legacy / pre-Phase-D ckpts).
+    - Marker present and parseable with a recognized ``format`` value → that value.
+    - Marker present but unparseable or unrecognized → ``"unknown"``; the
+      manifest never aborts on a single bad marker.
+    """
+    marker_path = step_dir / _MARKER_FILENAME
+    if not marker_path.is_file():
+        return "full"
+    try:
+        payload = json.loads(marker_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "unknown"
+    fmt = payload.get("format")
+    if fmt in ("lora_only", "full"):
+        return fmt
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Filesystem walkers
 # ---------------------------------------------------------------------------
 
@@ -287,13 +323,16 @@ def walk_pi05_checkpoints(root: Path) -> Iterator[RunRecord]:
             # If the parser already produced a notes string, fold it into the
             # final notes below; otherwise use only the per-dir summary.
             parser_notes = fields.pop("notes", "")
-            latest_ckpt = str(exp_dir / str(steps[-1]))
+            latest_step_dir = exp_dir / str(steps[-1])
+            latest_ckpt = str(latest_step_dir)
+            ckpt_format = _read_ckpt_format_marker(latest_step_dir)
             rec = RunRecord(
                 run_id=f"legacy:pi05:{cfg_dir.name}/{exp_dir.name}",
                 model="pi05",
                 phase="train",
                 step=str(steps[-1]),
                 ckpt_paths=latest_ckpt,
+                ckpt_format=ckpt_format,
                 status="done",
                 wandb_url=(
                     f"https://wandb.ai/mikulrai-stanford-university/openpi-robofactory/runs/{wandb_id}"
@@ -600,11 +639,21 @@ def _ckpt_entry_to_record(entry) -> RunRecord:
         except (OverflowError, OSError, ValueError):
             created = ""
 
+    # Read the lora_only/full format marker for Pi0.5 step dirs. DP ckpts are
+    # files (e.g. ``300.ckpt``), not dirs; their format stays blank.
+    ckpt_format = ""
+    if framework == "pi05" and path_str:
+        try:
+            ckpt_format = _read_ckpt_format_marker(Path(path_str))
+        except OSError:
+            ckpt_format = ""
+
     return RunRecord(
         run_id=f"legacy:{framework}:{identifier}",
         phase="train",
         step=str(epoch),
         ckpt_paths=path_str,
+        ckpt_format=ckpt_format,
         status="done",
         created_utc=created,
         notes=("ckpt_index entry" + (f"; {parser_notes}" if parser_notes else "")),
@@ -734,9 +783,11 @@ def _merge_records(
 def _combine(wandb_rec: RunRecord, ckpt_rec: RunRecord) -> RunRecord:
     """Field-wise merge: prefer wandb for metadata, ckpt for paths."""
     out = dataclasses.replace(wandb_rec)
-    # ckpt_paths and step come from ckpt side
+    # ckpt_paths, ckpt_format, and step come from ckpt side
     if ckpt_rec.ckpt_paths and not out.ckpt_paths:
         out.ckpt_paths = ckpt_rec.ckpt_paths
+    if ckpt_rec.ckpt_format and not out.ckpt_format:
+        out.ckpt_format = ckpt_rec.ckpt_format
     if ckpt_rec.step and not out.step:
         out.step = ckpt_rec.step
     # fill structural fields the wandb parser missed
