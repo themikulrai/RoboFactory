@@ -176,7 +176,7 @@ def main(args: Args):
 
     with WandbRun(
         enabled=args.wandb,
-        project='diffusion-robofactory',
+        project=os.environ.get('WANDB_PROJECT', 'diffusion-robofactory'),
         job_type='eval',
         name=f'eval_joint_{dataset_tag}_{ts}',
         group=f'eval_joint_{dataset_tag}',

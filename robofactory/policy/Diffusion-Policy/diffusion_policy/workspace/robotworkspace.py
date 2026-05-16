@@ -373,6 +373,14 @@ class RobotWorkspace(BaseWorkspace):
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
 
+        # optional torch.compile (LP wc 50demos run, 2026-05-13). EMA is not compiled —
+        # it's only used for inference snapshots, so compile gain is negligible there.
+        if bool(getattr(cfg.training, 'compile', False)):
+            compile_mode = str(getattr(cfg.training, 'compile_mode', 'default'))
+            print(f"[torch.compile] wrapping self.model.compute_loss mode={compile_mode}; "
+                  f"first batch will be slow.", flush=True)
+            self.model.compute_loss = torch.compile(self.model.compute_loss, mode=compile_mode)
+
         # save batch for sampling
         train_sampling_batch = None
 

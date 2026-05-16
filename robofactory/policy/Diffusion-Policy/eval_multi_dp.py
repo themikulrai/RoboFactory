@@ -122,11 +122,23 @@ class Args:
     img_width: int = 224
     """Width to resize camera frames before feeding to the policy. Dataset 1 (default_task.yaml) uses 320; Dataset 2 (wristcam) uses 224."""
 
-    video_max: int = 3
-    """Number of seeds to record video for (first N). Default capped at 3 to keep disk under control."""
+    video_max: int = 15
+    """Number of seeds to record video for (first N). Default capped at 15 to keep disk under control."""
 
     video_all: bool = False
     """If true, record video for every seed (overrides --video-max)."""
+
+    gripper_snap: bool = False
+    """Diagnostic: snap predicted gripper command (dim 7) to sign() so DP's MSE-averaged soft values become hard {-1, +1}. Tests whether mode-averaging on the near-binary gripper signal is the eval-failure root cause."""
+
+    gripper_source: str = "action"
+    """Where the proprio (agent_pos) channel comes from at eval. 'action' (legacy): dim 7 is the DP's commanded gripper in {-1, +1} (matches state=action zarrs). 'qpos': dim 7 is the env's observed finger-left width in meters (matches state=qpos zarrs from parse_h5_to_zarr_unified.py --state-source qpos). MUST match the zarr the ckpt was trained on."""
+
+    max_chunk_actions: int = 6
+    """How many of the DP-predicted actions to execute per chunk before re-observing (default 6 matches paper n_action_steps). Set to 1 to force re-observe after each predicted action — tests H4 (TOPP-amplified train/eval temporal mismatch)."""
+
+    skip_collapse_probe: bool = False
+    """Skip the S1 encoder-collapse probe between env.make and the first per-seed env.reset. Use when the probe interferes with downstream env state (observed for WC-trained ckpts on orion: probe predict_action with shape-mismatched obs corrupts PhysX init)."""
 
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
@@ -238,8 +250,12 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
         pass
     # Seed planner state
     for id in range(agent_num):
-        initial_qpos = raw_obs['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
-        initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
+        if args.gripper_source == "qpos":
+            qpos_full = raw_obs['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0).cpu().numpy()
+            initial_qpos = qpos_full[:8].astype(np.float32, copy=False)
+        else:
+            initial_qpos = raw_obs['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+            initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
         obs_dict = get_model_input(raw_obs, initial_qpos, id, include_global=args.include_global, cam_family=args.obs_cam_family, img_h=args.img_height, img_w=args.img_width)
         dp_models[id].update_obs(obs_dict)
 
@@ -260,7 +276,10 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
             t0 = _t.perf_counter()
             action_list = dp_models[id].get_action()
             infer_times_ms[id].append((_t.perf_counter() - t0) * 1000.0)
-            for i in range(6):
+            if args.gripper_snap:
+                _g = action_list[:, -1]
+                action_list[:, -1] = np.where(_g >= 0, 1.0, -1.0)
+            for i in range(args.max_chunk_actions):
                 now_action = action_list[i]
                 raw_obs = env.get_obs()
                 if i == 0:
@@ -286,7 +305,7 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
                     action_dict[f'{action_prefix}-{id}'].append(true_action)
 
         start_idx = [0 for _ in range(agent_num)]
-        for i in range(6):
+        for i in range(args.max_chunk_actions):
             max_step = 0
             for id in range(agent_num):
                 max_step = max(max_step, action_step_dict[f'{action_prefix}-{id}'][i])
@@ -311,7 +330,12 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
                 start_idx[id] += action_step_dict[f'{action_prefix}-{id}'][i]
                 if action_step_dict[f'{action_prefix}-{id}'][i] == 0:
                     continue
-                obs_dict = get_model_input(observation, true_action[f'{action_prefix}-{id}'], id, include_global=args.include_global, cam_family=args.obs_cam_family, img_h=args.img_height, img_w=args.img_width)
+                if args.gripper_source == "qpos":
+                    qpos_full = observation['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0).cpu().numpy()
+                    agent_pos = qpos_full[:8].astype(np.float32, copy=False)
+                else:
+                    agent_pos = true_action[f'{action_prefix}-{id}']
+                obs_dict = get_model_input(observation, agent_pos, id, include_global=args.include_global, cam_family=args.obs_cam_family, img_h=args.img_height, img_w=args.img_width)
                 dp_models[id].update_obs(obs_dict)
         if verbose:
             print("info", info)
@@ -396,9 +420,13 @@ def main(args: Args):
 
     # Load decentralised DP policies once (reused across all seeds)
     agent_num = planner.agent_num
+    print(f"[eval_multi_dp] agent_num={agent_num}, loading DP policies...", flush=True)
     dp_models = []
     for i in range(agent_num):
+        import time as _t_load
+        _ts = _t_load.perf_counter()
         dp_models.append(DP(env_id, args.checkpoint_num, args.data_num, id=i, ckpt_suffix=args.ckpt_suffix))
+        print(f"[eval_multi_dp] loaded DP agent {i} in {_t_load.perf_counter()-_ts:.1f}s", flush=True)
     print(f"Loaded {agent_num} decentralised DP policies. VRAM now: {torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
 
     # agent_prefix: used for obs dict keys (e.g. raw_obs['agent']['panda_wristcam_multi-0'])
@@ -422,6 +450,7 @@ def main(args: Args):
         task=env_id, scene_config=args.config,
         data_num=args.data_num, checkpoint_num=args.checkpoint_num,
         ckpt_suffix=args.ckpt_suffix,
+        gripper_source=args.gripper_source,
         ckpt_paths=[m.ckpt_path for m in dp_models],
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
@@ -447,21 +476,24 @@ def main(args: Args):
     ) as videos:
         # S1 collapse probe (metric-only; never blocks eval). Probe each
         # per-arm policy under namespaces collapse/arm{i}/*.
-        try:
-            import warnings as _warnings
-            from robofactory.utils.preflight_collapse import probe_collapse_with_loaded_policy
-            _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
-            for _i, _dpm in enumerate(dp_models):
-                _rep = probe_collapse_with_loaded_policy(_dpm.policy, _calib)
-                wandb_run.log_raw(_rep.to_wandb_payload(prefix=f'collapse/arm{_i}'))
-                _r = _rep.image_to_baseline_ratio
-                if _r < 1.5:
-                    _warnings.warn(f"[collapse arm{_i}] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
-                print(f"[collapse-probe arm{_i}] {_rep.summary()}", flush=True)
-        except Exception as _e:
-            import traceback as _tb
-            print(f"[collapse-probe] skipped: {type(_e).__name__}: {_e!r}", file=sys.stderr)
-            _tb.print_exc(file=sys.stderr)
+        if args.skip_collapse_probe:
+            print("[collapse-probe] disabled via --skip-collapse-probe", flush=True)
+        else:
+            try:
+                import warnings as _warnings
+                from robofactory.utils.preflight_collapse import probe_collapse_with_loaded_policy
+                _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
+                for _i, _dpm in enumerate(dp_models):
+                    _rep = probe_collapse_with_loaded_policy(_dpm.policy, _calib)
+                    wandb_run.log_raw(_rep.to_wandb_payload(prefix=f'collapse/arm{_i}'))
+                    _r = _rep.image_to_baseline_ratio
+                    if _r < 1.5:
+                        _warnings.warn(f"[collapse arm{_i}] mse_zero_image/baseline = {_r:.2f} < 1.5 - image input may be ignored")
+                    print(f"[collapse-probe arm{_i}] {_rep.summary()}", flush=True)
+            except Exception as _e:
+                import traceback as _tb
+                print(f"[collapse-probe] skipped: {type(_e).__name__}: {_e!r}", file=sys.stderr)
+                _tb.print_exc(file=sys.stderr)
         # Seed loop (reuses env + policies)
         results = []
         for idx, seed in enumerate(seeds):

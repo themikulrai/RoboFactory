@@ -126,6 +126,8 @@ training:
   # misc
   tqdm_interval_sec: 1.0
   use_bf16: True
+  compile: False
+  compile_mode: default
   # Workflow #4: auto-drop runs/calibration/<wandb_id>.npz after the final
   # epoch save. Default ON for canonical configs; flip to False for ablation
   # / debug runs whose ckpts you don't want polluting the calibration set.
