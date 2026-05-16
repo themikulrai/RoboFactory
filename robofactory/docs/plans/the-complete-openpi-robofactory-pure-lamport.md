@@ -812,6 +812,248 @@ S0 → S1 ordering matters; everything else can land in parallel commits.
 
 ---
 
+## Phase D — LoRA-only checkpoint storage (2026-05-12, locked)
+
+### Context
+
+Every Pi0.5 LoRA finetune checkpoint on disk is **8.9 GB**: the full PaLiGemma backbone (~3 B params × bf16) serialised at every save, even though training only updates the LoRA A/B matrices (~80–100 MB worth of params). Total `/iris/u/mikulrai/checkpoints/openpi/` = **708 GB**, of which an estimated **~680 GB** is duplicated base weights across N saved steps × M runs. With LoRA-only saves, each ckpt drops to **~80 MB**: a **~90× reduction**, freeing ~600 GB on `/iris`.
+
+**Why this works in openpi**: the architectural pieces all already exist.
+- `config.trainable_filter` is an `nnx.filterlib.Filter` matching only LoRA A/B params (`nnx.All(nnx.Param, nnx.Not(freeze_filter))`, with `freeze_filter = nnx.All(PathRegex(".*llm.*"), nnx.Not(PathRegex(".*lora.*")))`). Calling `params.filter(trainable_filter)` returns a **pure pytree of just the LoRA params** (not a masked full-shape tree).
+- `_load_weights_and_validate(config.weight_loader, params_shape)` in `scripts/train.py:171` already exists to fetch the **base** PaLiGemma from `gs://openpi-assets/checkpoints/pi05_base/params` and produce a full-shape pytree.
+- `init_train_state()` already supports a `partial_params` overlay via `state.replace_by_pure_dict(partial_params)` at `train.py:148` — designed exactly for "init from base, overlay something on top."
+- `ema_decay` is `None` for every pi05 LoRA finetune config — `_split_params` saves `state.params` directly (no EMA shadow to also filter).
+
+**User decisions (2026-05-12)**:
+1. **Default-on for LoRA configs**: auto-detect via `config.trainable_filter` — if filtered shape < full shape, save LoRA-only. Full-finetune configs (no freeze_filter, trainable = everything) still save full. Zero config-file edits required.
+2. **Convert + delete existing originals** (with 14-day `.trash_*` safety window via the existing `scripts/cron/prune_trash.sh` reaper). Recovers ~600 GB; reversible for 14 days if a bug surfaces.
+3. **Embed `base_weight_loader` URL in checkpoint marker** — inference path is config-free; the ckpt knows where to fetch base from.
+
+### Surface area (audited)
+
+Two distinct checkpoint reader APIs need updating (because openpi has parallel codepaths):
+
+**Training-side** (`ocp.CheckpointManager`, in `src/openpi/training/checkpoints.py`):
+- `save_state` — needs filtering.
+- `restore_state` — needs base-load + overlay branch.
+- `restore_params_only` — same.
+
+**Inference-side** (`ocp.PyTreeCheckpointer` direct, in `src/openpi/models/model.py:287-333`):
+- `restore_params` is called by `policy_config.create_trained_policy:57` (the path used by `serve_policy.py`, both `eval_pi05.py`/`eval_decent_pi05.py`, all unit tests, and the `examples/convert_jax_model_to_pytorch.py` exporter).
+
+By making `restore_params` itself auto-detect the format marker and merge base+LoRA on the fly, **every inference call site works unchanged**. This is the key design simplification — no eval-script edits, no `--base-weights` CLI args.
+
+### Locked architectural decisions (devil's-advocate critique applied)
+
+1. **Format marker as JSON sidecar, not as a baked-in pytree field**. File `ckpt_format.json` next to the orbax `params/` dir. Missing marker → assume `format=full` (legacy compat, no migration needed for existing ckpts on the read side).
+2. **Marker schema embeds the `weight_loader` URL**, the trainable_filter signature (string repr — for debugging mismatches), and `openpi_git_sha` (catches LoRA-layout drift across openpi versions).
+3. **Filter detection is automatic, not a config flag**: if `params.filter(trainable_filter).leaves() < params.leaves()` (strict subset → it's a real freeze config) → save LoRA-only. Full-finetune configs naturally fall through to full save.
+4. **Restore-side merge order**: load base into the shape-only state via `weight_loader` first, then orbax-restore the LoRA subset on top via `state.replace_by_pure_dict(lora_dict)`. This re-uses the existing `init_train_state(partial_params=...)` pattern verbatim.
+5. **Sharding + dtype**: base load uses the same `sharding` and `dtype` as the orbax restore call. PaLiGemma base is already `bfloat16` in GCS; no upcast.
+6. **Conversion script verifies before destroying**: per-leaf `jnp.allclose(merged_lora_params, original_full_params, atol=1e-3)` (bf16 tolerance) must pass on every leaf before the original ckpt is moved to `.trash_*`. Verification failure aborts the conversion for that dir; original untouched.
+7. **`pi05_libero_spatial_lora_*` excluded from conversion by default** (publication artifacts per `project_pi05_libero_public` memory). `--include-libero` opt-in flag if user wants to recover that space too.
+8. **No backward break**: a checkpoint saved before this work (no marker, full pytree) continues to load correctly through both training-resume and inference paths.
+
+### Stage breakdown
+
+#### D0 — Format-marker module (foundation; low risk)
+
+Create `src/openpi/training/ckpt_format.py`:
+
+```python
+@dataclass
+class CkptFormat:
+    format: Literal["lora_only", "full"]
+    base_weight_loader: str | None = None  # only meaningful for lora_only
+    trainable_filter_repr: str | None = None
+    openpi_git_sha: str | None = None
+    created_utc: str | None = None
+
+def write_marker(step_dir: epath.Path, fmt: CkptFormat) -> None: ...
+def read_marker(step_dir: epath.Path) -> CkptFormat:  # missing → CkptFormat(format="full")
+    ...
+```
+
+Unit test (`tests/test_ckpt_format.py`): round-trip read/write, missing-marker default, malformed-marker raises `MalformedCkptMarkerError`.
+
+#### D1 — Save side: filter params in `save_state`
+
+Modify `src/openpi/training/checkpoints.py:81-102`:
+- New signature: `save_state(..., trainable_filter: nnx.filterlib.Filter | None = None, base_weight_loader_repr: str | None = None)`.
+- `train.py:684` call site passes `config.trainable_filter` + `repr(config.weight_loader)`.
+- Inside `save_state`:
+  ```python
+  if trainable_filter is not None:
+      full_params = params
+      filtered_params = nnx_utils.state_filter(params, trainable_filter)
+      if _is_strict_subset(filtered_params, full_params):
+          params = filtered_params
+          fmt = CkptFormat(format="lora_only", base_weight_loader=base_weight_loader_repr, ...)
+      else:
+          fmt = CkptFormat(format="full", ...)
+  else:
+      fmt = CkptFormat(format="full")
+  # ... existing save ...
+  ckpt_format.write_marker(checkpoint_manager.directory / str(step), fmt)
+  ```
+- Unit test: save with `trainable_filter` that filters everything → format=lora_only and disk size ~80 MB; save with no filter → format=full, disk size ~9 GB; save with a no-op filter → still format=full (strict-subset check).
+
+#### D2 — Restore side, training path
+
+Modify `restore_state` and `restore_params_only`:
+- Read marker from `checkpoint_manager.directory / str(step)`.
+- If `format=full`: existing code path unchanged.
+- If `format=lora_only`:
+  ```python
+  loader = weight_loaders.CheckpointWeightLoader(marker.base_weight_loader)
+  base_params = loader.load(params_shape.to_pure_dict())  # full pytree
+  base_params_filtered = _filter_out_shape_dtype_structs(base_params)
+  state = state.replace_by_pure_dict_overlay(base_params_filtered)  # base in
+  # Now orbax restore the LoRA subset on top of `state.params`
+  restored_lora = checkpoint_manager.restore(step, items={"params": {"params": lora_shape}})
+  return _merge_lora_into_state(state, restored_lora["params"]["params"])
+  ```
+- Important: `train.py:571` already wraps `restore_state` in a try/except that falls back to `restore_params_only` on `OptStateMismatchError`. Both branches must handle lora_only correctly.
+- Smoke test: train 100 steps with LoRA-only save → SIGKILL → resume → wandb run continues, loss curve smooth, step counter resumes correctly.
+
+#### D3 — Restore side, inference path
+
+Modify `src/openpi/models/model.py:restore_params`:
+- Read marker from `params_path.parent / "ckpt_format.json"` (params is a subdir of step dir).
+- If `format=full`: existing PyTreeCheckpointer restore unchanged.
+- If `format=lora_only`:
+  - Fetch base via `weight_loaders.CheckpointWeightLoader(marker.base_weight_loader).load(...)`.
+  - Restore LoRA subset via `PyTreeCheckpointer().restore()`.
+  - Merge: shallow dict overlay (LoRA keys overwrite base keys of the same path).
+  - Return merged pytree in requested `dtype` + `sharding`.
+- **Critical**: must NOT change the public signature — every existing call site stays unchanged.
+- Smoke test (the gold-standard end-to-end): load `pi05_pm_d1_v1` ckpt via `create_trained_policy` (after conversion), run 10 PM eval seeds, compare predicted action chunks per-step to a baseline recorded BEFORE conversion. L∞ deviation < 1e-3 (bf16 tolerance).
+
+#### D4 — One-shot conversion script
+
+New file `scripts/cleanup/convert_to_lora_only.py`:
+
+Algorithm per step-dir:
+1. Skip if marker already says `lora_only`.
+2. Skip if user's exclude pattern matches (default: `pi05_libero_spatial_lora_*`).
+3. Identify the corresponding `TrainConfig` by parsing the parent dir's `<config_name>/<exp_name>` and looking up the registered TrainConfig. If config lookup fails (orphaned ckpt), skip with WARN.
+4. Load `full_params` via existing `restore_params(step_dir / "params", dtype=jnp.bfloat16)`.
+5. Compute `lora_params = nnx_utils.state_filter(full_params, config.trainable_filter)`. Assert non-trivial (strict subset).
+6. Load `base_params` via `config.weight_loader.load(full_params_shape)`.
+7. Compute `expected_merged = base_params overlaid with lora_params`. Assert `jax.tree.map(jnp.allclose, expected_merged, full_params)` is True (within bf16 tolerance 1e-3) on every leaf. **Verification gate.**
+8. Write `lora_params` + marker to `<step_dir>.new/`.
+9. Atomic-ish swap: `mv <step_dir> <step_dir>.trash_<unix_ts>_<pid>`; `mv <step_dir>.new <step_dir>`.
+10. Log: original size, new size, savings, verification report (per-leaf L∞).
+
+Modes:
+- `--dry-run` (DEFAULT): no writes. Prints a table of every step_dir, its predicted savings, and the predicted verification PASS/FAIL.
+- `--execute`: requires `--dry-run` to have been run first (gated by user re-confirming totals).
+- `--include-libero`: opt-in to also convert the LIBERO ablation ckpts.
+- `--root <path>`: override scan root (default `/iris/u/mikulrai/checkpoints/openpi`).
+
+Disk overhead during conversion: peak ≈ `2 × ckpt_size = ~18 GB` per ckpt (full original on disk + new dir being written). Sequential per-dir so total peak overhead stays bounded.
+
+Run in tmux/screen (CLAUDE.md rule). Estimated wall time: ~10–20 min total across ~80 step dirs.
+
+#### D5 — Test suite
+
+New file `tests/test_lora_only_ckpt.py`:
+1. **Roundtrip CheckpointManager**: synthesize tiny LoRA model → train 5 steps → save with LoRA-only → restore → compare params per-leaf < 1e-6 L∞.
+2. **Roundtrip inference path**: same model → save via training path → load via `restore_params` → compare.
+3. **Format detection**: ckpt with marker → correctly identified; ckpt without marker → assume full.
+4. **Backward compat**: synthesize a "legacy full" ckpt (no marker, full pytree) → both restore paths load correctly.
+5. **Adversarial**: marker says `lora_only` but params dir has full pytree shape → raise `CkptFormatMismatchError`; vice-versa.
+6. **Adversarial**: marker says `lora_only` but `base_weight_loader` URL is unreachable → raise with clear "base weights inaccessible" error.
+
+End-to-end smoke (run on iris, NOT in CI):
+- `scripts/smoke/lora_only_e2e.sh`: train pi05 PM workspace LoRA for 1000 steps → assert ckpt size < 200 MB → resume from step 500 → assert step counter and loss continuity → load via `eval_pi05.py` → assert smoke-eval succeeds.
+
+#### D6 — Disk verification and manifest update
+
+Post-conversion:
+- `du -sh /iris/u/mikulrai/checkpoints/openpi/` drops from 708 GB to ~60–100 GB (depends on retained step count per run). The `.trash_*` dirs add back ~600 GB temporarily, reaped automatically after 14 days by `scripts/cron/prune_trash.sh`.
+- Add `ckpt_format` column to `runs/manifest.csv` (already populated by `make manifest`'s wandb cascade — extend to also read the format marker for ckpt paths it discovers).
+
+### Stage dependencies
+
+```
+D0 (format marker) ──┬─→ D1 (save filter)  ──┬─→ D5 (test suite)  ──→ D6 (disk verif)
+                     │                       │
+                     ├─→ D2 (train restore) ─┤
+                     │                       │
+                     ├─→ D3 (infer restore) ─┤
+                     │                       │
+                     └─→ D4 (conversion) ────┘
+```
+
+D0 is the only hard prerequisite. D1–D4 can land as separate commits in any order once D0 is in. D5 validates the union. D6 is the post-deploy disk check.
+
+### Files to create / modify
+
+**Create**:
+- `src/openpi/training/ckpt_format.py` — marker schema + read/write helpers.
+- `scripts/cleanup/convert_to_lora_only.py` — one-shot conversion with dry-run + verification gate.
+- `scripts/smoke/lora_only_e2e.sh` — end-to-end smoke launcher.
+- `tests/test_ckpt_format.py`, `tests/test_lora_only_ckpt.py`.
+
+**Modify**:
+- `src/openpi/training/checkpoints.py` — `save_state` (filter), `restore_state` (base+overlay branch), `restore_params_only` (same).
+- `src/openpi/models/model.py` — `restore_params` (auto base+LoRA merge on `format=lora_only`).
+- `scripts/train.py:684` — pass `config.trainable_filter` + `weight_loader.params_path` into `save_state`.
+- `utils/manifest.py` — add `ckpt_format` column derived from marker.
+
+### Estimated effort
+
+| Stage | LOC | Hours |
+|---|---|---|
+| D0 — marker module + test | ~80 | 1 |
+| D1 — save filter + test | ~40 | 1 |
+| D2 — train restore branch + smoke | ~80 | 2 |
+| D3 — infer restore branch + smoke (HIGH risk) | ~80 | 2.5 |
+| D4 — conversion script + verification gate | ~250 | 3 |
+| D5 — test suite | ~150 | 2 |
+| D6 — disk + manifest verification | ~30 | 0.5 |
+| **Total** | **~710 LOC** | **~12 h** |
+
+Two focused sessions over 2 days, by my estimate.
+
+### Risk register
+
+| Stage | Risk | Mitigation |
+|---|---|---|
+| D3 | A bug in `restore_params` silently breaks every eval script (the path used by `serve_policy.py`, `eval_pi05.py`, `eval_decent_pi05.py`). | (a) Default `format=full` (missing marker) — legacy ckpts unaffected. (b) D5 inference-path roundtrip test mandatory before D4 runs. (c) PM 88.3% reproduction is the binary go/no-go before any conversion. |
+| D4 | Conversion bug destroys original ckpts incorrectly. | Per-leaf verification gate (`jnp.allclose` against original) must pass before `.trash_*` rename. Verification failure → abort that dir, original untouched. 14-day trash recovery window via the existing reaper. |
+| D2 | Resume flow change might break orion preempt-requeue (jobs restart from scratch + resume from ckpt). | Smoke test specifically covers SIGKILL → relaunch → wandb continuity. Resume now takes ~30 s longer (one extra GCS load), well within orion's 15-min startup budget. |
+| D0, D1, D5, D6 | Low risk. | — |
+
+### Verification (end-to-end binary go/no-go)
+
+1. `pytest tests/test_lora_only_ckpt.py tests/test_ckpt_format.py` — all green.
+2. **PM 88.3% reproduction binary gate**: convert `pi05_robofactory_pm_lora_finetune/pi05_pm_d1_v1/19999` (the canary), reload via `eval_pi05.py`, run 60 PM seeds on workspace TABLE scene. SR ∈ [86 %, 90 %] (within seed noise of 88.3 % baseline). **If FAIL, abort all further conversions; restore from `.trash_*`.**
+3. Smoke train: launch pi05 PM workspace LoRA for 1 k steps → ckpt size < 200 MB → resume from step 500 → wandb run shows step continuity, no spurious loss spike, `resumed_count` increments per `run_meta.yaml`.
+4. Inference smoke: load the new tiny ckpt → 10-seed eval → SR within noise of the full-format baseline.
+5. After all conversions: `du -sh /iris/u/mikulrai/checkpoints/openpi/` shows the expected drop. `find /iris/u/mikulrai/checkpoints/openpi -name "ckpt_format.json" | wc -l` matches the count of step dirs converted.
+6. After 14 days: `du -sh /iris/u/mikulrai/checkpoints/openpi` shows the final post-trash-reaper number.
+7. Manifest sanity: `grep ckpt_format /iris/u/mikulrai/runs/manifest.csv | grep -v lora_only | wc -l` returns only the rows for legacy/non-LoRA configs.
+
+### Critical files (during execution)
+
+- `/iris/u/mikulrai/projects/openpi/src/openpi/training/checkpoints.py` (lines 81–160 are the meat).
+- `/iris/u/mikulrai/projects/openpi/src/openpi/models/model.py` (lines 287–333 — the inference path).
+- `/iris/u/mikulrai/projects/openpi/src/openpi/training/weight_loaders.py:50-54` (the `CheckpointWeightLoader` we re-use for base fetch).
+- `/iris/u/mikulrai/projects/openpi/scripts/train.py` (lines 131–180 for the `init_train_state` pattern we mirror; line 684 for the save call site).
+- `/iris/u/mikulrai/projects/openpi/src/openpi/policies/policy_config.py:57` (the inference entry point — confirm it still works untouched).
+- `/iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/cron/prune_trash.sh` (already reaps `.trash_*` after 14 days — leveraged by D4 conversion).
+
+### Out of scope (deferred)
+
+- Converting `pi05_libero_spatial_lora_*` to LoRA-only — publication artifacts, ask separately before touching (per `project_pi05_libero_public` memory).
+- Sherding/multi-host base-loads — single-host inference assumed; multi-host would need the base-load to respect the existing sharding spec (probably works via `restore_params`'s existing `sharding` arg but untested).
+- DP-side analog (saving only the diff against ImageNet-pretrained encoder) — DP doesn't have a clean "LoRA structure" so this doesn't transfer directly. Deferred.
+- Full-finetune Pi0.5 configs (none exist today in this repo) — would naturally fall through to `format=full` save anyway, no change needed.
+
+---
+
 ## Things deliberately out of scope
 
 - 2SC wristcam dataset / scripts / ckpts — confirmed by user.
