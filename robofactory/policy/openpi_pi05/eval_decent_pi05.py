@@ -106,8 +106,22 @@ def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, st
         "state": _build_state(obs, num_arms, robot_uid),
         "prompt": prompt,
     }
+    # Mirrors training-side RoboFactoryDecentInputs: slots whose mapping is None are
+    # zero-filled to match the masked input the model saw during fit. Required for
+    # 2-arm configs (extra_0_rgb_raw = null in two_robots_stack_cube_wristcam.json).
+    ref_shape: tuple[int, int, int] | None = None
     for slot in IMAGE_SLOTS:
-        out[slot] = _extract_image(obs, cam_map[slot])
+        cam_name = cam_map.get(slot)
+        if cam_name is not None:
+            img = _extract_image(obs, cam_name)
+            out[slot] = img
+            if ref_shape is None:
+                ref_shape = img.shape  # type: ignore[assignment]
+    if ref_shape is None:
+        ref_shape = (224, 224, 3)
+    for slot in IMAGE_SLOTS:
+        if slot not in out:
+            out[slot] = np.zeros(ref_shape, dtype=np.uint8)
     return out
 
 

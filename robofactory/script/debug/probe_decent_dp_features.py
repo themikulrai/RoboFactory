@@ -124,11 +124,15 @@ def probe_collapse_features(
         sensor_configs=dict(shader_pack='default'),
     )
     raw_obs, _ = env.reset(seed=seeds[0])
-    try:
-        agent_prefix = env.unwrapped.agent.agents[0].uid
-    except Exception:
-        agent_prefix = 'panda'
-    agent_num = len(env.unwrapped.agent.agents)
+    # Single-agent envs (PickMeat) expose env.unwrapped.agent as the Panda directly;
+    # multi-agent envs expose a MultiAgent wrapper with .agents list.
+    _agent = env.unwrapped.agent
+    if hasattr(_agent, 'agents'):
+        agent_prefix = _agent.agents[0].uid
+        agent_num = len(_agent.agents)
+    else:
+        agent_prefix = getattr(_agent, 'uid', 'panda')
+        agent_num = 1
     print(f"env_id={env_id} agent_prefix={agent_prefix} agent_num={agent_num}", flush=True)
 
     if ckpt_paths is None:
@@ -171,7 +175,12 @@ def probe_collapse_features(
                 cubes[si, ci] = p
 
         for aid in range(agent_num):
-            qpos = raw_obs['agent'][f'{agent_prefix}-{aid}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+            # Single-agent envs expose raw_obs['agent'] as flat {'qpos','qvel'};
+            # multi-agent envs nest per-arm under '{prefix}-{aid}'.
+            _ag = raw_obs['agent']
+            _key = f'{agent_prefix}-{aid}'
+            _qsrc = _ag[_key]['qpos'] if _key in _ag else _ag['qpos']
+            qpos = _qsrc.squeeze(0)[:-2].cpu().numpy()
             qpos_with_grip = np.append(qpos, OPEN)
             obs_d = get_model_input(
                 raw_obs, qpos_with_grip, aid,

@@ -72,6 +72,49 @@ def _action_key(tr, agent_id):
     return "actions"
 
 
+def _qpos_key(tr, agent_id):
+    """Resolve the qpos path for arm `agent_id`. Multi-agent uses the robot
+    UID prefix (e.g. obs/agent/panda_wristcam_multi-0/qpos); single-agent uses
+    obs/agent/{uid}/qpos with no suffix.
+
+    Returns the full path inside the traj group, or None if not present.
+    """
+    agent_grp = tr.get("obs/agent")
+    if agent_grp is None:
+        return None
+    # Multi-agent: keys look like 'panda_wristcam_multi-0', 'panda-0', etc.
+    multi = [k for k in agent_grp.keys() if k.endswith(f"-{agent_id}")]
+    if multi:
+        return f"obs/agent/{multi[0]}/qpos"
+    # Single-agent fallback
+    keys = list(agent_grp.keys())
+    if len(keys) == 1:
+        return f"obs/agent/{keys[0]}/qpos"
+    return None
+
+
+def _state_from_qpos(qpos: np.ndarray, T: int) -> np.ndarray:
+    """Project the H5 qpos (T+1, 9) [7 arm joints + 2 finger widths] to a
+    state vector of shape (T, 8) aligned with the action layout
+    [arm_joints(7), gripper_scalar(1)]:
+      state[t, :7] = qpos[t, :7]      (raw joint angles, radians)
+      state[t,  7] = qpos[t, 7]       (left-finger width in meters; the two
+                                       finger joints mimic each other on Panda)
+
+    NOTE on units: the action's dim 7 is a commanded gripper signal in
+    {-1, +1}; here `state[7]` is the physical finger width in [0.018, 0.040] m.
+    The two channels are no longer scale-matched, but this is the eval-time
+    reality (env returns finger widths via env.get_obs). The normalizer fits
+    each channel independently, so this is fine — and crucially it makes train
+    and eval inputs come from the SAME distribution.
+    """
+    if qpos.ndim != 2 or qpos.shape[1] < 8:
+        raise ValueError(f"qpos shape {qpos.shape} unsupported")
+    arm = qpos[:T, :7].astype(np.float32, copy=False)
+    grip = qpos[:T, 7:8].astype(np.float32, copy=False)
+    return np.concatenate([arm, grip], axis=1)
+
+
 def _camera_key(tr, family, agent_id):
     """Multi-agent: head_camera_agent{i}; single-agent: head_camera."""
     multi = CAM_KEY[family].format(i=agent_id)
@@ -137,7 +180,8 @@ def _create_zarr(out_path, schema, total_steps, resize):
     return root, data, meta
 
 
-def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resize, total_steps):
+def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resize, total_steps,
+                  state_source: str = "action"):
     tpl = CAM_KEY[cam_family]
     cursor = 0
     episode_ends = []
@@ -150,7 +194,17 @@ def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resi
         joint = np.concatenate(acts, axis=1)  # (T, 8N)
         sl = slice(cursor, cursor + T)
         data["action"][sl] = joint
-        data["state"][sl] = joint
+        if state_source == "qpos":
+            qstates = []
+            for i in range(n_agents):
+                qkey = _qpos_key(tr, i)
+                if qkey is None:
+                    raise ValueError(f"{tk}: cannot resolve qpos for arm {i}")
+                qp = np.asarray(tr[qkey], dtype=np.float32)
+                qstates.append(_state_from_qpos(qp, T))
+            data["state"][sl] = np.concatenate(qstates, axis=1)
+        else:
+            data["state"][sl] = joint
         for i in range(n_agents):
             rgb = np.asarray(tr[f"obs/sensor_data/{tpl.format(i=i)}/rgb"])
             if rgb.shape[0] < T:
@@ -167,7 +221,8 @@ def _stream_joint(f, traj_keys, data, n_agents, cam_family, include_global, resi
     return np.asarray(episode_ends, dtype=np.int64)
 
 
-def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, resize, total_steps):
+def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, resize, total_steps,
+                      state_source: str = "action"):
     cursor = 0
     episode_ends = []
     for ep_idx, tk in enumerate(traj_keys):
@@ -180,7 +235,14 @@ def _stream_per_agent(f, traj_keys, data, agent_id, cam_family, include_global, 
             raise ValueError(f"{tk}: cam {cam_key} {rgb.shape[0]} < T={T}")
         sl = slice(cursor, cursor + T)
         data["action"][sl] = act
-        data["state"][sl] = act
+        if state_source == "qpos":
+            qkey = _qpos_key(tr, agent_id)
+            if qkey is None:
+                raise ValueError(f"{tk}: cannot resolve qpos for arm {agent_id}")
+            qp = np.asarray(tr[qkey], dtype=np.float32)
+            data["state"][sl] = _state_from_qpos(qp, T)
+        else:
+            data["state"][sl] = act
         data["tcp_action"][sl] = act
         data["head_camera"][sl] = _resize_batch(rgb[:T], resize)
         if include_global:
@@ -210,6 +272,11 @@ def main():
     ap.add_argument("--resize-h", type=int, default=None)
     ap.add_argument("--resize-w", type=int, default=None)
     ap.add_argument("--load-num", type=int, default=150)
+    ap.add_argument("--state-source", choices=["action", "qpos"], default="action",
+                    help="What to write into data/state. 'action' (default, legacy) "
+                         "duplicates the action stream. 'qpos' reads obs/agent/.../qpos "
+                         "and projects to (T, 8*n_agents) — matches what env.get_obs() "
+                         "feeds the policy at eval, removing the train/eval proprio gap.")
     args = ap.parse_args()
 
     if args.mode == "joint" and args.n_agents is None:
@@ -242,11 +309,13 @@ def main():
         if args.mode == "joint":
             ep_ends = _stream_joint(
                 f, traj_keys, data, args.n_agents, args.camera_family,
-                args.include_global, resize, total_steps)
+                args.include_global, resize, total_steps,
+                state_source=args.state_source)
         else:
             ep_ends = _stream_per_agent(
                 f, traj_keys, data, args.agent_id, args.camera_family,
-                args.include_global, resize, total_steps)
+                args.include_global, resize, total_steps,
+                state_source=args.state_source)
 
     meta.create_dataset("episode_ends", data=ep_ends, dtype="int64",
                         chunks=(len(ep_ends),), compressor=COMPRESSOR, overwrite=True)
