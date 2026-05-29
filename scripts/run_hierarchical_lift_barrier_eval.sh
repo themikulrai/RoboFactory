@@ -52,6 +52,14 @@ LL_CKPT_ARM0=""
 LL_CKPT_ARM1=""
 LL_PORT0=8000
 LL_PORT1=8001
+# GPU pinning (indices into CUDA_VISIBLE_DEVICES of the SLURM allocation). All default to 0
+# so HL Qwen-4B + 2x pi0.5 + SAPIEN share one 48GB GPU (a40/l40s). The LL JAX servers run at
+# XLA mem-fraction 0.30 with prealloc off (mirrors the user's decent eval scripts) so two of
+# them coexist with the torch HL + SAPIEN. Override to spread across GPUs on multi-GPU jobs.
+HL_GPU=0
+LL_GPU0=0
+LL_GPU1=0
+LL_XLA_MEM_FRACTION=0.30
 N_EPISODES=20
 BASE_SEED=1000
 RESULTS_DIR="$RF_DIR/eval_results"
@@ -71,6 +79,10 @@ while [[ $# -gt 0 ]]; do
     --ll-ckpt-arm1) LL_CKPT_ARM1="$2"; shift 2;;
     --ll-port0) LL_PORT0="$2"; shift 2;;
     --ll-port1) LL_PORT1="$2"; shift 2;;
+    --hl-gpu) HL_GPU="$2"; shift 2;;
+    --ll-gpu0) LL_GPU0="$2"; shift 2;;
+    --ll-gpu1) LL_GPU1="$2"; shift 2;;
+    --ll-xla-mem-fraction) LL_XLA_MEM_FRACTION="$2"; shift 2;;
     --n-episodes) N_EPISODES="$2"; shift 2;;
     --base-seed) BASE_SEED="$2"; shift 2;;
     --results-dir) RESULTS_DIR="$2"; shift 2;;
@@ -144,28 +156,39 @@ if [[ "$FLAT_BASELINE" -eq 0 ]]; then
     "$MEMER_PY" "$HL_SERVER" --mock --port "$HL_PORT" >"$LOG_DIR/hl.log" 2>&1 &
   else
     [[ -z "$HL_MODEL" ]] && { echo "--hl-model required (or use --mock / --flat-baseline)" >&2; exit 2; }
-    echo "[launcher] starting HL server on :$HL_PORT (model=$HL_MODEL)"
-    "$MEMER_PY" "$HL_SERVER" --model-path "$HL_MODEL" --port "$HL_PORT" \
+    echo "[launcher] starting HL server on :$HL_PORT (model=$HL_MODEL, GPU=$HL_GPU)"
+    CUDA_VISIBLE_DEVICES="$HL_GPU" \
+      "$MEMER_PY" "$HL_SERVER" --model-path "$HL_MODEL" --port "$HL_PORT" \
         >"$LOG_DIR/hl.log" 2>&1 &
   fi
   PIDS+=("$!")
-  wait_http_health 127.0.0.1 "$HL_PORT" || { cat "$LOG_DIR/hl.log"; exit 1; }
+  # Qwen3-VL-4B + LoRA load from a cold HF cache over the shared FS can take 4-6 min, so give
+  # the HL health check a generous window (300 retries x 2s = 10 min).
+  wait_http_health 127.0.0.1 "$HL_PORT" 300 || { cat "$LOG_DIR/hl.log"; exit 1; }
   echo "[launcher] HL healthy on :$HL_PORT"
 fi
 
 # ---------------------------------------------------------------- 2) LL servers
 if [[ "$MOCK" -eq 0 ]]; then
   [[ -z "$LL_CKPT_ARM0" || -z "$LL_CKPT_ARM1" ]] && { echo "--ll-ckpt-arm0/1 required (or --mock)" >&2; exit 2; }
-  echo "[launcher] starting LL arm0 ($LL_CONFIG_ARM0) on :$LL_PORT0"
-  "$OPENPI_PY" "$OPENPI_DIR/scripts/serve_policy.py" \
-      --port "$LL_PORT0" policy:checkpoint \
-      --policy.config="$LL_CONFIG_ARM0" --policy.dir="$LL_CKPT_ARM0" \
+  echo "[launcher] starting LL arm0 ($LL_CONFIG_ARM0) on :$LL_PORT0 (GPU=$LL_GPU0)"
+  ( cd "$OPENPI_DIR" && \
+    CUDA_VISIBLE_DEVICES="$LL_GPU0" \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION="$LL_XLA_MEM_FRACTION" \
+    "$OPENPI_PY" "$OPENPI_DIR/scripts/serve_policy.py" \
+        --port "$LL_PORT0" policy:checkpoint \
+        --policy.config="$LL_CONFIG_ARM0" --policy.dir="$LL_CKPT_ARM0" ) \
       >"$LOG_DIR/ll_arm0.log" 2>&1 &
   PIDS+=("$!")
-  echo "[launcher] starting LL arm1 ($LL_CONFIG_ARM1) on :$LL_PORT1"
-  "$OPENPI_PY" "$OPENPI_DIR/scripts/serve_policy.py" \
-      --port "$LL_PORT1" policy:checkpoint \
-      --policy.config="$LL_CONFIG_ARM1" --policy.dir="$LL_CKPT_ARM1" \
+  echo "[launcher] starting LL arm1 ($LL_CONFIG_ARM1) on :$LL_PORT1 (GPU=$LL_GPU1)"
+  ( cd "$OPENPI_DIR" && \
+    CUDA_VISIBLE_DEVICES="$LL_GPU1" \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION="$LL_XLA_MEM_FRACTION" \
+    "$OPENPI_PY" "$OPENPI_DIR/scripts/serve_policy.py" \
+        --port "$LL_PORT1" policy:checkpoint \
+        --policy.config="$LL_CONFIG_ARM1" --policy.dir="$LL_CKPT_ARM1" ) \
       >"$LOG_DIR/ll_arm1.log" 2>&1 &
   PIDS+=("$!")
   wait_ws_health 127.0.0.1 "$LL_PORT0" || { cat "$LOG_DIR/ll_arm0.log"; exit 1; }
