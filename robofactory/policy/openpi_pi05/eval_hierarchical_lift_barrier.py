@@ -232,17 +232,190 @@ def _make_ll_policies(args):
 
 # ----------------------------------------------------------------------------------- guards
 
+# The data-gen renderer (robofactory.planner.run) uses shader_pack="default" on all three
+# camera-config groups. ManiSkill's fallback is "minimal", whose Color shader clears the
+# framebuffer to pure black instead of "default"'s gray clear — silently blacking out the
+# upper ~third of head_camera_global at eval (base_0_rgb_raw train-vs-eval RMSE jumps to
+# ~0.53 vs ~0.005 for the wrist cams). See memory/feedback_sapien_shader_pack_eval_mismatch.md.
+REQUIRED_SHADER_PACK = "default"
+_SHADER_CONFIG_KEYS = ("sensor_configs", "human_render_camera_configs", "viewer_camera_configs")
+
+
+def _assert_shader_pack_default(gym_make_kwargs: dict) -> None:
+    """Fail loudly unless shader_pack=="default" on ALL three camera-config groups.
+
+    Gate G2: a wrong/absent shader_pack does not crash — it silently corrupts the global
+    camera background, so we MUST assert rather than warn. Call this on the exact kwargs
+    dict passed to gym.make (single source of truth)."""
+    bad = []
+    for key in _SHADER_CONFIG_KEYS:
+        cfg = gym_make_kwargs.get(key)
+        sp = cfg.get("shader_pack") if isinstance(cfg, dict) else None
+        if sp != REQUIRED_SHADER_PACK:
+            bad.append(f"{key}.shader_pack={sp!r}")
+    if bad:
+        raise RuntimeError(
+            "SAPIEN shader_pack guard FAILED (Gate G2): expected shader_pack="
+            f"{REQUIRED_SHADER_PACK!r} on {list(_SHADER_CONFIG_KEYS)}, but got: "
+            f"{', '.join(bad)}. ManiSkill's 'minimal' fallback blacks out the upper region of "
+            "head_camera_global vs the gray clear used at data-gen, silently corrupting eval. "
+            "See memory/feedback_sapien_shader_pack_eval_mismatch.md."
+        )
+
+
+def _is_compute_node() -> bool:
+    """True iff we are clearly on a compute node (not the login node).
+
+    Primary green signal: a SLURM allocation (SLURM_JOB_ID set) — a batch/interactive job
+    is by construction on a compute node. Secondary: an explicit override env var for
+    interactive runs on workstation nodes (iris-ws-*), since those render correctly but
+    carry no SLURM_JOB_ID. The iris LOGIN node has neither and is refused."""
+    import os
+
+    if os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID"):
+        return True
+    if os.environ.get("ROBOFACTORY_ALLOW_NON_SLURM_NODE") == "1":
+        return True
+    host = socket.gethostname().split(".")[0]
+    # Workstation nodes (iris-ws-*) render correctly; allow interactive use on them.
+    if host.startswith("iris-ws"):
+        return True
+    return False
+
 
 def _assert_not_login_node():
-    # GUARDIAN: shader/login-node guards here. The SAPIEN renderer produces ~32% darker /
-    # black framebuffers on the iris login node (see memory/feedback_sapien_shader_pack_eval_mismatch.md).
-    # The Data & Sim-Fidelity Guardian owns hardening this (login-node hostname refusal +
-    # rendered-vs-training-frame RMSE sign-off gate G2). This stub keeps the structure and a
-    # loud warning so eval is never silently trusted on the login node. Leave for the Guardian.
+    """HARD refusal to run on the iris login node (renders ~32% darker / black framebuffer).
+
+    Gate G2: eval numbers from the login node are untrustworthy, so refuse rather than warn.
+    Green iff inside a SLURM allocation OR on a workstation node OR explicit override."""
+    if _is_compute_node():
+        return
     host = socket.gethostname()
-    if host.startswith("iris") and "ws" not in host and not any(c.isdigit() for c in host.split(".")[0]):
-        print(f"[GUARDIAN-WARN] hostname={host!r} looks like a login node; SAPIEN may render "
-              f"~32% darker. Run eval on a COMPUTE node. (Hard refusal to be added by Guardian.)")
+    raise RuntimeError(
+        f"REFUSING to run SAPIEN eval on host {host!r}: no SLURM_JOB_ID and not a workstation "
+        "node. The iris login node renders ~32% darker / blacks out head_camera_global, which "
+        "silently corrupts eval. Run inside a SLURM allocation on a COMPUTE node (sbatch / "
+        "srun / interactive). If you are knowingly on a correctly-rendering interactive node, "
+        "set ROBOFACTORY_ALLOW_NON_SLURM_NODE=1. See "
+        "memory/feedback_sapien_shader_pack_eval_mismatch.md."
+    )
+
+
+# ------------------------------------------------------------------- Gate G2 fidelity check
+
+
+def _normalize_img(img: np.ndarray) -> np.ndarray:
+    """uint8 HxWx3 -> float32 in [-1, 1] (the space the shader-mismatch note's RMSE uses)."""
+    return np.asarray(img, dtype=np.float32) / 127.5 - 1.0
+
+
+def _rmse_norm(a: np.ndarray, b: np.ndarray) -> float:
+    """RMSE between two images in normalized [-1, 1] space."""
+    x = _normalize_img(a)
+    y = _normalize_img(b)
+    return float(np.sqrt(np.mean((x - y) ** 2)))
+
+
+def _load_training_base0_frame(index: int, v21_dir: str) -> np.ndarray:
+    """Read base_0_rgb_raw for a global frame `index` from the v2.1 dataset parquet
+    (read-only, version-agnostic). v2.1 layout: data/chunk-*/episode_*.parquet, one
+    episode per file; the global `index` column is the frame id we match on."""
+    import glob
+    import io
+
+    import pandas as pd
+    from PIL import Image
+
+    files = sorted(glob.glob(str(Path(v21_dir) / "data" / "chunk-*" / "episode_*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"no v2.1 parquet under {v21_dir}/data/chunk-*/")
+    for f in files:
+        df = pd.read_parquet(f, columns=["index", "base_0_rgb_raw"])
+        hit = df[df["index"] == index]
+        if len(hit):
+            cell = hit.iloc[0]["base_0_rgb_raw"]
+            # LeRobot stores images as {"bytes": <png/jpeg>, "path": ...}
+            if isinstance(cell, dict) and cell.get("bytes") is not None:
+                img = np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB"))
+            else:
+                img = np.asarray(cell)
+            return img.astype(np.uint8)
+    raise IndexError(f"global index {index} not found in v2.1 dataset {v21_dir}")
+
+
+def fidelity_check(
+    episode_index: int = 0,
+    config: str = Args.config,
+    v21_dir: str = "/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_lift_barrier_workspace_seedfix_v1",
+    lb_json: str = "/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.json",
+    rmse_threshold: float = 0.1,
+) -> dict:
+    """Gate G2: render one head_camera_global frame at the training episode's reset
+    (shader_pack="default") and compare it to that episode's frame-0 base_0_rgb_raw via
+    RMSE in [-1,1] space. The wrong-shader divergent case is ~0.53; we want << 0.1.
+
+    The training episode's reset seed is read from LiftBarrier.json (episode_seed), because
+    the planner skips MP failures so episode_index != seed in general.
+    """
+    _assert_not_login_node()
+
+    # Recover this episode's exact reset seed (episode_seed) and its global frame-0 index.
+    meta = json.loads(Path(lb_json).read_text())
+    episodes = meta["episodes"]
+    ep = next(e for e in episodes if e["episode_id"] == episode_index)
+    reset_seed = int(ep["reset_kwargs"].get("seed", ep["episode_seed"]))
+    # Global frame index of this episode's frame 0 = sum of all prior episodes' lengths.
+    global_index0 = sum(int(e["elapsed_steps"]) for e in episodes if e["episode_id"] < episode_index)
+
+    train_img = _load_training_base0_frame(global_index0, v21_dir)
+
+    gym_make_kwargs = dict(
+        config=config,
+        obs_mode="rgb",
+        control_mode="pd_joint_pos",
+        render_mode="rgb_array",
+        num_envs=1,
+        sim_backend="cpu",  # data-gen used cpu backend (LiftBarrier.json env_kwargs)
+        robot_uids=("panda_wristcam_multi", "panda_wristcam_multi"),
+        sensor_configs=dict(shader_pack="default"),
+        human_render_camera_configs=dict(shader_pack="default"),
+        viewer_camera_configs=dict(shader_pack="default"),
+    )
+    _assert_shader_pack_default(gym_make_kwargs)
+    env = gym.make("LiftBarrier-rf", **gym_make_kwargs)
+    try:
+        obs, _ = env.reset(seed=reset_seed)
+        eval_img = _extract_image(obs, "head_camera_global")
+    finally:
+        env.close()
+
+    if eval_img.shape != train_img.shape:
+        raise RuntimeError(
+            f"shape mismatch: eval {eval_img.shape} vs train {train_img.shape} "
+            "(cannot compute RMSE)"
+        )
+
+    rmse = _rmse_norm(eval_img, train_img)
+
+    # Top-sixth near-black fraction is the shader-bug fingerprint (note: >0.8 when broken).
+    top = eval_img[: eval_img.shape[0] // 6]
+    frac_near_black = float(np.mean(np.all(top < 10, axis=-1)))
+
+    passed = rmse < rmse_threshold
+    result = {
+        "episode_index": episode_index,
+        "reset_seed": reset_seed,
+        "global_frame_index": global_index0,
+        "image_shape": list(eval_img.shape),
+        "rmse_norm": rmse,
+        "rmse_threshold": rmse_threshold,
+        "top_sixth_frac_near_black": frac_near_black,
+        "gate_g2_pass": passed,
+    }
+    print(f"[G2-fidelity] ep={episode_index} seed={reset_seed} idx={global_index0} "
+          f"RMSE={rmse:.4f} (thr={rmse_threshold}) top_black={frac_near_black:.3f} "
+          f"-> {'PASS' if passed else 'FAIL'}")
+    return result
 
 
 # ------------------------------------------------------------------------------ episode loop
@@ -330,8 +503,10 @@ def main(args: Args):
         "extra_0_rgb_raw": None,
     }
 
-    env = gym.make(
-        args.task,
+    # shader_pack="default" matches the data-gen renderer; the assertion below refuses to
+    # proceed if any camera-config group is missing/!="default" (Gate G2). Build the kwargs
+    # once so the guard checks exactly what gym.make receives.
+    gym_make_kwargs = dict(
         config=args.config,
         obs_mode="rgb",
         control_mode="pd_joint_pos",
@@ -339,13 +514,12 @@ def main(args: Args):
         num_envs=1,
         sim_backend=args.sim_backend,
         robot_uids=tuple(args.robot_uids_csv.split(",")),
-        # GUARDIAN: shader/login-node guards here. shader_pack="default" matches the data-gen
-        # renderer; do NOT change without the Guardian's sign-off (G2). See
-        # memory/feedback_sapien_shader_pack_eval_mismatch.md.
         sensor_configs=dict(shader_pack="default"),
         human_render_camera_configs=dict(shader_pack="default"),
         viewer_camera_configs=dict(shader_pack="default"),
     )
+    _assert_shader_pack_default(gym_make_kwargs)
+    env = gym.make(args.task, **gym_make_kwargs)
     action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
 
     ll_policies = _make_ll_policies(args)
