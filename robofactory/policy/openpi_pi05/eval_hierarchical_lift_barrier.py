@@ -49,13 +49,36 @@ import robofactory.agents  # noqa: F401
 
 IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
-# Cameras the HL policy consumes, in the canonical dual-agent order. Keys are the slot names
-# the HL server expects; values are the SAPIEN sensor names in the LiftBarrier env.
-HL_CAM_MAP = {
-    "left_wrist_0_rgb_raw": "hand_camera_0",
-    "right_wrist_0_rgb_raw": "hand_camera_1",
-    "base_0_rgb_raw": "head_camera_global",
+# Camera families: slot name -> SAPIEN sensor name. BOTH the LL helpers and the HL Boss must
+# see the SAME cameras they trained on, else eval is a silent camera mismatch.
+#   wristcam  : egocentric hand cameras (used by the throwaway sanity run).
+#   workspace : fixed head cameras (head_camera_agent0/agent1 + global) -- matches
+#               eval_decent_pi05.py / examples/.../camera_mappings/lift_barrier.json, i.e. the
+#               cams the WORKSPACE decent pi0.5 helpers AND the dual-agent HL were trained on.
+CAMERA_FAMILIES = {
+    "wristcam": {
+        "base_0_rgb_raw": "head_camera_global",
+        "left_wrist_0_rgb_raw": "hand_camera_0",
+        "right_wrist_0_rgb_raw": "hand_camera_1",
+        "extra_0_rgb_raw": None,
+    },
+    "workspace": {
+        "base_0_rgb_raw": "head_camera_global",
+        "left_wrist_0_rgb_raw": "head_camera_agent0",
+        "right_wrist_0_rgb_raw": "head_camera_agent1",
+        "extra_0_rgb_raw": None,
+    },
 }
+
+# Cameras the HL policy consumes, in the canonical dual-agent order [left, right, base]. The
+# values are filled per --camera-family at runtime (see _hl_cam_map).
+HL_CAM_ORDER = ("left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "base_0_rgb_raw")
+
+
+def _hl_cam_map(camera_family: str) -> dict:
+    """HL slot->sensor map for a camera family, in [left, right, base] order."""
+    fam = CAMERA_FAMILIES[camera_family]
+    return {slot: fam[slot] for slot in HL_CAM_ORDER}
 
 
 @dataclasses.dataclass
@@ -81,6 +104,13 @@ class Args:
     sim_backend: str = "auto"
     results_dir: str = "/iris/u/mikulrai/projects/RoboFactory/eval_results"
     video_dir: str = ""  # if set, write one global-cam mp4 per episode
+    # ---- cameras ----
+    camera_family: str = "wristcam"  # {wristcam, workspace}; workspace = head cams (trained-on)
+    # ---- live dashboard ----
+    live_json: str = ""  # if set, rewrite this JSON after every episode (live progress)
+    hl_ckpt: str = ""    # recorded into live_json for the dashboard (informational)
+    arm0_ckpt: str = ""
+    arm1_ckpt: str = ""
     # ---- modes ----
     flat_baseline: bool = False  # skip HL; fixed prompt for both arms
     flat_prompt: str = "lift the steel barrier using two robot arms"
@@ -156,10 +186,11 @@ def _write_mp4(path, frames):
 class HLClient:
     """Stdlib-HTTP client to the HL Qwen subtask server (memer env, separate process)."""
 
-    def __init__(self, host: str, port: int, instruction: str, timeout: float = 60.0):
+    def __init__(self, host: str, port: int, instruction: str, hl_cam_map: dict, timeout: float = 60.0):
         self.host = host
         self.port = port
         self.instruction = instruction
+        self.hl_cam_map = hl_cam_map  # slot -> sensor, in [left, right, base] order
         self.timeout = timeout
 
     def _post(self, path: str, payload: dict) -> dict:
@@ -193,7 +224,9 @@ class HLClient:
     def reset(self) -> None:
         self._post("/reset", {"instruction": self.instruction})
 
-    def query(self, obs, cam_map=HL_CAM_MAP) -> dict:
+    def query(self, obs, cam_map=None) -> dict:
+        if cam_map is None:
+            cam_map = self.hl_cam_map
         images = {}
         for slot, cam in cam_map.items():
             arr = _extract_image(obs, cam)
@@ -496,12 +529,11 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
 def main(args: Args):
     _assert_not_login_node()
 
-    cam_map = {
-        "base_0_rgb_raw": "head_camera_global",
-        "left_wrist_0_rgb_raw": "hand_camera_0",
-        "right_wrist_0_rgb_raw": "hand_camera_1",
-        "extra_0_rgb_raw": None,
-    }
+    if args.camera_family not in CAMERA_FAMILIES:
+        raise ValueError(f"--camera-family must be one of {sorted(CAMERA_FAMILIES)}, got {args.camera_family!r}")
+    cam_map = dict(CAMERA_FAMILIES[args.camera_family])      # LL helpers' cameras
+    hl_cam_map = _hl_cam_map(args.camera_family)             # HL Boss's cameras (same family)
+    print(f"[camera-family] {args.camera_family}: LL={cam_map} HL={hl_cam_map}")
 
     # shader_pack="default" matches the data-gen renderer; the assertion below refuses to
     # proceed if any camera-config group is missing/!="default" (Gate G2). Build the kwargs
@@ -526,7 +558,7 @@ def main(args: Args):
 
     hl_client = None
     if not args.flat_baseline:
-        hl_client = HLClient(args.hl_host, args.hl_port, args.hl_instruction)
+        hl_client = HLClient(args.hl_host, args.hl_port, args.hl_instruction, hl_cam_map)
         hl_client.wait_healthy()
 
     print(f"[config] mode={'flat-baseline' if args.flat_baseline else 'hierarchical'} "
@@ -534,7 +566,36 @@ def main(args: Args):
           f"hl={args.hl_host}:{args.hl_port} K={args.hl_query_interval} "
           f"episodes={args.max_episodes} base_seed={args.seed}")
 
+    def _write_live(status: str, eps: list):
+        """Rewrite the live dashboard JSON after each episode (atomic via tmp+rename)."""
+        if not args.live_json:
+            return
+        n_ok = sum(1 for e in eps if e["success"])
+        payload = {
+            "status": status,
+            "camera_family": args.camera_family,
+            "checkpoints": {"hl": args.hl_ckpt, "arm0": args.arm0_ckpt, "arm1": args.arm1_ckpt},
+            "seeds_total": int(args.max_episodes),
+            "episodes": [
+                {
+                    "seed": e["seed"],
+                    "success": e["success"],
+                    "steps": e["steps"],
+                    "l": e.get("last_subtask_left"),
+                    "r": e.get("last_subtask_right"),
+                }
+                for e in eps
+            ],
+            "sr": f"{n_ok}/{len(eps)}",
+        }
+        p = Path(args.live_json)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(p)
+
     episodes = []
+    _write_live("running", episodes)  # seed an empty live file so a reader sees us start
     for ep in range(args.max_episodes):
         seed = args.seed + ep
         video_path = ""
@@ -543,6 +604,7 @@ def main(args: Args):
         rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path)
         episodes.append(rec)
         print(f"[episode {ep}] {rec}")
+        _write_live("running", episodes)
 
     n = len(episodes)
     n_success = sum(1 for e in episodes if e["success"])
@@ -563,6 +625,7 @@ def main(args: Args):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = Path(args.results_dir) / f"eval_{args.task}_{ts}.json"
     out_path.write_text(json.dumps(results, indent=2))
+    _write_live("done", episodes)
     print(f"[result] success_rate={success_rate:.3f} ({n_success}/{n}) -> {out_path}")
     return results
 
