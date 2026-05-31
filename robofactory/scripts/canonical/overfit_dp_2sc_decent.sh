@@ -1,4 +1,5 @@
 #!/bin/bash
+# // not migrated: env-var-driven zarr aliasing (ARM/CAM_FAMILY/EXP_TAG/OVERFIT_N) + runtime symlink scheme; no static manifest resolution
 #SBATCH --job-name=dp_2sc_overfit_decent
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

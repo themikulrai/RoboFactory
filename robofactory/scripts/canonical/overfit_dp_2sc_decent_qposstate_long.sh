@@ -1,4 +1,5 @@
 #!/bin/bash
+# // not migrated: env-var-driven zarr aliasing + long val_every variant; runtime-templated
 #SBATCH --job-name=dp_2sc_overfit_qpos_long
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

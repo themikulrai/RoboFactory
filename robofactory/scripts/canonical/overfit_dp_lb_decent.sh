@@ -1,4 +1,5 @@
 #!/bin/bash
+# // not migrated: env-var-driven zarr aliasing (ARM 0..3/EXP_TAG) + per-arm runtime symlink; not statically resolvable
 #SBATCH --job-name=dp_lb_overfit_quick
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
