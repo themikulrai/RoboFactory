@@ -43,7 +43,20 @@ cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
 OPENPI_DIR=/iris/u/mikulrai/projects/openpi
 OPENPI_PY=${OPENPI_DIR}/.venv/bin/python
+PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 CKPT_BASE=/iris/u/mikulrai/checkpoints/openpi
+
+# Pick two job-unique free ports so co-scheduled eval jobs on the same node
+# never collide on the hardcoded 8000/8001 (a same-node port clash silently
+# routes one client to the wrong policy server).
+read -r PORT0 PORT1 <<<"$("$PREFLIGHT_PYTHON" -c "
+import socket
+ss=[socket.socket() for _ in range(2)]
+for s in ss: s.bind(('127.0.0.1',0))
+print(*[s.getsockname()[1] for s in ss])
+for s in ss: s.close()
+")"
+echo "[server] decent will use ports ${PORT0} ${PORT1}"
 
 ARM0_CFG=pi05_robofactory_lb_wc_decent_arm0
 ARM1_CFG=pi05_robofactory_lb_wc_decent_arm1
@@ -74,8 +87,8 @@ start_server () {
     echo $! > "${SERVER_LOG_DIR}/${logname}.pid"
 }
 
-start_server 0 8000 "$ARM0_CFG" "$ARM0_DIR" arm0
-start_server 1 8001 "$ARM1_CFG" "$ARM1_DIR" arm1
+start_server 0 "$PORT0" "$ARM0_CFG" "$ARM0_DIR" arm0
+start_server 1 "$PORT1" "$ARM1_CFG" "$ARM1_DIR" arm1
 
 cleanup () {
     echo "[cleanup] stopping policy servers"
@@ -91,9 +104,8 @@ cleanup () {
 }
 trap cleanup EXIT INT TERM
 
-PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
-echo "[wait] probing ports 8000/8001 (deadline 600s) ..."
-for port in 8000 8001; do
+echo "[wait] probing ports ${PORT0}/${PORT1} (deadline 600s) ..."
+for port in "$PORT0" "$PORT1"; do
     deadline=$((SECONDS + 600))
     while ! "$PREFLIGHT_PYTHON" -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1',${port}))==0 else 1)" 2>/dev/null; do
         if [ $SECONDS -ge $deadline ]; then
@@ -113,7 +125,7 @@ SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
     --task LiftBarrier-rf \
     --config /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml \
     --host 127.0.0.1 \
-    --ports 8000,8001 \
+    --ports "${PORT0},${PORT1}" \
     --num-arms 2 \
     --num-episodes 1 \
     --seeds "$SEEDS" \

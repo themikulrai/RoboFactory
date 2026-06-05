@@ -44,22 +44,28 @@ cd /iris/u/mikulrai/projects/RoboFactory/robofactory
 
 OPENPI_DIR=/iris/u/mikulrai/projects/openpi
 OPENPI_PY=${OPENPI_DIR}/.venv/bin/python
+PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 CENT_CFG=pi05_robofactory_lb_wc_cent
 CENT_DIR=/iris/u/mikulrai/checkpoints/openpi/${CENT_CFG}/lb-wc-cent-bs16-20k-2026-05-16-fp/19999
 [ -d "$CENT_DIR" ] || { echo "missing ckpt dir: $CENT_DIR"; exit 1; }
 echo "Evaluating cent ckpt: $CENT_DIR"
 
+# Pick a job-unique free port so co-scheduled eval jobs on the same node never
+# collide (the 8000 hardcode let a decent job's arm0 server hijack this client).
+PORT=$("$PREFLIGHT_PYTHON" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
+echo "[server] cent will use port ${PORT}"
+
 SERVER_LOG_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/${SLURM_JOB_ID}_servers
 mkdir -p "$SERVER_LOG_DIR"
 
-echo "[server] cent GPU=0 port=8000 cfg=${CENT_CFG}"
+echo "[server] cent GPU=0 port=${PORT} cfg=${CENT_CFG}"
 (cd "$OPENPI_DIR" && \
  CUDA_VISIBLE_DEVICES=0 \
  XLA_PYTHON_CLIENT_PREALLOCATE=false \
  XLA_PYTHON_CLIENT_MEM_FRACTION=0.30 \
  HF_LEROBOT_HOME=/iris/u/mikulrai/data/RoboFactory/lerobot \
  "$OPENPI_PY" scripts/serve_policy.py \
-     --port 8000 \
+     --port "${PORT}" \
      policy:checkpoint \
      --policy.config="${CENT_CFG}" \
      --policy.dir="${CENT_DIR}") \
@@ -80,16 +86,15 @@ cleanup () {
 }
 trap cleanup EXIT INT TERM
 
-PREFLIGHT_PYTHON=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
-echo "[wait] probing port 8000 (deadline 600s) ..."
+echo "[wait] probing port ${PORT} (deadline 600s) ..."
 deadline=$((SECONDS + 600))
-while ! "$PREFLIGHT_PYTHON" -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1',8000))==0 else 1)" 2>/dev/null; do
+while ! "$PREFLIGHT_PYTHON" -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1',${PORT}))==0 else 1)" 2>/dev/null; do
     if [ $SECONDS -ge $deadline ]; then
-        echo "[wait] timeout port 8000"; tail -n 80 "${SERVER_LOG_DIR}"/*.log; exit 1
+        echo "[wait] timeout port ${PORT}"; tail -n 80 "${SERVER_LOG_DIR}"/*.log; exit 1
     fi
     sleep 5
 done
-echo "[wait] port 8000 up"
+echo "[wait] port ${PORT} up"
 
 VIDEO_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/videos_${SLURM_JOB_ID}
 OUT_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent
@@ -100,7 +105,7 @@ SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
     --task LiftBarrier-rf \
     --config /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml \
     --host 127.0.0.1 \
-    --port 8000 \
+    --port "${PORT}" \
     --camera-mapping /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/lift_barrier_wristcam.json \
     --robot-uid panda_wristcam_multi \
     --robot-uids-csv "panda_wristcam_multi,panda_wristcam_multi" \
