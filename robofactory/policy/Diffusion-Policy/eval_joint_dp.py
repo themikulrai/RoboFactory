@@ -86,6 +86,12 @@ class Args:
     jsonl_path: Optional[str] = None
     """Path for per-episode JSONL log; auto-created if None."""
 
+    video_max: int = 3
+    """Max episodes to save as mp4 per run (ignored if video_all=True)."""
+
+    video_all: bool = False
+    """If True, save mp4 for every seed (overrides video_max)."""
+
 
 def load_policy(ckpt_path: str, device: str = "cuda:0"):
     ckpt_full = ckpt_path if os.path.isabs(ckpt_path) else './' + ckpt_path

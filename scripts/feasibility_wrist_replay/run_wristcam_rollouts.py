@@ -43,6 +43,7 @@ from robofactory.planner.solutions import (
     solveTwoRobotsStackCube,
     solveLiftBarrier,
     solvePlaceFood,
+    solveStackCube,
 )
 from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory import CONFIG_DIR
@@ -92,6 +93,12 @@ TASK_MAP = {
         "table/place_food.yaml",
         solvePlaceFood,
         2,
+    ),
+    "StackCube": (
+        "StackCube-rf",
+        "table/stack_cube.yaml",
+        solveStackCube,
+        1,
     ),
 }
 

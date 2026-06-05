@@ -98,7 +98,11 @@ class Args:
     hl_query_interval: int = 25  # K: query HL every K env steps
     hl_instruction: str = "lift the steel barrier using two robot arms"
     # ---- rollout / eval control ----
-    seed: int = 1000  # base seed; episode i uses seed + i
+    seed: int = 1000  # base seed; episode i uses base = seed + i
+    # Lift-Barrier pi0.5 project convention: env reset seed = base * seed_stride (+0). With
+    # seed_stride=100000, bases 100..159 map to env seeds 10_000_000.. ; the recorded/live
+    # "seed" field stays the BASE (100..159). seed_stride=1 (default) = consecutive bases.
+    seed_stride: int = 1
     max_episodes: int = 20
     max_env_steps: int = 500  # LiftBarrier-rf max_episode_steps is 500
     sim_backend: str = "auto"
@@ -178,6 +182,27 @@ def _write_mp4(path, frames):
     for f in frames:
         vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
     vw.release()
+
+
+def _overlay_subtasks(img, step, total, left, right):
+    """Burn the active subtask (per arm) + step counter onto a frame.
+
+    White text on a black bar is colour-swap invariant (the writer does an
+    RGB->BGR convert), so it renders identically regardless of channel order.
+    """
+    import cv2
+
+    img = np.ascontiguousarray(img)
+    w = img.shape[1]
+    cv2.rectangle(img, (0, 0), (w, 46), (0, 0, 0), -1)
+    cv2.putText(img, f"step {step + 1}/{total}", (5, 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"L: {left or '-'}", (5, 29),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    if right is not None:
+        cv2.putText(img, f"R: {right}", (5, 43),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return img
 
 
 # --------------------------------------------------------------------------------- HL client
@@ -454,8 +479,9 @@ def fidelity_check(
 # ------------------------------------------------------------------------------ episode loop
 
 
-def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path):
-    obs, _ = env.reset(seed=seed)
+def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path,
+                env_seed=None, record_seed=None):
+    obs, _ = env.reset(seed=(env_seed if env_seed is not None else seed))
     if hl_client is not None:
         hl_client.reset()
 
@@ -469,10 +495,18 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
 
     success = False
     step = 0
+    subtasks_l, subtasks_r = [], []   # per-step active subtask (the one driving this step)
+    # ---- per-arm grasp-contact instrumentation (is each gripper actually holding the barrier?) ----
+    try:
+        _barrier = env.unwrapped.barrier
+        _subagents = env.unwrapped.agent.agents
+    except Exception:
+        _barrier, _subagents = None, None
+    def _scal(x):
+        a = x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+        return a.reshape(-1)
+    grasp_trace, barz_trace = [], []   # per step: [grasp_left, grasp_right], barrier z
     for step in range(args.max_env_steps):
-        if video_path:
-            frames.append(_extract_image(obs, "head_camera_global"))
-
         # ---- HL query every K steps (skipped in flat-baseline) ----
         if hl_client is not None and (step % args.hl_query_interval == 0):
             last_hl = hl_client.query(obs)
@@ -486,6 +520,17 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
             right_p = prompts[1] if args.num_arms > 1 else None
             print(f"[seed {seed} step {step}] HL -> left={prompts[0]!r} right={right_p!r} "
                   f"(src={last_hl.get('dual_source')})")
+
+        # ---- record the subtask active for THIS step's action (held between HL queries) ----
+        cur_l = prompts[0]
+        cur_r = prompts[1] if args.num_arms > 1 else None
+        subtasks_l.append(cur_l)
+        subtasks_r.append(cur_r)
+
+        if video_path:
+            frame = _extract_image(obs, "head_camera_global")
+            frame = _overlay_subtasks(frame, step, args.max_env_steps, cur_l, cur_r)
+            frames.append(frame)
 
         # ---- per-arm LL replanning with its own prompt ----
         replanned = [False] * args.num_arms
@@ -510,6 +555,14 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         obs, _, term, trunc, info = env.step(action_dict)
         s = info.get("success", False)
         success = bool(s.item() if hasattr(s, "item") else s)
+        # record per-arm grasp + barrier height for THIS step (incl. the final/break step)
+        if _barrier is not None:
+            try:
+                barz_trace.append(float(_scal(_barrier.pose.p)[2]))
+                grasp_trace.append([bool(_scal(_subagents[i].is_grasping(_barrier))[0])
+                                    for i in range(args.num_arms)])
+            except Exception:
+                pass
         if success or term or trunc:
             break
 
@@ -517,12 +570,17 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         _write_mp4(video_path, frames)
 
     return {
-        "seed": int(seed),
+        "seed": int(record_seed if record_seed is not None else seed),
+        "env_seed": int(env_seed if env_seed is not None else seed),
         "success": bool(success),
         "steps": int(step + 1),
         "n_hl_queries": int(n_hl_queries),
         "last_subtask_left": (last_hl or {}).get("subtask_left") if last_hl else None,
         "last_subtask_right": (last_hl or {}).get("subtask_right") if last_hl else None,
+        "subtask_trace_left": subtasks_l,
+        "subtask_trace_right": subtasks_r,
+        "grasp_trace": grasp_trace,   # per step [grasp_left, grasp_right]
+        "barz_trace": barz_trace,     # per step barrier z height
     }
 
 
@@ -597,11 +655,13 @@ def main(args: Args):
     episodes = []
     _write_live("running", episodes)  # seed an empty live file so a reader sees us start
     for ep in range(args.max_episodes):
-        seed = args.seed + ep
+        base = args.seed + ep                 # recorded/live seed (e.g. 100..159)
+        env_seed = base * args.seed_stride     # actual env reset seed (project convention)
         video_path = ""
         if args.video_dir:
-            video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{seed}.mp4")
-        rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path)
+            video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
+        rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, base,
+                          video_path, env_seed=env_seed, record_seed=base)
         episodes.append(rec)
         print(f"[episode {ep}] {rec}")
         _write_live("running", episodes)

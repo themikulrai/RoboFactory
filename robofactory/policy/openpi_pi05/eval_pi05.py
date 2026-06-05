@@ -77,6 +77,7 @@ class Args:
     num_envs: int = 1  # >1 = vectorize; one batch of size num_envs runs in lockstep
     num_arms: int = 3
     active_dim: int = 0  # 0 => num_arms * 8
+    state_pad_to: int = 0  # 0 => no padding; set to model's active_dim to pad env state w/ zeros (curriculum models)
     camera_mapping: str = ""  # path to JSON; empty => DEFAULT_CAMERA_MAPPING
     robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
     robot_uids_csv: str = ""  # comma-separated UIDs for gym.make; empty = use default
@@ -109,13 +110,16 @@ def _get_qpos(obs: dict, robot_uid: str, arm_i: int) -> np.ndarray:
     raise KeyError(f"qpos lookup failed: arm={arm_i} uid={robot_uid} agent_keys={list(agent.keys())}")
 
 
-def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda") -> np.ndarray:
+def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda", pad_to: int = 0) -> np.ndarray:
     state_parts: list[np.ndarray] = []
     for i in range(num_arms):
         q = _get_qpos(obs, robot_uid, i).squeeze()
         state_parts.append(q[:7].astype(np.float32))
         state_parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
-    return np.concatenate(state_parts).astype(np.float32)
+    out = np.concatenate(state_parts).astype(np.float32)
+    if pad_to and out.shape[0] < pad_to:
+        out = np.concatenate([out, np.zeros(pad_to - out.shape[0], dtype=np.float32)])
+    return out
 
 
 def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
@@ -128,9 +132,9 @@ def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str = "panda") -> dict:
+def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str = "panda", state_pad_to: int = 0) -> dict:
     out: dict = {
-        "state": _build_state(obs, num_arms, robot_uid),
+        "state": _build_state(obs, num_arms, robot_uid, pad_to=state_pad_to),
         "prompt": prompt,
     }
     # Mirrors training-side RoboFactoryInputs: slots whose mapping is None are
@@ -299,7 +303,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
                 video_frames.append(_extract_image(obs, global_cam))
             replanned = False
             if chunk is None or chunk_idx >= args.replan_after:
-                obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, args.state_pad_to)
                 result = policy.infer(obs_dict)
                 chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
                 chunk_idx = 0
@@ -462,6 +466,13 @@ def main(args: Args) -> None:
         render_mode="rgb_array",
         num_envs=args.num_envs,
         sim_backend=args.sim_backend,
+        # Match data-gen shader_pack ("default"). ManiSkill default is "minimal" which clears
+        # the framebuffer to pure black; data-gen used "default" which has a gray clear, so
+        # without this kwarg head_camera_global above the table geometry diverges from train
+        # by RMSE 0.53 in [-1,1] space. See memory/feedback_sapien_shader_pack_eval_mismatch.md.
+        sensor_configs=dict(shader_pack="default"),
+        human_render_camera_configs=dict(shader_pack="default"),
+        viewer_camera_configs=dict(shader_pack="default"),
     )
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))

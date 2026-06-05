@@ -62,6 +62,11 @@ LL_GPU1=0
 LL_XLA_MEM_FRACTION=0.30
 N_EPISODES=20
 BASE_SEED=1000
+SEED_STRIDE=1
+MAX_ENV_STEPS=500
+REPLAN_AFTER=8
+CAMERA_FAMILY="wristcam"
+LIVE_JSON=""
 RESULTS_DIR="$RF_DIR/eval_results"
 VIDEO_DIR=""
 FLAT_BASELINE=0
@@ -85,6 +90,11 @@ while [[ $# -gt 0 ]]; do
     --ll-xla-mem-fraction) LL_XLA_MEM_FRACTION="$2"; shift 2;;
     --n-episodes) N_EPISODES="$2"; shift 2;;
     --base-seed) BASE_SEED="$2"; shift 2;;
+    --seed-stride) SEED_STRIDE="$2"; shift 2;;
+    --max-env-steps) MAX_ENV_STEPS="$2"; shift 2;;
+    --replan-after) REPLAN_AFTER="$2"; shift 2;;
+    --camera-family) CAMERA_FAMILY="$2"; shift 2;;
+    --live-json) LIVE_JSON="$2"; shift 2;;
     --results-dir) RESULTS_DIR="$2"; shift 2;;
     --video-dir) VIDEO_DIR="$2"; shift 2;;
     --flat-baseline) FLAT_BASELINE=1; shift;;
@@ -203,9 +213,17 @@ EVAL_ARGS=(
   --hl-query-interval "$HL_QUERY_INTERVAL"
   --max-episodes "$N_EPISODES"
   --seed "$BASE_SEED"
+  --seed-stride "$SEED_STRIDE"
+  --max-env-steps "$MAX_ENV_STEPS"
+  --replan-after "$REPLAN_AFTER"
+  --camera-family "$CAMERA_FAMILY"
   --results-dir "$RESULTS_DIR"
+  --hl-ckpt "$HL_MODEL"
+  --arm0-ckpt "$LL_CKPT_ARM0"
+  --arm1-ckpt "$LL_CKPT_ARM1"
 )
 [[ -n "$VIDEO_DIR" ]] && EVAL_ARGS+=(--video-dir "$VIDEO_DIR")
+[[ -n "$LIVE_JSON" ]] && EVAL_ARGS+=(--live-json "$LIVE_JSON")
 [[ "$FLAT_BASELINE" -eq 1 ]] && EVAL_ARGS+=(--flat-baseline)
 [[ "$MOCK" -eq 1 ]] && EVAL_ARGS+=(--mock-ll)
 
