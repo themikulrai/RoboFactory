@@ -11,8 +11,8 @@ Tiling contract (`tile_views`):
   is accepted on purpose — simplicity over letterboxing.
 - `layout="auto"`:
     * n == 1 -> that frame (contiguous copy).
-    * n == 2 -> one row, two columns (side by side).
-    * n >= 3 -> grid with `ncols = ceil(sqrt(n))`, `nrows = ceil(n / ncols)`,
+    * 2 <= n <= 3 -> one row of n columns (side by side).
+    * n > 3 -> grid with `ncols = ceil(sqrt(n))`, `nrows = ceil(n / ncols)`,
       filled row-major. Trailing empty cells are black (zeros), so any padding
       lands in the bottom-right.
 - `layout="horizontal"` always lays out a single row of `n` cells.
@@ -89,8 +89,8 @@ def tile_views(frames: List[np.ndarray], layout: str = "auto") -> np.ndarray:
     elif layout == "auto":
         if n == 1:
             return np.ascontiguousarray(cells[0])
-        if n == 2:
-            nrows, ncols = 1, 2
+        if n <= 3:
+            nrows, ncols = 1, n
         else:
             ncols = math.ceil(math.sqrt(n))
             nrows = math.ceil(n / ncols)

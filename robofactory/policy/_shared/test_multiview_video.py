@@ -100,18 +100,16 @@ def test_tile_two_different_sizes_uses_max_cell():
 # ---------------------------------------------------------------------------
 # tile_views — grids
 # ---------------------------------------------------------------------------
-def test_tile_three_grid_one_black_cell():
+def test_tile_three_horizontal_single_row():
+    # New contract: n <= 3 -> single horizontal row (no grid, no black padding).
     frames = [_solid(20, 20, (i + 1, i + 1, i + 1)) for i in range(3)]
     out = tile_views(frames)
-    # ncols = ceil(sqrt(3)) = 2, nrows = ceil(3/2) = 2
-    assert out.shape == (40, 40, 3)
-    # bottom-right cell (row 1, col 1) is black
-    black_cell = out[20:40, 20:40]
-    assert np.all(black_cell == 0)
-    # the three filled cells are non-black
-    assert np.any(out[0:20, 0:20] != 0)
-    assert np.any(out[0:20, 20:40] != 0)
-    assert np.any(out[20:40, 0:20] != 0)
+    # 1 row x 3 cols of 20x20 cells
+    assert out.shape == (20, 60, 3)
+    # all three cells are non-black, left-to-right in order
+    assert np.all(out[:, 0:20] == 1)
+    assert np.all(out[:, 20:40] == 2)
+    assert np.all(out[:, 40:60] == 3)
 
 
 def test_tile_four_grid_no_padding():
@@ -158,8 +156,8 @@ def test_tile_six_grid_no_padding():
 
 
 def test_grid_dimensions_formula_many_n():
-    """Cross-check the documented ncols/nrows formula for n = 3..16."""
-    for n in range(3, 17):
+    """Cross-check the documented ncols/nrows formula for n = 4..16 (grid path)."""
+    for n in range(4, 17):
         frames = [_solid(8, 8, (1, 1, 1)) for _ in range(n)]
         out = tile_views(frames)
         ncols = math.ceil(math.sqrt(n))
