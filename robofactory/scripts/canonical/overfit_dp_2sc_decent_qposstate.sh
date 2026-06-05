@@ -1,4 +1,5 @@
 #!/bin/bash
+# // not migrated: env-var-driven zarr aliasing (ARM/CAM_FAMILY/EXP_TAG) + state=qpos zarr variant; runtime-templated, not statically resolvable
 #SBATCH --job-name=dp_2sc_overfit_qposstate
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

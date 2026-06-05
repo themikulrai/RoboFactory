@@ -394,3 +394,212 @@ launchers:
       mem: "32G"
       output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
       error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # dp_decent_multi — 2SC (TwoRobotsStackCube) decentralised DP, eval_multi_dp.py
+  #
+  # Migrated from eval_dp_2sc_decent_60seeds.sh, which was CAM_FAMILY-parameterized
+  # (workspace|wristcam). Each cam-family resolves to a distinct command, so each
+  # gets its own launcher; the `eval_dp_2sc_decent_60seeds.sh` wrapper picks the
+  # launcher_id from $CAM_FAMILY (default: wristcam, matching the legacy primary).
+  #
+  # Correctness invariants preserved from the legacy script (do NOT tidy):
+  #   - seed set = eval_seeds_60_dp.txt (the 10000-10029 + 1000-1029 x-bucket set;
+  #     legacy default DEFAULT_SEEDS_LIST is exactly this set, ':'-delimited)
+  #   - max_steps=250 (legacy default, NOT 400)
+  #   - dp_backend=gpu (legacy SIM_BACKEND default), include_global=true, 224x224
+  #   - wandb project=2SC-DP and a fixed --wandb-name carried via extra_argv
+  #     (the DP argv builders do not emit --wandb-project/--wandb-name).
+  # ---------------------------------------------------------------------------
+  2sc_dp_decent_wristcam:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 300
+      suffix: wristcam_decent
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube.yaml
+      camera_family: wristcam
+      num_arms: 2
+      obs_cam_family: wristcam
+      include_global: true
+      img_height: 224
+      img_width: 224
+      max_steps: 250
+      dp_backend: gpu
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    extra_argv:
+      - "--wandb-project=2SC-DP"
+      - "--wandb-name=Eval 2SC WC DP Decent "
+    wandb:
+      project: 2SC-DP
+      tags: [eval, 2sc, decent, wristcam, encoder-in1k, wristcam_decent, seedfix-v1, max250, sim-gpu, with_global_true]
+    sbatch:
+      job_name: eval_dp_2sc_decent
+      time: "05:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      partition: iris
+      output: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.err
+
+  2sc_dp_decent_workspace:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 300
+      suffix: workspace_decent
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube.yaml
+      camera_family: workspace
+      num_arms: 2
+      obs_cam_family: workspace
+      include_global: true
+      img_height: 224
+      img_width: 224
+      max_steps: 250
+      dp_backend: gpu
+      robot_uids_csv: panda,panda
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      delim: " "
+    extra_argv:
+      - "--wandb-project=2SC-DP"
+      - "--wandb-name=Eval 2SC WS DP Decent "
+    wandb:
+      project: 2SC-DP
+      tags: [eval, 2sc, decent, workspace, encoder-in1k, workspace_decent, seedfix-v1, max250, sim-gpu, with_global_true]
+    sbatch:
+      job_name: eval_dp_2sc_decent
+      time: "05:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      partition: iris
+      output: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # dp_decent_multi — LongPipelineDelivery (LP) 1-demo overfit eval.
+  #
+  # Migrated from eval_dp_lp_overfit.sh. 4-arm task; evaluates the maxfit
+  # overfit ckpt at the training seed (=14) with 3 stochastic-DDPM retries.
+  #
+  # Correctness invariants (do NOT tidy):
+  #   - seeds = "14 14 14" (3 repeats of the training seed). A dedicated seed
+  #     file /iris/u/mikulrai/runs/eval_seeds_lp_overfit_s14x3.txt holds exactly
+  #     these 3 lines so the dispatcher's seed-hash + argv-drift preflight passes
+  #     (the legacy script had NO preflight — this is a stricter add, harmless).
+  #   - checkpoint_num=200 (legacy default), max_steps=900, suffix=workspace_overfit1_maxfit
+  #   - 4 arms all panda_wristcam_multi, include_global, 224x224, -b gpu
+  #   - wandb project=LP-DP + fixed --wandb-name via extra_argv.
+  # NOTE: the legacy script is CAM_FAMILY/CKPT_SUFFIX/CHECKPOINT_NUM/SEED/N_RETRIES
+  # parameterized; this launcher fixes the documented DEFAULTS (workspace, 200,
+  # seed 14, 3 retries). The `--skip-collapse-probe` knob (SKIP_PROBE) defaults
+  # off in the legacy, so it is not emitted here.
+  # ---------------------------------------------------------------------------
+  lp_dp_overfit1_maxfit:
+    policy_type: dp_decent_multi
+    ckpt:
+      data_num: 150
+      checkpoint_num: 200
+      suffix: workspace_overfit1_maxfit
+    task:
+      env_id: LongPipelineDelivery-rf
+      scene_config: configs/table/long_pipeline_delivery.yaml
+      camera_family: workspace
+      num_arms: 4
+      obs_cam_family: workspace
+      include_global: true
+      img_height: 224
+      img_width: 224
+      max_steps: 900
+      dp_backend: gpu
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_lp_overfit_s14x3.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_lp_overfit_s14x3.sha256
+      delim: " "
+    extra_argv:
+      - "--wandb-project=LP-DP"
+      - "--wandb-name=Eval LP WS DP Overfit1 Maxfit ckpt200 s14x3"
+    wandb:
+      project: LP-DP
+      tags: [eval, lp, decent, workspace, overfit1, maxfit, seed14, ckpt200]
+    sbatch:
+      job_name: eval_lp_overfit
+      time: "03:00:00"
+      gres: "gpu:1"
+      cpus_per_task: 8
+      mem: "64G"
+      output: /iris/u/mikulrai/logs/eval_lp_overfit/eval_lp_%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_lp_overfit/eval_lp_%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # pi05_decent — 2SC wristcam decentralised Pi0.5 eval (2 servers, 2 GPUs).
+  #
+  # Migrated from eval_pi05_2sc_wc_decent_60seeds.sh. Two per-arm LoRA servers
+  # (step 19999) on ports 8000/8001, routed by eval_decent_pi05.py. TABLE scene.
+  #
+  # Correctness invariants (do NOT tidy):
+  #   - seed set = eval_seeds_60.txt (100-159), comma-delim for the pi05 driver.
+  #   - num_arms=2; both arms panda_wristcam_multi; wristcam camera mapping json.
+  #   - xla_mem_fraction=0.30 (legacy XLA_PYTHON_CLIENT_MEM_FRACTION).
+  #   - replan_after=8, max_env_steps=400.
+  #   - prompt = "stack the two cubes in collaboration with other robot arm".
+  # ---------------------------------------------------------------------------
+  2sc_pi05_wc_decent:
+    policy_type: pi05_decent
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm0/pi05_2sc_wc_decent_a0/19999
+      train_config: pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm0/pi05_2sc_wc_decent_a0/19999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 400
+      replan_after: 8
+    # The pi05_decent argv builder does not emit --prompt; the legacy 2SC WC
+    # script passed one, so carry it verbatim via extra_argv.
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes in collaboration with other robot arm"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
+      delim: ","
+    server:
+      ports: [8000, 8001]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm0
+        - pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm0/pi05_2sc_wc_decent_a0/19999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_decent_wristcam_lora_finetune_arm1/pi05_2sc_wc_decent_a1/19999
+    wandb:
+      project: openpi-robofactory
+      tags: [eval, pi05, decent, 2sc, wristcam, table-scene, first-eval]
+    sbatch:
+      job_name: pi05_2sc_wc_dec_60s
+      time: "06:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "64G"
+      partition: orion
+      output: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.err

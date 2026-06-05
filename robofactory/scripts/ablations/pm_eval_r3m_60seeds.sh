@@ -15,7 +15,7 @@ export HOME=/iris/u/mikulrai
 [ -L "$HOME/.r3m" ] || ln -sfn /iris/u/mikulrai/.cache/r3m "$HOME/.r3m"
 
 export CUDA_VISIBLE_DEVICES=0
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:-$(cat /iris/u/mikulrai/.wandb_api_key 2>/dev/null)}"
 export HYDRA_FULL_ERROR=1
 
 cd /iris/u/mikulrai/projects/RoboFactory/robofactory

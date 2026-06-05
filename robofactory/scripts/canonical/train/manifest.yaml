@@ -1,0 +1,375 @@
+# =============================================================================
+# DP-train-launcher manifest. One entry per (zarr × task × encoder × training)
+# launcher. DP-ONLY (Pi0.5 training lives in openpi).
+#
+# Grouped by family for diff-readability:
+#   pm_*   PickMeat single-arm encoder ablations (robot_dp)
+#   tsc_d2_*  ThreeRobotsStackCube d2 wristcam decentralised per-arm (robot_dp)
+#   resume_tsc_d2_*  explicit-load resumes of the above from epoch 285
+#
+# Run `python -m robofactory.scripts.canonical.train.manifest_schema
+# scripts/canonical/train/manifest.yaml` to validate the schema.
+#
+# NOTE on exp_name / logging.* in extra_overrides: train.py reads these for
+# wandb. They are static (no $(date)/uuid), so they live verbatim in
+# extra_overrides and are reproduced exactly. The parity harness masks them.
+# =============================================================================
+
+launchers:
+
+  # ---------------------------------------------------------------------------
+  # pm — PickMeat single-arm encoder ablations (canonical retrain_dp_pm_d1_ep300_*)
+  # zarr stem = PickMeat-rf_150 (shared dir); crop variant uses its own alias.
+  # ---------------------------------------------------------------------------
+  pm_d1_ep300_in1k:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr
+    ckpt_alias: PickMeat-rf_150_in1k
+    preflight:
+      cheap: {enabled: true, task_config: default_task, scene_config: configs/table/pick_meat.yaml, agent_id: 0}
+      heavy: {gated: true, needs_overfit: true, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-in1k, encoder-fix, imagenet-pretrained]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-in1k
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-in1k,encoder-fix,imagenet-pretrained]
+    sbatch:
+      job_name: pm_retrain_in1k
+      partition: iris-hi
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a40:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_%j.err
+
+  pm_d1_ep300_in1k_crop:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: resnet18_in1k, crop_shape: [216, 288]}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150_in1k_crop.zarr
+    preflight:
+      cheap: {enabled: false, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-in1k-crop, track-b, crop-on-imagenet, encoder-fix]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-in1k-crop
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-in1k-crop,track-b,crop-on-imagenet,encoder-fix]
+    sbatch:
+      job_name: pm_retrain_in1k_crop
+      partition: iris
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      mail_type: null
+      mail_user: null
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_crop_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_in1k_crop_%j.err
+
+  pm_d1_ep300_crop:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: resnet18_scratch, crop_shape: [216, 288]}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr
+    ckpt_alias: PickMeat-rf_150_scratch_crop
+    preflight:
+      cheap: {enabled: false, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-crop, track-b, crop-ablation, random-init]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-crop
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-crop,track-b,crop-ablation,random-init]
+    sbatch:
+      job_name: pm_retrain_crop
+      partition: iris-hi
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a40:1"
+      mem: "96G"
+      mail_type: null
+      mail_user: null
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_crop_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_crop_%j.err
+
+  pm_d1_ep300_r3m:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: resnet18_r3m}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr
+    ckpt_alias: PickMeat-rf_150_r3m
+    preflight:
+      cheap: {enabled: false, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-r3m, encoder-fix, r3m-pretrained]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-r3m
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-r3m,encoder-fix,r3m-pretrained]
+    sbatch:
+      job_name: pm_retrain_r3m
+      partition: iris-hi
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a40:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_r3m_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_r3m_%j.err
+
+  pm_d1_ep300_dinov2_blora:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: dinov2_lora, resize_shape: [224, 224], use_group_norm: false}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr
+    ckpt_alias: PickMeat-rf_150_dinob
+    preflight:
+      cheap: {enabled: false, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-dino-blora, track-b, dinov2-vitb14, lora, frozen-backbone]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-dino-blora
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-dino-blora,track-b,dinov2-vitb14,lora,frozen-backbone]
+    sbatch:
+      job_name: pm_retrain_dino_blora
+      partition: iris-hi
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a40:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_dino_blora_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_dino_blora_%j.err
+
+  pm_d1_ep300_dinov2_spatch:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task, env_name: PickMeat-rf, num_arms: 1, cam_family: workspace}
+    encoder: {family: dinov2_patchattn, resize_shape: [224, 224], use_group_norm: false}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr
+    ckpt_alias: PickMeat-rf_150_dinos
+    preflight:
+      cheap: {enabled: false, scene_config: configs/table/pick_meat.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d1_encoder_fix, tags: [robot_dp, default_task, pm-d1-ep300-dino-spatch, track-b, dinov2-vits14, patch-attn, perceiver]}
+    extra_overrides:
+      - exp_name=pm-d1-ep300-dino-spatch
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d1_encoder_fix
+      - logging.tags=[robot_dp,default_task,pm-d1-ep300-dino-spatch,track-b,dinov2-vits14,patch-attn,perceiver]
+    sbatch:
+      job_name: pm_retrain_dino_spatch
+      partition: iris-hi
+      account: iris
+      time: "24:00:00"
+      gres: "gpu:a40:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_dino_spatch_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/pm_retrain_dino_spatch_%j.err
+
+  # ---------------------------------------------------------------------------
+  # tsc d2 wristcam decentralised per-arm (retrain_dp_tsc_d2_ep300_in1k_a{0,1,2})
+  # ---------------------------------------------------------------------------
+  tsc_d2_ep300_in1k_a0:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 0}
+      heavy: {gated: true, needs_overfit: true, scene_config: configs/table/three_robots_stack_cube.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a0, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a0
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a0,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam]
+    sbatch:
+      job_name: tsc_d2_in1k_a0
+      partition: orion
+      account: orion
+      nice: 10000
+      requeue: true
+      time: "24:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a0_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a0_%j.err
+
+  tsc_d2_ep300_in1k_a1:
+    agent_mode: robot
+    arm_id: 1
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent1_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 1}
+      heavy: {gated: true, needs_overfit: true, scene_config: configs/table/three_robots_stack_cube.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a1, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a1
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a1,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam]
+    sbatch:
+      job_name: tsc_d2_in1k_a1
+      partition: orion
+      account: orion
+      nice: 10000
+      requeue: true
+      time: "24:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a1_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a1_%j.err
+
+  tsc_d2_ep300_in1k_a2:
+    agent_mode: robot
+    arm_id: 2
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {auto: false}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 2}
+      heavy: {gated: true, needs_overfit: true, scene_config: configs/table/three_robots_stack_cube.yaml}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a2, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a2
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a2,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam]
+    sbatch:
+      job_name: tsc_d2_in1k_a2
+      partition: orion
+      account: orion
+      nice: 10000
+      requeue: true
+      time: "24:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a2_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/tsc_d2_in1k_a2_%j.err
+
+  # ---------------------------------------------------------------------------
+  # resume_tsc_d2 — explicit-load resumes from epoch 285
+  # (resume_dp_tsc_d2_in1k_a{0,1,2}_from285)
+  # ---------------------------------------------------------------------------
+  resume_tsc_d2_in1k_a0_from285:
+    agent_mode: robot
+    arm_id: 0
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {from_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150/285.ckpt}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 0}
+      heavy: {gated: true, scene_config: configs/table/three_robots_stack_cube.yaml, baseline_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent0_d2_wristcam_150/285.ckpt}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a0, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam, resume-of-dn5uqhrs]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a0
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a0,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam,resume-of-dn5uqhrs]
+    sbatch:
+      job_name: resume_tsc_d2_in1k_a0
+      partition: iris
+      account: iris
+      time: "06:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a0_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a0_%j.err
+
+  resume_tsc_d2_in1k_a1_from285:
+    agent_mode: robot
+    arm_id: 1
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {from_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent1_d2_wristcam_150/285.ckpt}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent1_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 1}
+      heavy: {gated: true, scene_config: configs/table/three_robots_stack_cube.yaml, baseline_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent1_d2_wristcam_150/285.ckpt}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a1, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam, resume-of-d27z1or5]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a1
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a1,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam,resume-of-d27z1or5]
+    sbatch:
+      job_name: resume_tsc_d2_in1k_a1
+      partition: iris
+      account: iris
+      time: "06:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a1_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a1_%j.err
+
+  resume_tsc_d2_in1k_a2_from285:
+    agent_mode: robot
+    arm_id: 2
+    task: {task_config: default_task_wristcam, env_name: ThreeRobotsStackCube-rf, num_arms: 3, cam_family: wristcam}
+    encoder: {family: resnet18_in1k}
+    training: {num_epochs: 300, max_train_episodes: 150, rollout_every: 10000, seed: 100, batch_size: 64}
+    resume: {from_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150/285.ckpt}
+    zarr_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150.zarr
+    preflight:
+      cheap: {enabled: true, task_config: default_task_wristcam, scene_config: configs/table/three_robots_stack_cube.yaml, agent_id: 2}
+      heavy: {gated: true, scene_config: configs/table/three_robots_stack_cube.yaml, baseline_ckpt: /iris/u/mikulrai/checkpoints/RoboFactory/ThreeRobotsStackCube-rf_agent2_d2_wristcam_150/285.ckpt}
+    wandb: {project: diffusion-robofactory, group: dp_d2_tsc_encoder_fix, tags: [robot_dp, default_task_wristcam, tsc-d2-ep300-in1k-a2, encoder-fix, imagenet-pretrained, decentralised, d2-wristcam, resume-of-gz1g5q1o]}
+    extra_overrides:
+      - exp_name=tsc-d2-ep300-in1k-a2
+      - logging.mode=online
+      - logging.project=diffusion-robofactory
+      - logging.group=dp_d2_tsc_encoder_fix
+      - logging.tags=[robot_dp,default_task_wristcam,tsc-d2-ep300-in1k-a2,encoder-fix,imagenet-pretrained,decentralised,d2-wristcam,resume-of-gz1g5q1o]
+    sbatch:
+      job_name: resume_tsc_d2_in1k_a2
+      partition: iris
+      account: iris
+      time: "06:00:00"
+      gres: "gpu:a6000:1"
+      mem: "96G"
+      output: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a2_%j.out
+      error: /iris/u/mikulrai/logs/phase2_debug/resume_tsc_d2_in1k_a2_%j.err

@@ -1,4 +1,5 @@
 #!/bin/bash
+# // not migrated: env-var-driven zarr aliasing + one-off optimizer.lr/weight_decay/ema.max_value/lr_warmup_steps/use_bf16/compile maxfit knobs; runtime-templated
 #SBATCH --job-name=lp_overfit_maxfit
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
