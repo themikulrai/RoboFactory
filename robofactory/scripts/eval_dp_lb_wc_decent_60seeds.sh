@@ -66,6 +66,8 @@ SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
     --img-width 224 \
     --max-steps 150 \
     --shader default \
+    --quiet \
+    --skip-collapse-probe \
     --video-dir "$VIDEO_DIR" \
     --jsonl-path "${OUT_DIR}/lb_wc_decent_ckpt300_60seeds_${SLURM_JOB_ID}.jsonl" \
     --wandb \
