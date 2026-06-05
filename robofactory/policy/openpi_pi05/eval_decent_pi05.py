@@ -46,7 +46,41 @@ DEFAULT_CAMERA_MAPPING = {
     "right_wrist_0_rgb_raw": "hand_camera_1",
     "extra_0_rgb_raw": "hand_camera_2",
 }
-IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
+# Default (wc/centralised) image slots. NOTE: these are NOT hardcoded into the obs
+# construction anymore — the actual slots are driven by the --camera-mapping JSON keys
+# (see _resolve_camera_mapping). This tuple is only the fallback used when no
+# --camera-mapping is passed (i.e. DEFAULT_CAMERA_MAPPING above). The 5-camera "union"
+# model uses different raw keys (global_rgb, wrist0_rgb, wrist1_rgb, head0_rgb, head1_rgb)
+# that the server's RoboFactoryDecentUnionInputs reads verbatim, so its mapping JSON
+# carries those 5 keys and they flow straight through to the obs dict.
+DEFAULT_IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
+
+# One-shot guard for the SAPIEN shader_pack regression. Data-gen uses
+# shader_pack="default" (gray clear). ManiSkill default is "minimal" (pure
+# black clear), which leaves the upper rows of head_camera_global pitch black
+# above the table geometry and silently desyncs eval from training. We check
+# the upper sixth of the global cam on the very first frame; if it's almost
+# entirely black warn loudly. See memory/feedback_sapien_shader_pack_eval_mismatch.md.
+_SHADER_BG_CHECK_DONE = False
+
+def _shader_bg_guard(global_img: np.ndarray) -> None:
+    global _SHADER_BG_CHECK_DONE
+    if _SHADER_BG_CHECK_DONE:
+        return
+    _SHADER_BG_CHECK_DONE = True
+    if global_img is None or global_img.ndim < 3:
+        return
+    upper = global_img[: max(1, global_img.shape[0] // 6)]
+    near_black_frac = float((upper.sum(axis=-1) < 6).mean())
+    if near_black_frac > 0.9:
+        import warnings as _w
+        _w.warn(
+            f"[shader_pack guard] head_camera_global upper region is {100*near_black_frac:.0f}% near-black. "
+            "This is the SAPIEN shader_pack=minimal symptom. Pass "
+            "sensor_configs=dict(shader_pack=\"default\") to gym.make to match data-gen. "
+            "See ~/.claude/projects/-iris-u-mikulrai/memory/feedback_sapien_shader_pack_eval_mismatch.md",
+            stacklevel=2,
+        )
 
 
 @dataclasses.dataclass
@@ -74,6 +108,7 @@ class Args:
     wandb: bool = False
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,decent"
+    wandb_name: str = ""  # override default name "eval_decent_{task}_run{run_id}" if set
     video_max: int = 3
     video_all: bool = False
 
@@ -106,12 +141,15 @@ def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, st
         "state": _build_state(obs, num_arms, robot_uid),
         "prompt": prompt,
     }
-    # Mirrors training-side RoboFactoryDecentInputs: slots whose mapping is None are
-    # zero-filled to match the masked input the model saw during fit. Required for
-    # 2-arm configs (extra_0_rgb_raw = null in two_robots_stack_cube_wristcam.json).
+    # The image-slot keys are driven ENTIRELY by the camera-mapping JSON keys (cam_map),
+    # NOT a hardcoded constant. This lets the same eval client drive any per-arm server
+    # whose input transform reads its own raw image keys directly from the obs dict:
+    #   - wc/centralised: base_0_rgb_raw, left_wrist_0_rgb_raw, right_wrist_0_rgb_raw, extra_0_rgb_raw
+    #   - 5-cam union:    global_rgb, wrist0_rgb, wrist1_rgb, head0_rgb, head1_rgb
+    # Slots mapped to null are zero-filled to match the masked input the model saw during
+    # fit (e.g. extra_0_rgb_raw=null for 2-arm wc configs).
     ref_shape: tuple[int, int, int] | None = None
-    for slot in IMAGE_SLOTS:
-        cam_name = cam_map.get(slot)
+    for slot, cam_name in cam_map.items():
         if cam_name is not None:
             img = _extract_image(obs, cam_name)
             out[slot] = img
@@ -119,7 +157,7 @@ def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, st
                 ref_shape = img.shape  # type: ignore[assignment]
     if ref_shape is None:
         ref_shape = (224, 224, 3)
-    for slot in IMAGE_SLOTS:
+    for slot in cam_map:
         if slot not in out:
             out[slot] = np.zeros(ref_shape, dtype=np.uint8)
     return out
@@ -154,13 +192,17 @@ def _video_filename(task: str, run_id: str, seed_base: int, ep_i: int) -> str:
 
 
 def _resolve_camera_mapping(path: str) -> dict[str, str]:
+    """Load the camera-mapping JSON. The JSON keys ARE the obs-dict image-slot keys
+    (verbatim — no suffix appended) that the policy server's input transform reads.
+    Values are the SAPIEN sensor names (or null to zero-fill that slot). Supports any
+    number/names of cameras; the caller must ensure the keys match what the target
+    server's input transform expects (wc *_raw keys vs union non-_raw keys)."""
     if not path:
         return dict(DEFAULT_CAMERA_MAPPING)
     mapping = json.loads(Path(path).read_text())
-    missing = set(IMAGE_SLOTS) - set(mapping.keys())
-    if missing:
-        raise ValueError(f"camera_mapping missing slots: {missing}")
-    return {slot: mapping[slot] for slot in IMAGE_SLOTS}
+    if not mapping:
+        raise ValueError(f"camera_mapping {path!r} is empty")
+    return dict(mapping)
 
 
 def _cube_xyz(env, name: str) -> list[float]:
@@ -185,16 +227,36 @@ def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix
     return out
 
 
+def _resolve_global_cam(cam_map: dict[str, str]) -> str:
+    """SAPIEN sensor name to use for the shader-pack guard and video recording.
+    Independent of slot-key naming: prefer the global head cam, else the slot keyed
+    'base_0_rgb_raw' or 'global_rgb', else the first non-null mapped camera."""
+    for cam in cam_map.values():
+        if cam == "head_camera_global":
+            return cam
+    for key in ("base_0_rgb_raw", "global_rgb"):
+        if cam_map.get(key):
+            return cam_map[key]
+    for cam in cam_map.values():
+        if cam is not None:
+            return cam
+    return "head_camera_global"
+
+
 def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: int, action_prefix: str, video_path: str = "") -> dict:
     """Run one episode with 3 per-arm policy servers."""
     obs, _ = env.reset(seed=seed)
+    global_cam = _resolve_global_cam(cam_map)
+    try:
+        _shader_bg_guard(_extract_image(obs, global_cam))
+    except Exception:
+        pass
     success = False
     t0 = time.time()
 
     chunks: list[np.ndarray | None] = [None] * args.num_arms
     chunk_idxs: list[int] = [args.replan_after] * args.num_arms
     video_frames: list[np.ndarray] = []
-    global_cam = cam_map["base_0_rgb_raw"]
 
     traj_fp = None
     if args.trajectory_log_path:
@@ -291,6 +353,15 @@ def main(args: Args) -> None:
         render_mode="rgb_array",
         num_envs=1,
         sim_backend=args.sim_backend,
+        # CRITICAL: must match data-gen (robofactory.planner.run uses shader_pack="default").
+        # ManiSkill default is shader_pack="minimal", which produces a pure-black framebuffer
+        # clear -> the upper portion of head_camera_global (above the table geometry) renders
+        # black, while training H5 frames have the "default" shader's gray clear. Without
+        # this kwarg the eval base_0_rgb diverges from the training distribution by RMSE 0.53
+        # in [-1,1] space. See memory/feedback_sapien_shader_pack_eval_mismatch.md.
+        sensor_configs=dict(shader_pack="default"),
+        human_render_camera_configs=dict(shader_pack="default"),
+        viewer_camera_configs=dict(shader_pack="default"),
     )
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
@@ -311,7 +382,7 @@ def main(args: Args) -> None:
         enabled=args.wandb,
         project=args.wandb_project,
         job_type="eval",
-        name=f"eval_decent_{args.task}_run{run_id}",
+        name=(args.wandb_name or f"eval_decent_{args.task}_run{run_id}"),
         tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
         config=dataclasses.asdict(args),
     ) as wandb_run, VideoRecorder(
@@ -325,18 +396,19 @@ def main(args: Args) -> None:
             _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
             _ref_shape = (224, 224, 3)
             _state_dim = args.num_arms * 8
+            _probe_slots = tuple(cam_map.keys())
             def _build_obs_for_probe(img_chw, qpos):
                 state = np.resize(np.asarray(qpos, dtype=np.float32), _state_dim).astype(np.float32)
                 hwc_u8 = (np.clip(np.moveaxis(img_chw, 0, -1), 0, 1) * 255.0).astype(np.uint8)
                 out = {"state": state, "prompt": args.prompt}
-                for slot in IMAGE_SLOTS:
+                for slot in _probe_slots:
                     out[slot] = hwc_u8
                 return out
             for _i, _p in enumerate(policies):
                 _rep = probe_collapse_pi05_loaded_policy(
                     _p, _calib,
                     build_obs_dict=_build_obs_for_probe,
-                    image_slots=IMAGE_SLOTS, proprio_key="state", max_episodes=8,
+                    image_slots=_probe_slots, proprio_key="state", max_episodes=8,
                 )
                 wandb_run.log_raw(_rep.to_wandb_payload(prefix=f"collapse/arm{_i}"))
                 _r = _rep.image_to_baseline_ratio
