@@ -44,6 +44,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
+from policy._shared.multiview_video import tile_views, ordered_unique, subsample  # noqa: E402
 
 
 DEFAULT_PROMPT = "stack the three cubes using three robot arms"
@@ -72,7 +73,8 @@ class Args:
     prompt: str = DEFAULT_PROMPT
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05"
-    video_dir: str = ""  # if set, save mp4 per episode (global cam)
+    video_dir: str = ""  # output dir for per-episode mp4s (tiled multi-view); "" => <out_dir>/videos
+    video_frame_stride: int = 2  # subsample recorded frames before writing mp4; 1 = every frame
     run_id: str = ""  # disambiguates videos across runs; "" => $SLURM_JOB_ID or unix-ts
     num_envs: int = 1  # >1 = vectorize; one batch of size num_envs runs in lockstep
     num_arms: int = 3
@@ -289,7 +291,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
     chunk_idx: int = 10**9
     chunk: np.ndarray | None = None
     video_frames: list[np.ndarray] = []
-    global_cam = cam_map["base_0_rgb_raw"]
+    view_sensors = ordered_unique(list(cam_map.values()))
 
     # ---- trajectory logging (only when num_envs == 1) ----
     traj_fp = None
@@ -299,8 +301,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
 
     try:
         for step in range(args.max_env_steps):
-            if video_path:
-                video_frames.append(_extract_image(obs, global_cam))
+            video_frames.append(tile_views([_extract_image(obs, s) for s in view_sensors]))
             replanned = False
             if chunk is None or chunk_idx >= args.replan_after:
                 obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, args.state_pad_to)
@@ -351,7 +352,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
             traj_fp.close()
 
     if video_path and video_frames:
-        _write_mp4(video_path, video_frames)
+        _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
 
     return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
 
@@ -392,15 +393,13 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
     done = [False] * n
     successes = [False] * n
     steps = [0] * n
-    global_cam = cam_map["base_0_rgb_raw"]
+    view_sensors = ordered_unique(list(cam_map.values()))
     video_frames: list[list[np.ndarray]] = [[] for _ in range(n)]
-    record_video = bool(video_dir)
 
     for step in range(args.max_env_steps):
-        if record_video:
-            for i in range(n):
-                if not done[i]:
-                    video_frames[i].append(_extract_image_at(obs, global_cam, i))
+        for i in range(n):
+            if not done[i]:
+                video_frames[i].append(tile_views([_extract_image_at(obs, s, i) for s in view_sensors]))
 
         for i in range(n):
             if done[i]:
@@ -443,10 +442,10 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
     run_id = _resolve_run_id(args.run_id)
     results = []
     for i, sd in enumerate(seeds):
-        if record_video and video_frames[i]:
+        if video_frames[i]:
             seed_base, ep_i = divmod(int(sd), 100_000)
             vp = str(Path(video_dir) / _video_filename(args.task, run_id, seed_base, ep_i))
-            _write_mp4(vp, video_frames[i])
+            _write_mp4(vp, subsample(video_frames[i], args.video_frame_stride))
         results.append({"seed": int(sd), "success": successes[i], "steps": steps[i] or args.max_env_steps, "wall_s": time.time() - t0})
     return results
 
@@ -454,6 +453,9 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
 def main(args: Args) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Always-on recording: --video-dir only chooses location; default to <out_dir>/videos.
+    if not args.video_dir:
+        args.video_dir = str(out_dir / "videos")
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     cam_map = _resolve_camera_mapping(args.camera_mapping)
@@ -506,7 +508,7 @@ def main(args: Args) -> None:
         tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
         config=dataclasses.asdict(args),
     ) as wandb_run, VideoRecorder(
-        args.video_dir, max_recorded=args.video_max, all_seeds=args.video_all,
+        args.video_dir, max_recorded=10**9, all_seeds=True,
     ) as videos:
         # S1 collapse probe (metric-only; never blocks eval). Opaque server
         # path: feature_rank/var unavailable, only MSE ratios are logged.
@@ -572,10 +574,8 @@ def main(args: Args) -> None:
             for seed_idx, seed in enumerate(seeds):
                 for ep_i in range(args.num_episodes):
                     ep_seed = seed * 100_000 + ep_i
-                    if (args.video_all or seed_idx < args.video_max) and args.video_dir:
-                        video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
-                    else:
-                        video_path = ""
+                    # Always record every episode (args.video_dir defaulted in main()).
+                    video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
                     try:
                         r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path, is_dict_action=is_dict_action)
                     except Exception as e:  # noqa: BLE001

@@ -122,11 +122,19 @@ class Args:
     img_width: int = 224
     """Width to resize camera frames before feeding to the policy. Dataset 1 (default_task.yaml) uses 320; Dataset 2 (wristcam) uses 224."""
 
-    video_max: int = 15
-    """Number of seeds to record video for (first N). Default capped at 15 to keep disk under control."""
+    video_dir: Optional[str] = None
+    """Directory to save tiled multi-view eval videos. Recording is ALWAYS on (every seed).
+    If None, defaults to <record_root>/videos. Use this only to CHOOSE the location."""
+
+    video_frame_stride: int = 2
+    """Subsample factor applied to recorded frames before writing the mp4 (frames[::stride],
+    last frame always kept). Default 2 halves file size; set to 1 to keep every frame."""
+
+    video_max: int = 3
+    """DEPRECATED/ignored: recording is now always-on for every seed. Kept for launcher compat."""
 
     video_all: bool = False
-    """If true, record video for every seed (overrides --video-max)."""
+    """DEPRECATED/ignored: every seed always records. Kept so --video-all still parses."""
 
     gripper_snap: bool = False
     """Diagnostic: snap predicted gripper command (dim 7) to sign() so DP's MSE-averaged soft values become hard {-1, +1}. Tests whether mode-averaging on the near-binary gripper signal is the eval-failure root cause."""
@@ -193,10 +201,45 @@ def _rgb_chw(rgb_tensor, img_h: int = 224, img_w: int = 224):
     return np.moveaxis(arr, -1, 0).astype(np.float32) / 255.0
 
 
+from policy._shared.multiview_video import tile_views, ordered_unique, subsample
+
+
 _CAM_TPL = {"workspace": "head_camera_agent{i}", "wristcam": "hand_camera_{i}"}
 
 
 _SINGLE_AGENT_CAM_FALLBACK = {"workspace": "head_camera", "wristcam": "hand_camera"}
+
+
+def derive_view_sensors(observation, agent_num, include_global: bool, cam_family: str):
+    """Ordered, deduped list of sensor names the policy actually receives as image input.
+
+    Mirrors get_model_input()'s key resolution exactly: per-agent head_cam for each
+    agent (with single-agent suffix fallback), then head_camera_global if include_global
+    (with head_camera fallback). This is the UNION of cameras the robots collectively saw.
+    """
+    sd = observation['sensor_data']
+    names = []
+    for agent_id in range(agent_num):
+        per_agent_key = _CAM_TPL[cam_family].format(i=agent_id)
+        if per_agent_key not in sd:
+            sa_fallback = _SINGLE_AGENT_CAM_FALLBACK.get(cam_family)
+            if sa_fallback and sa_fallback in sd:
+                per_agent_key = sa_fallback
+        names.append(per_agent_key)
+    if include_global:
+        if 'head_camera_global' in sd:
+            names.append('head_camera_global')
+        elif 'head_camera' in sd:
+            names.append('head_camera')
+    return ordered_unique(names)
+
+
+def _extract_view_uint8(observation, sensor_name):
+    """Pull sensor_name's RGB from obs as an HWC uint8 numpy frame (env idx 0)."""
+    frame = observation['sensor_data'][sensor_name]['rgb'][0]
+    if hasattr(frame, 'cpu'):
+        frame = frame.cpu().numpy()
+    return np.asarray(frame).astype(np.uint8)
 
 
 def get_model_input(observation, agent_pos, agent_id, include_global: bool = True, cam_family: str = "workspace", img_h: int = 224, img_w: int = 224):
@@ -227,7 +270,7 @@ def get_model_input(observation, agent_pos, agent_id, include_global: bool = Tru
         out['head_cam_global'] = _rgb_chw(sd[global_key]['rgb'], img_h=img_h, img_w=img_w)
     return out
 
-def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix='panda', action_prefix='panda', video_path: str = None):
+def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix='panda', action_prefix='panda', video_path: str = None, view_sensors=None):
     """Run one episode. Returns dict(success, steps, wallclock_s, infer_ms_per_arm, vram_peak_mb)."""
     import time as _t
     torch.cuda.reset_peak_memory_stats()
@@ -315,12 +358,9 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
                     now_step = min(j, action_step_dict[f'{action_prefix}-{id}'][i] - 1)
                     true_action[f'{action_prefix}-{id}'] = action_dict[f'{action_prefix}-{id}'][start_idx[id] + now_step]
                 observation, reward, terminated, truncated, info = env.step(true_action)
-                if video_path is not None:
-                    _gframe = observation['sensor_data'].get('head_camera_global', {}).get('rgb')
-                    if _gframe is not None:
-                        _f = _gframe[0]
-                        if hasattr(_f, 'cpu'): _f = _f.cpu().numpy()
-                        _video_frames.append(_f.astype(np.uint8))
+                if video_path is not None and view_sensors:
+                    _tiled = tile_views([_extract_view_uint8(observation, s) for s in view_sensors])
+                    _video_frames.append(_tiled)
                 if verbose:
                     env.render_human()
             if verbose:
@@ -346,6 +386,7 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
             break
 
     if video_path is not None and _video_frames:
+        _video_frames = subsample(_video_frames, args.video_frame_stride)
         os.makedirs(os.path.dirname(video_path), exist_ok=True)
         h, w = _video_frames[0].shape[:2]
         vw = _cv2.VideoWriter(video_path, _cv2.VideoWriter_fourcc(*'mp4v'), 20, (w, h))
@@ -439,6 +480,15 @@ def main(args: Args):
     action_prefix = list(env.action_space.spaces.keys())[0].rsplit('-', 1)[0]
     print(f"agent_prefix='{agent_prefix}' action_prefix='{action_prefix}'", flush=True)
 
+    # Derive the ordered, deduped list of cameras the policy actually sees (= union of
+    # per-agent head_cams across agents + head_camera_global if include_global). Recorded
+    # videos tile exactly these views. raw_obs is the post-reset obs from above.
+    view_sensors = derive_view_sensors(raw_obs, agent_num, args.include_global, args.obs_cam_family)
+    print(f"[eval_multi_dp] tiled video view_sensors={view_sensors}", flush=True)
+
+    # ALWAYS record every seed. Default the video dir to a real path under record_root.
+    video_dir = args.video_dir or os.path.join(record_root, 'videos')
+
     # Provenance + sinks
     try:
         git_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/iris/u/mikulrai/projects/RoboFactory').decode().strip()
@@ -456,6 +506,8 @@ def main(args: Args):
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
         git_sha=git_sha, host=socket.gethostname(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
+        view_sensors=view_sensors, video_dir=video_dir,
+        video_frame_stride=args.video_frame_stride,
     )
     with open(jsonl_path, 'w') as f:
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
@@ -472,7 +524,7 @@ def main(args: Args):
         tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
         config=manifest,
     ) as wandb_run, VideoRecorder(
-        record_root, max_recorded=args.video_max, all_seeds=args.video_all,
+        video_dir, all_seeds=True,
     ) as videos:
         # S1 collapse probe (metric-only; never blocks eval). Probe each
         # per-arm policy under namespaces collapse/arm{i}/*.
@@ -497,8 +549,8 @@ def main(args: Args):
         # Seed loop (reuses env + policies)
         results = []
         for idx, seed in enumerate(seeds):
-            video_path = videos.video_path_for(idx, seed, suffix='_global')
-            metrics = run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix=agent_prefix, action_prefix=action_prefix, video_path=video_path)
+            video_path = videos.video_path_for(idx, seed, suffix='_tiled')
+            metrics = run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix=agent_prefix, action_prefix=action_prefix, video_path=video_path, view_sensors=view_sensors)
             metrics['episode_idx'] = idx
             results.append(metrics)
             with open(jsonl_path, 'a') as f:

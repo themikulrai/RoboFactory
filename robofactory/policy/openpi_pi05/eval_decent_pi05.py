@@ -37,6 +37,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
+from policy._shared.multiview_video import ordered_unique, tile_views, subsample  # noqa: E402
 
 
 DEFAULT_PROMPT = "stack the three cubes using three robot arms"
@@ -98,7 +99,10 @@ class Args:
     prompt: str = DEFAULT_PROMPT
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
-    video_dir: str = ""  # if set, save mp4 per episode (global cam)
+    video_dir: str = ""  # location override; defaults to <out_dir>/videos. Video is ALWAYS recorded.
+    video_frame_stride: int = 2  # subsample recorded frames before writing mp4 (1 = every frame)
+    video_max: int = 3   # DEPRECATED/ignored: recording is now always-on for every seed. Kept for launcher compat.
+    video_all: bool = False  # DEPRECATED/ignored: every seed always records. Kept so --video-all still parses.
     run_id: str = ""  # disambiguates videos across runs; "" => $SLURM_JOB_ID or unix-ts
     num_arms: int = 3
     camera_mapping: str = ""
@@ -109,8 +113,6 @@ class Args:
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,decent"
     wandb_name: str = ""  # override default name "eval_decent_{task}_run{run_id}" if set
-    video_max: int = 3
-    video_all: bool = False
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -227,28 +229,15 @@ def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix
     return out
 
 
-def _resolve_global_cam(cam_map: dict[str, str]) -> str:
-    """SAPIEN sensor name to use for the shader-pack guard and video recording.
-    Independent of slot-key naming: prefer the global head cam, else the slot keyed
-    'base_0_rgb_raw' or 'global_rgb', else the first non-null mapped camera."""
-    for cam in cam_map.values():
-        if cam == "head_camera_global":
-            return cam
-    for key in ("base_0_rgb_raw", "global_rgb"):
-        if cam_map.get(key):
-            return cam_map[key]
-    for cam in cam_map.values():
-        if cam is not None:
-            return cam
-    return "head_camera_global"
+def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_sensors: list[str], seed: int, action_prefix: str, video_path: str) -> dict:
+    """Run one episode with 3 per-arm policy servers.
 
-
-def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: int, action_prefix: str, video_path: str = "") -> dict:
-    """Run one episode with 3 per-arm policy servers."""
+    `view_sensors` is the ordered, deduped union of every per-arm policy's
+    non-masked image inputs (see main()); each recorded frame tiles all of them.
+    """
     obs, _ = env.reset(seed=seed)
-    global_cam = _resolve_global_cam(cam_map)
     try:
-        _shader_bg_guard(_extract_image(obs, global_cam))
+        _shader_bg_guard(_extract_image(obs, view_sensors[0]))
     except Exception:
         pass
     success = False
@@ -265,8 +254,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
 
     try:
         for step in range(args.max_env_steps):
-            if video_path:
-                video_frames.append(_extract_image(obs, global_cam))
+            video_frames.append(tile_views([_extract_image(obs, s) for s in view_sensors]))
             # Replan arms whose chunk is exhausted
             obs_dict = None
             replanned_per_arm = [False] * args.num_arms
@@ -332,7 +320,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], seed: 
             traj_fp.close()
 
     if video_path and video_frames:
-        _write_mp4(video_path, video_frames)
+        _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
 
     return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
 
@@ -345,6 +333,20 @@ def main(args: Args) -> None:
     assert len(ports) == args.num_arms, f"Need {args.num_arms} ports, got {ports}"
 
     cam_map = _resolve_camera_mapping(args.camera_mapping)
+    # view_sensors = ordered, deduped union of every per-arm policy's non-masked
+    # image inputs. The client sends ALL agents the same obs dict (the full union
+    # of mapped sensors); each per-arm server masks to global+its-own-wrist
+    # internally. So the union of distinct non-null cam_map values is exactly what
+    # the robots collectively saw. ordered_unique drops null slots and dedups the
+    # shared global; cam_map preserves JSON key order (global first).
+    view_sensors = ordered_unique(list(cam_map.values()))
+    if not view_sensors:
+        raise ValueError(f"camera mapping has no non-null cameras: {cam_map!r}")
+    print(f"view_sensors (tiled in video) = {view_sensors}", flush=True)
+
+    # Video is ALWAYS recorded. Default the record dir to <out_dir>/videos so there
+    # is no way to run eval without producing tiled multi-view videos.
+    video_dir = args.video_dir or str(out_dir / "videos")
 
     env_kwargs = dict(
         config=args.config,
@@ -386,7 +388,7 @@ def main(args: Args) -> None:
         tags=[t.strip() for t in args.wandb_tags.split(",") if t.strip()],
         config=dataclasses.asdict(args),
     ) as wandb_run, VideoRecorder(
-        args.video_dir, max_recorded=args.video_max, all_seeds=args.video_all,
+        video_dir, all_seeds=True,
     ) as videos:
         # S1 collapse probe (metric-only; never blocks eval). Probe each per-arm
         # server under namespace collapse/arm{i}/*.
@@ -425,18 +427,14 @@ def main(args: Args) -> None:
             for ep_i in range(args.num_episodes):
                 ep_seed = seed * 100_000 + ep_i
                 # cap maps to (seed, ep_i): record first N (seed_idx, ep_i==0) pairs only
-                if args.video_all or seed_idx < args.video_max:
-                    if args.video_dir:
-                        video_path = str(
-                            Path(args.video_dir)
-                            / _video_filename(args.task, run_id, seed, ep_i)
-                        )
-                    else:
-                        video_path = ""
-                else:
-                    video_path = ""
+                # ALWAYS record every seed/episode (no per-seed cap). videos.record_dir
+                # is video_dir, which always resolves to a real path (<out_dir>/videos).
+                video_path = str(
+                    Path(videos.record_dir)
+                    / _video_filename(args.task, run_id, seed, ep_i)
+                )
                 try:
-                    r = run_episode(env, policies, args, cam_map, ep_seed, action_prefix, video_path)
+                    r = run_episode(env, policies, args, cam_map, view_sensors, ep_seed, action_prefix, video_path)
                 except Exception as e:  # noqa: BLE001
                     r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
                 results.append(r)

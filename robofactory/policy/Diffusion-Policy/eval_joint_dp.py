@@ -72,7 +72,16 @@ class Args:
     """How many steps of the action chunk to execute per policy call."""
 
     record_dir: str = "./eval_video/joint/{env_id}"
-    """Directory to save MP4 and GIF videos."""
+    """Directory to save MP4 and GIF videos. ALWAYS recorded; this only chooses the location."""
+
+    video_frame_stride: int = 2
+    """Subsample recorded frames by this stride before writing the mp4 (1 = every frame)."""
+
+    video_max: int = 3
+    """DEPRECATED/ignored: recording is now always-on for every seed. Kept for launcher compat."""
+
+    video_all: bool = False
+    """DEPRECATED/ignored: every seed always records. Kept so --video-all still parses."""
 
     quiet: bool = False
     """Suppress per-step output."""
@@ -86,11 +95,37 @@ class Args:
     jsonl_path: Optional[str] = None
     """Path for per-episode JSONL log; auto-created if None."""
 
-    video_max: int = 3
-    """Max episodes to save as mp4 per run (ignored if video_all=True)."""
 
-    video_all: bool = False
-    """If True, save mp4 for every seed (overrides video_max)."""
+def _import_multiview():
+    """Mirror the eval_context import: add the policy/ parent to sys.path then import."""
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+    from policy._shared.multiview_video import tile_views, ordered_unique, subsample
+    return tile_views, ordered_unique, subsample
+
+
+def _rgb_hwc_uint8(raw_obs: dict, key: str) -> np.ndarray:
+    """Extract sensor `key` RGB from raw_obs as HWC uint8 (same access pattern as the runner)."""
+    rgb = raw_obs["sensor_data"][key]["rgb"]
+    if hasattr(rgb, "cpu"):
+        rgb = rgb.cpu().numpy()
+    else:
+        rgb = np.asarray(rgb)
+    while rgb.ndim > 3:
+        rgb = rgb[0]
+    return rgb.astype(np.uint8)
+
+
+def make_multiview_frame_fn(view_sensors: List[str], tile_views):
+    """Return a drop-in replacement for runner._frame_from_obs that tiles all policy-input views."""
+    def _frame_from_obs(raw_obs: dict):
+        try:
+            frames = [_rgb_hwc_uint8(raw_obs, s) for s in view_sensors]
+            return tile_views(frames)
+        except Exception:
+            return None
+    return _frame_from_obs
 
 
 def load_policy(ckpt_path: str, device: str = "cuda:0"):
@@ -151,6 +186,20 @@ def main(args: Args):
 
     env = runner._make_env()
 
+    # --- Multiview recording: tile EVERY camera the policy actually consumes. ---
+    # The joint policy's image inputs (see RobotJointImageRunner._build_obs_dict) are
+    # one camera per agent from the camera-family template, plus the global overhead
+    # when include_global=True. Derive that exact ordered/deduped list and record it.
+    tile_views, ordered_unique, subsample = _import_multiview()
+    from diffusion_policy.env_runner.robot_joint_image_runner import CAM_KEY_TPL
+    _tpl = CAM_KEY_TPL[args.camera_family]
+    view_sensors = ordered_unique(
+        [_tpl.format(i=i) for i in range(args.n_agents)]
+        + (["head_camera_global"] if runner.include_global else [])
+    )
+    print(f"Recording multiview frames from sensors: {view_sensors}", flush=True)
+    runner._frame_from_obs = make_multiview_frame_fn(view_sensors, tile_views)
+
     dataset_tag = "d1" if args.camera_family == "workspace" else "d2"
     env_id = args.env_id
     record_root = args.record_dir.format(env_id=env_id) + f"/eval_{ts}_{dataset_tag}_ckpt{os.path.basename(args.ckpt_path).replace('.ckpt','')}"
@@ -189,7 +238,7 @@ def main(args: Args):
         tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()],
         config=manifest,
     ) as wandb_run, VideoRecorder(
-        record_root, max_recorded=getattr(args, 'video_max', 3), all_seeds=getattr(args, 'video_all', False),
+        record_root, all_seeds=True,  # ALWAYS-ON: record every seed, no caps.
     ) as videos:
         results = []
         for idx, seed in enumerate(seeds):
@@ -199,11 +248,11 @@ def main(args: Args):
             result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
             vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
-            video_path = videos.video_path_for(idx, seed, suffix='_global')
-            gif_path = None
-            if video_path is not None:
-                save_mp4(result['frames'], video_path)
-                gif_path = save_gif(video_path) if result['frames'] else None
+            # ALWAYS-ON: all_seeds=True + real record_root => video_path is never None.
+            video_path = videos.video_path_for(idx, seed, suffix='_multiview')
+            rec_frames = subsample(result['frames'], args.video_frame_stride)
+            save_mp4(rec_frames, video_path)
+            gif_path = save_gif(video_path) if rec_frames else None
 
             metrics = dict(
                 seed=int(seed), success=int(result['success']),

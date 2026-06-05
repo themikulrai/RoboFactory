@@ -47,6 +47,11 @@ from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+from policy._shared.multiview_video import ordered_unique, tile_views, subsample  # noqa: E402
+
 IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
 # Camera families: slot name -> SAPIEN sensor name. BOTH the LL helpers and the HL Boss must
@@ -107,7 +112,8 @@ class Args:
     max_env_steps: int = 500  # LiftBarrier-rf max_episode_steps is 500
     sim_backend: str = "auto"
     results_dir: str = "/iris/u/mikulrai/projects/RoboFactory/eval_results"
-    video_dir: str = ""  # if set, write one global-cam mp4 per episode
+    video_dir: str = ""  # video output dir; defaults to <results_dir>/videos (always records)
+    video_frame_stride: int = 2  # subsample factor before writing mp4 (1 = every frame)
     # ---- cameras ----
     camera_family: str = "wristcam"  # {wristcam, workspace}; workspace = head cams (trained-on)
     # ---- live dashboard ----
@@ -480,7 +486,7 @@ def fidelity_check(
 
 
 def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path,
-                env_seed=None, record_seed=None):
+                view_sensors, env_seed=None, record_seed=None):
     obs, _ = env.reset(seed=(env_seed if env_seed is not None else seed))
     if hl_client is not None:
         hl_client.reset()
@@ -527,10 +533,10 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         subtasks_l.append(cur_l)
         subtasks_r.append(cur_r)
 
-        if video_path:
-            frame = _extract_image(obs, "head_camera_global")
-            frame = _overlay_subtasks(frame, step, args.max_env_steps, cur_l, cur_r)
-            frames.append(frame)
+        # ---- record the views the LL policy actually saw (tiled), with subtask overlay ----
+        frame = tile_views([_extract_image(obs, s) for s in view_sensors])
+        frame = _overlay_subtasks(frame, step, args.max_env_steps, cur_l, cur_r)
+        frames.append(frame)
 
         # ---- per-arm LL replanning with its own prompt ----
         replanned = [False] * args.num_arms
@@ -566,8 +572,8 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         if success or term or trunc:
             break
 
-    if video_path and frames:
-        _write_mp4(video_path, frames)
+    if frames:
+        _write_mp4(video_path, subsample(frames, args.video_frame_stride))
 
     return {
         "seed": int(record_seed if record_seed is not None else seed),
@@ -591,7 +597,16 @@ def main(args: Args):
         raise ValueError(f"--camera-family must be one of {sorted(CAMERA_FAMILIES)}, got {args.camera_family!r}")
     cam_map = dict(CAMERA_FAMILIES[args.camera_family])      # LL helpers' cameras
     hl_cam_map = _hl_cam_map(args.camera_family)             # HL Boss's cameras (same family)
-    print(f"[camera-family] {args.camera_family}: LL={cam_map} HL={hl_cam_map}")
+    # The views the LL policy physically saw = the non-masked sensors in its cam_map
+    # (ordered, deduped). These — NOT just head_camera_global — are what we tile into video.
+    view_sensors = ordered_unique(list(cam_map.values()))
+    print(f"[camera-family] {args.camera_family}: LL={cam_map} HL={hl_cam_map} "
+          f"video_views={view_sensors}")
+
+    # ALWAYS record: default the video dir to <results_dir>/videos when unset. There is no
+    # way to disable recording; --video-dir only chooses the location.
+    if not args.video_dir:
+        args.video_dir = str(Path(args.results_dir) / "videos")
 
     # shader_pack="default" matches the data-gen renderer; the assertion below refuses to
     # proceed if any camera-config group is missing/!="default" (Gate G2). Build the kwargs
@@ -657,11 +672,9 @@ def main(args: Args):
     for ep in range(args.max_episodes):
         base = args.seed + ep                 # recorded/live seed (e.g. 100..159)
         env_seed = base * args.seed_stride     # actual env reset seed (project convention)
-        video_path = ""
-        if args.video_dir:
-            video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
+        video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
         rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, base,
-                          video_path, env_seed=env_seed, record_seed=base)
+                          video_path, view_sensors, env_seed=env_seed, record_seed=base)
         episodes.append(rec)
         print(f"[episode {ep}] {rec}")
         _write_live("running", episodes)
