@@ -40,7 +40,8 @@ from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
 from policy._shared.multiview_video import ordered_unique, tile_views, subsample  # noqa: E402
 
 
-DEFAULT_PROMPT = "stack the three cubes using three robot arms"
+# PR6: the TSC DEFAULT_PROMPT that was silently used for EVERY task is DELETED.
+# --prompt is now REQUIRED and validated against the task / subtask vocab (see Args.prompt).
 DEFAULT_CAMERA_MAPPING = {
     "base_0_rgb_raw": "head_camera_global",
     "left_wrist_0_rgb_raw": "hand_camera_0",
@@ -84,7 +85,14 @@ class Args:
     seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
     max_env_steps: int = 200
     replan_after: int = 8
-    prompt: str = DEFAULT_PROMPT
+    # PR6: --prompt is REQUIRED (tyro.MISSING). The old TSC DEFAULT_PROMPT silently
+    # tagged every task. Validated against the task prompts JSON (or the LB subtask
+    # vocab via --subtask-vocab); OOV hard-fails unless --allow-oov-prompt (recorded in JSON).
+    prompt: Annotated[str, tyro.conf.arg(help="task instruction (REQUIRED); validated against task/subtask vocab")] = tyro.MISSING
+    prompts_json: str = ""  # explicit prompts-JSON path; "" => derive from --task/--camera-mapping
+    subtask_vocab: bool = False  # validate against the LB sidecar subtask vocab (sidecar-trained ckpts)
+    subtask_npz: str = ""  # override the subtask vocab npz path (defaults to lb_subtask_index.npz)
+    allow_oov_prompt: bool = False  # permit an out-of-vocab prompt (recorded in JSON; for E1 prompt-swap probe)
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
     video_dir: str = ""  # location override; defaults to <out_dir>/videos. Video is ALWAYS recorded.
@@ -335,6 +343,20 @@ def main(args: Args) -> None:
         env_seeds=(args.env_seeds or args.seeds) or None,
         allow_train=args.allow_train_seeds,
     )
+
+    # PR6: required, vocab-checked prompt. OOV hard-fails (prints the vocab) unless
+    # --allow-oov-prompt is set. The validation dict is recorded in the result JSON.
+    from robofactory.utils.eval_validity import load_prompt_vocab, validate_prompt
+    _vocab, _vocab_src = load_prompt_vocab(
+        prompts_json=args.prompts_json or None,
+        task=args.camera_mapping or args.task,
+        use_subtask_vocab=args.subtask_vocab,
+        subtask_npz=args.subtask_npz or None,
+    )
+    prompt_validation = validate_prompt(
+        args.prompt, _vocab, allow_oov=args.allow_oov_prompt, vocab_source=_vocab_src
+    )
+
     ports = [int(p) for p in args.ports.split(",") if p.strip()]
     assert len(ports) == args.num_arms, f"Need {args.num_arms} ports, got {ports}"
 
@@ -486,12 +508,31 @@ def main(args: Args) -> None:
         print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
         from robofactory.utils.eval_guards import shader_mismatch_override_active
+        # PR6: validity guard + full provenance (eval_protocol v2).
+        from robofactory.utils.eval_validity import (
+            build_provenance, classify_validity, finalize_validity,
+        )
+        validity = classify_validity(results)
+        provenance = build_provenance(
+            shader_pack="default",
+            enable_shadow=False,
+            sim_backend=args.sim_backend,
+            seed_provenance=seed_provenance,
+            prompts=[args.prompt],
+            prompt_validation=prompt_validation,
+            max_env_steps=args.max_env_steps,
+            chunk_config={"replan_after": args.replan_after, "num_arms": args.num_arms},
+            server_metadata={f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
+        )
         out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
         out_file.write_text(json.dumps({
             "args": dataclasses.asdict(args),
             "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train
             "shader_mismatch_override": shader_mismatch_override_active(),
             "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
+            "provenance": provenance,            # PR6: eval_protocol v2
+            "prompt_validation": prompt_validation,
+            "validity": validity,                # PR6: valid / invalid_reason
             "results": results,
         }, indent=2))
         print(f"Saved {out_file}")
@@ -501,9 +542,13 @@ def main(args: Args) -> None:
             n_episodes=n,
             n_success=n_succ,
             results_json_path=str(out_file),
+            valid=validity["valid"],
         )
 
         env.close()
+        # PR6: if >5% episodes invalid -> rename *_INVALID.json, tag wandb 'invalid',
+        # exit 2. Done after env.close() so the env shuts down cleanly first.
+        finalize_validity(validity, out_file, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":

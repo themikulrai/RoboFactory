@@ -246,6 +246,19 @@ def main(args: Args):
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
 
     from robofactory.utils.eval_guards import shader_mismatch_override_active
+    # PR6: full provenance (eval_protocol v2) — both-repo git sha+dirty, GPU, shader/shadow,
+    # seed pool+sha, ckpt path+md5, chunk config. DP has no --prompt (no language input).
+    from robofactory.utils.eval_validity import build_provenance
+    provenance = build_provenance(
+        shader_pack="default",
+        enable_shadow=False,
+        sim_backend="auto",
+        seed_provenance=seed_provenance,
+        prompts=None,  # DP is not language-conditioned
+        max_env_steps=args.max_steps,
+        chunk_config={"n_action_exec": args.n_action_exec, "camera_family": args.camera_family},
+        ckpt_paths=[args.ckpt_path],
+    )
     manifest = dict(
         task=env_id, scene_config=args.config,
         ckpt_path=args.ckpt_path, camera_family=args.camera_family,
@@ -254,6 +267,7 @@ def main(args: Args):
         git_sha=git_sha, host=socket.gethostname(),
         shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
+        provenance=provenance,  # PR6: eval_protocol v2
     )
     with open(jsonl_path, 'w') as f:
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
@@ -280,7 +294,18 @@ def main(args: Args):
             if not args.quiet:
                 print(f"[seed {seed}] running...", flush=True)
             torch.cuda.reset_peak_memory_stats()
-            result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
+            try:
+                result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
+            except Exception as _e:  # PR6: per-episode crash -> steps=-1+error so the >5%
+                # validity guard can fire instead of taking the whole run down silently.
+                vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+                metrics = dict(seed=int(seed), success=0, steps=-1, vram_peak_mb=vram_mb,
+                               episode_idx=idx, error=repr(_e))
+                results.append(metrics)
+                with open(jsonl_path, 'a') as f:
+                    f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
+                print(f"[seed {seed}] ERROR: {metrics['error']}", flush=True)
+                continue
             vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
             # ALWAYS-ON: all_seeds=True + real record_root => video_path is never None.
@@ -315,12 +340,19 @@ def main(args: Args):
         sr = n_succ / n_total if n_total else 0.0
         from math import sqrt
         ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
-        summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci)
+        # PR6: validity guard — if >5% episodes invalid (steps==-1 or error) the run
+        # is invalid; JSONL renamed *_INVALID.jsonl + exit 2.
+        from robofactory.utils.eval_validity import classify_validity, finalize_validity
+        validity = classify_validity(results)
+        summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
+                       valid=validity['valid'], invalid_reason=validity['invalid_reason'])
         with open(jsonl_path, 'a') as f:
             f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+            f.write(json.dumps({'kind': 'validity', **validity}) + '\n')
         print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
         wandb_run.log_summary(**summary)
         print('success' if sr > 0 else 'failed')
+        finalize_validity(validity, jsonl_path, wandb_run=wandb_run)
 
 
 if __name__ == '__main__':

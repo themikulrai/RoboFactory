@@ -555,12 +555,27 @@ def main(args: Args):
     jsonl_path = args.jsonl_path or f'/iris/u/mikulrai/logs/eval_{env_id}_ckpt{args.checkpoint_num}_{ts}.jsonl'
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
     from robofactory.utils.eval_guards import shader_mismatch_override_active
+    # PR6: full provenance (eval_protocol v2) — both-repo git sha+dirty, GPU, shader/shadow,
+    # seed pool+sha, ckpt path+md5, chunk config. DP has no --prompt (no language input).
+    from robofactory.utils.eval_validity import build_provenance
+    _ckpt_paths = [m.ckpt_path for m in dp_models]
+    provenance = build_provenance(
+        shader_pack=args.shader,
+        enable_shadow=False,
+        sim_backend=args.sim_backend,
+        seed_provenance=seed_provenance,
+        prompts=None,  # DP is not language-conditioned
+        max_env_steps=args.max_steps,
+        chunk_config={"max_chunk_actions": args.max_chunk_actions, "gripper_source": args.gripper_source},
+        ckpt_paths=_ckpt_paths,
+        zarr_repo_id=args.ckpt_suffix or None,
+    )
     manifest = dict(
         task=env_id, scene_config=args.config,
         data_num=args.data_num, checkpoint_num=args.checkpoint_num,
         ckpt_suffix=args.ckpt_suffix,
         gripper_source=args.gripper_source,
-        ckpt_paths=[m.ckpt_path for m in dp_models],
+        ckpt_paths=_ckpt_paths,
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
         seed_provenance=seed_provenance,  # PR4: pool name + sha + allow_train
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
@@ -569,6 +584,7 @@ def main(args: Args):
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
         view_sensors=view_sensors, video_dir=video_dir,
         video_frame_stride=args.video_frame_stride,
+        provenance=provenance,  # PR6: eval_protocol v2
     )
     with open(jsonl_path, 'w') as f:
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
@@ -611,7 +627,12 @@ def main(args: Args):
         results = []
         for idx, seed in enumerate(seeds):
             video_path = videos.video_path_for(idx, seed, suffix='_tiled')
-            metrics = run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix=agent_prefix, action_prefix=action_prefix, video_path=video_path, view_sensors=view_sensors)
+            try:
+                metrics = run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_prefix=agent_prefix, action_prefix=action_prefix, video_path=video_path, view_sensors=view_sensors)
+            except Exception as _e:  # PR6: a per-episode crash records steps=-1+error so the
+                # >5% validity guard can fire instead of taking the whole run down silently.
+                metrics = dict(seed=int(seed), success=0, steps=-1, wallclock_s=0.0,
+                               infer_ms_mean_per_arm=[], vram_peak_mb=0.0, error=repr(_e))
             metrics['episode_idx'] = idx
             results.append(metrics)
             with open(jsonl_path, 'a') as f:
@@ -639,17 +660,25 @@ def main(args: Args):
         ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
         steps_succ = [r['steps'] for r in results if r['success']]
         mean_steps_succ = float(np.mean(steps_succ)) if steps_succ else float('nan')
+        # PR6: validity guard — if >5% episodes are invalid (steps==-1 or error)
+        # the whole run is invalid; the JSONL is renamed *_INVALID.jsonl + exit 2.
+        from robofactory.utils.eval_validity import classify_validity, finalize_validity
+        validity = classify_validity(results)
         summary = dict(
             n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
             mean_steps_on_success=mean_steps_succ,
             mean_episode_wallclock_s=float(np.mean([r['wallclock_s'] for r in results])) if results else 0.0,
+            valid=validity['valid'], invalid_reason=validity['invalid_reason'],
         )
         with open(jsonl_path, 'a') as f:
             f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+            f.write(json.dumps({'kind': 'validity', **validity}) + '\n')
         print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
         wandb_run.log_summary(**summary)
         # Preserve legacy stdout marker for eval_multi.sh compatibility (last line parse)
         print('success' if sr > 0 else 'failed')
+        # PR6: rename JSONL -> *_INVALID.jsonl, tag wandb 'invalid', exit 2 if invalid.
+        finalize_validity(validity, jsonl_path, wandb_run=wandb_run)
 
 if __name__ == "__main__":
     parsed_args = tyro.cli(Args)

@@ -128,6 +128,13 @@ class Args:
     # ---- modes ----
     flat_baseline: bool = False  # skip HL; fixed prompt for both arms
     flat_prompt: str = "lift the steel barrier using two robot arms"
+    # PR6 prompt guard (flat-baseline path): the LL sidecar ckpts were conditioned on the
+    # subtask vocab (lb_subtask_index.npz), not an instruction string. In --flat-baseline
+    # mode --flat-prompt is validated against that vocab; OOV hard-fails (prints the vocab)
+    # unless --allow-oov-prompt is set (recorded in the result JSON — needed for prompt-swap
+    # probes; the default flat instruction IS deliberately OOV for the LL vocab).
+    subtask_npz: str = ""  # override the subtask vocab npz path (defaults to lb_subtask_index.npz)
+    allow_oov_prompt: bool = False  # permit an out-of-vocab --flat-prompt (recorded in JSON)
     mock_ll: bool = False  # zero-action chunks instead of contacting LL servers
     # PR2 server-identity handshake for the LL pi0.5 servers. If set, hard-fail (exit 3)
     # before episode 1 unless each LL arm's metadata config_name matches AND action_dim==8.
@@ -619,6 +626,20 @@ def main(args: Args):
             allow_train=args.allow_train_seeds,
         )
 
+    # PR6 prompt guard (flat-baseline only): validate --flat-prompt against the LL
+    # subtask vocab. OOV hard-fails (prints the vocab) unless --allow-oov-prompt. The
+    # validation dict is recorded in the result JSON. The hierarchical path routes
+    # subtasks live so its per-arm prompts are vocab by construction.
+    prompt_validation = None
+    if args.flat_baseline:
+        from robofactory.utils.eval_validity import load_prompt_vocab, validate_prompt
+        _vocab, _vocab_src = load_prompt_vocab(
+            use_subtask_vocab=True, subtask_npz=args.subtask_npz or None,
+        )
+        prompt_validation = validate_prompt(
+            args.flat_prompt, _vocab, allow_oov=args.allow_oov_prompt, vocab_source=_vocab_src
+        )
+
     if args.camera_family not in CAMERA_FAMILIES:
         raise ValueError(f"--camera-family must be one of {sorted(CAMERA_FAMILIES)}, got {args.camera_family!r}")
     cam_map = dict(CAMERA_FAMILIES[args.camera_family])      # LL helpers' cameras
@@ -753,6 +774,7 @@ def main(args: Args):
         "task": args.task,
         "args": dataclasses.asdict(args),
         "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train (None on legacy --seed path)
+        "prompt_validation": prompt_validation,  # PR6: flat-baseline prompt OOV check (None in hierarchical mode)
         "server_metadata": {f"arm{i}": ll_server_metadata[i] for i in range(len(ll_server_metadata))},
         "mode": "flat-baseline" if args.flat_baseline else "hierarchical",
         "mock_ll": args.mock_ll,
