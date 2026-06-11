@@ -117,8 +117,10 @@ class RobotMultiAgentImageRunner:
 
         cfg_path = self.config_path
         if cfg_path is None:
-            from robofactory import CONFIG_DIR
-            cfg_path = os.path.join(CONFIG_DIR, "robocasa", "three_robots_stack_cube.yaml")
+            raise ValueError(
+                "scene config (cfg_path) is required; refusing to silently default to "
+                "robocasa — see memory project_robofactory_tsc_scene"
+            )
 
         env_kwargs = dict(
             config=cfg_path,
@@ -131,8 +133,11 @@ class RobotMultiAgentImageRunner:
             viewer_camera_configs=dict(shader_pack="default"),
             num_envs=1,
             sim_backend="cpu",
-            enable_shadow=True,
+            # datagen never enables shadows (ManiSkill default False); matching it (commit 69fcf5d precedent)
+            enable_shadow=False,
         )
+        from robofactory.utils.eval_guards import assert_shader_pack_default
+        assert_shader_pack_default(env_kwargs)
         return gym.make(self.env_id, **env_kwargs)
 
     @staticmethod
@@ -176,6 +181,11 @@ class RobotMultiAgentImageRunner:
         raw_obs, _ = env.reset(seed=seed)
         if env.action_space is not None:
             env.action_space.seed(seed)
+
+        # Hard-fail (once/process) if the first rendered head_camera_global frame is
+        # black-skied (shader_pack=minimal / login-node symptom).
+        from robofactory.utils.eval_guards import shader_bg_guard
+        shader_bg_guard(self._render_frame(env))
 
         for aid in range(self.n_agents):
             init_pos = self._initial_agent_pos(raw_obs, aid)

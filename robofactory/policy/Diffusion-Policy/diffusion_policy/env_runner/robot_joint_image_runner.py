@@ -106,10 +106,13 @@ class RobotJointImageRunner:
             viewer_camera_configs=dict(shader_pack="default"),
             num_envs=1,
             sim_backend="cpu",
-            enable_shadow=True,
+            # datagen never enables shadows (ManiSkill default False); matching it (commit 69fcf5d precedent)
+            enable_shadow=False,
         )
         if self.robot_uids is not None:
             env_kwargs["robot_uids"] = self.robot_uids
+        from robofactory.utils.eval_guards import assert_shader_pack_default
+        assert_shader_pack_default(env_kwargs)
         return gym.make(self.env_id, **env_kwargs)
 
     # ------------------- obs extraction -------------------
@@ -222,6 +225,10 @@ class RobotJointImageRunner:
         raw_obs, _ = env.reset(seed=seed)
         if env.action_space is not None:
             env.action_space.seed(seed)
+
+        # Hard-fail (once/process) if the first head_camera_global frame is black-skied.
+        from robofactory.utils.eval_guards import shader_bg_guard
+        shader_bg_guard(self._frame_from_obs(raw_obs))
 
         obs_history.append(self._build_obs_dict(raw_obs, last_exec=None))
 

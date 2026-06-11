@@ -174,6 +174,21 @@ def _rgb_chw(rgb_tensor, img_h: Optional[int] = None, img_w: Optional[int] = Non
 _SINGLE_AGENT_CAM = {"workspace": "head_camera", "wristcam": "hand_camera"}
 
 
+def _global_frame_for_guard(observation):
+    """Best-effort HxWx3 uint8-ish global frame for shader_bg_guard. Prefer
+    head_camera_global; fall back to head_camera (PM scene has no global cam)."""
+    sd = observation.get('sensor_data', {}) if isinstance(observation, dict) else {}
+    for key in ('head_camera_global', 'head_camera'):
+        cam = sd.get(key)
+        if isinstance(cam, dict) and 'rgb' in cam:
+            rgb = cam['rgb']
+            rgb = rgb.cpu().numpy() if hasattr(rgb, 'cpu') else np.asarray(rgb)
+            while rgb.ndim > 3:
+                rgb = rgb[0]
+            return rgb
+    return None
+
+
 def get_model_input(observation, agent_pos, img_h: Optional[int] = None, img_w: Optional[int] = None, cam_family: str = "workspace", include_global: bool = False):
     sd = observation['sensor_data']
     per_agent_key = _SINGLE_AGENT_CAM.get(cam_family, "head_camera")
@@ -204,6 +219,9 @@ def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optiona
     raw_obs, _ = env.reset(seed=seed)
     if env.action_space is not None:
         env.action_space.seed(seed)
+    # Hard-fail (once/process) if the first global frame is black-skied (PR3).
+    from robofactory.utils.eval_guards import shader_bg_guard
+    shader_bg_guard(_global_frame_for_guard(raw_obs))
     if args.render_mode is not None:
         viewer = env.render()
         if isinstance(viewer, sapien.utils.Viewer):
@@ -305,6 +323,9 @@ def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optiona
 def main(args: Args):
     import time, json, subprocess, socket
     from datetime import datetime
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front.
+    from robofactory.utils.eval_guards import assert_not_login_node, assert_shader_pack_default
+    assert_not_login_node()
     np.set_printoptions(suppress=True, precision=5)
     verbose = not args.quiet
     if isinstance(args.seed, int):
@@ -338,6 +359,7 @@ def main(args: Args):
     )
     if args.robot_uids is not None:
         env_kwargs["robot_uids"] = tuple(args.robot_uids.split(","))
+    assert_shader_pack_default(env_kwargs)
     env: BaseEnv = gym.make(env_id, **env_kwargs)
 
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
@@ -364,6 +386,7 @@ def main(args: Args):
         git_sha = 'unknown'
     jsonl_path = args.jsonl_path or f'/iris/u/mikulrai/logs/eval_{env_id}_ckpt{args.checkpoint_num}_{ts}.jsonl'
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+    from robofactory.utils.eval_guards import shader_mismatch_override_active
     manifest = dict(
         task=env_id, scene_config=args.config,
         data_num=args.data_num, checkpoint_num=args.checkpoint_num,
@@ -372,6 +395,7 @@ def main(args: Args):
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
         img_height=args.img_height, img_width=args.img_width,
         git_sha=git_sha, host=socket.gethostname(),
+        shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
     )
     with open(jsonl_path, 'w') as f:

@@ -299,6 +299,11 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
     video_frames: list[np.ndarray] = []
     view_sensors = ordered_unique(list(cam_map.values()))
 
+    # Hard-fail (once/process) if the first head_camera_global frame is black-skied (PR3).
+    from robofactory.utils.eval_guards import shader_bg_guard
+    _global_view = "head_camera_global" if "head_camera_global" in view_sensors else view_sensors[0]
+    shader_bg_guard(_extract_image(obs, _global_view))
+
     # ---- trajectory logging (only when num_envs == 1) ----
     traj_fp = None
     if args.trajectory_log_path and args.num_envs == 1:
@@ -400,6 +405,11 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
     successes = [False] * n
     steps = [0] * n
     view_sensors = ordered_unique(list(cam_map.values()))
+
+    # Hard-fail (once/process) if the first head_camera_global frame is black-skied (PR3).
+    from robofactory.utils.eval_guards import shader_bg_guard
+    _global_view = "head_camera_global" if "head_camera_global" in view_sensors else view_sensors[0]
+    shader_bg_guard(_extract_image_at(obs, _global_view, 0))
     video_frames: list[list[np.ndarray]] = [[] for _ in range(n)]
 
     for step in range(args.max_env_steps):
@@ -457,6 +467,10 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
 
 
 def main(args: Args) -> None:
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front.
+    from robofactory.utils.eval_guards import assert_not_login_node, assert_shader_pack_default
+    assert_not_login_node()
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     # Always-on recording: --video-dir only chooses location; default to <out_dir>/videos.
@@ -484,6 +498,7 @@ def main(args: Args) -> None:
     )
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
+    assert_shader_pack_default(env_kwargs)
     env = gym.make(args.task, **env_kwargs)
     # ManiSkill uses URDF body name (e.g. "panda") for action_space keys but the
     # registered agent uid (e.g. "panda_wristcam_multi") for obs["agent"] keys.
@@ -616,9 +631,11 @@ def main(args: Args) -> None:
         n_succ = sum(1 for r in results if r["success"])
         print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
+        from robofactory.utils.eval_guards import shader_mismatch_override_active
         out_file = out_dir / f"eval_{args.task}_{int(time.time())}.json"
         out_file.write_text(json.dumps({
             "args": dataclasses.asdict(args),
+            "shader_mismatch_override": shader_mismatch_override_active(),
             "server_metadata": {f"port_{args.port}": server_metadata},
             "results": results,
         }, indent=2))

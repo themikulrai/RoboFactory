@@ -163,6 +163,12 @@ def save_gif(mp4_path: str):
 
 
 def main(args: Args):
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front. The
+    # shader_pack assert + black-sky bg guard run inside RobotJointImageRunner (_make_env /
+    # _rollout_single_episode), which this driver delegates env construction/rollout to.
+    from robofactory.utils.eval_guards import assert_not_login_node
+    assert_not_login_node()
+
     seeds = [args.seed] if isinstance(args.seed, int) else list(args.seed)
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
 
@@ -213,11 +219,13 @@ def main(args: Args):
     jsonl_path = args.jsonl_path or f'/iris/u/mikulrai/logs/eval_joint_{env_id}_{dataset_tag}_{ts}.jsonl'
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
 
+    from robofactory.utils.eval_guards import shader_mismatch_override_active
     manifest = dict(
         task=env_id, scene_config=args.config,
         ckpt_path=args.ckpt_path, camera_family=args.camera_family,
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
         git_sha=git_sha, host=socket.gethostname(),
+        shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
     )
     with open(jsonl_path, 'w') as f:

@@ -56,32 +56,10 @@ DEFAULT_CAMERA_MAPPING = {
 # carries those 5 keys and they flow straight through to the obs dict.
 DEFAULT_IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
-# One-shot guard for the SAPIEN shader_pack regression. Data-gen uses
-# shader_pack="default" (gray clear). ManiSkill default is "minimal" (pure
-# black clear), which leaves the upper rows of head_camera_global pitch black
-# above the table geometry and silently desyncs eval from training. We check
-# the upper sixth of the global cam on the very first frame; if it's almost
-# entirely black warn loudly. See memory/feedback_sapien_shader_pack_eval_mismatch.md.
-_SHADER_BG_CHECK_DONE = False
-
-def _shader_bg_guard(global_img: np.ndarray) -> None:
-    global _SHADER_BG_CHECK_DONE
-    if _SHADER_BG_CHECK_DONE:
-        return
-    _SHADER_BG_CHECK_DONE = True
-    if global_img is None or global_img.ndim < 3:
-        return
-    upper = global_img[: max(1, global_img.shape[0] // 6)]
-    near_black_frac = float((upper.sum(axis=-1) < 6).mean())
-    if near_black_frac > 0.9:
-        import warnings as _w
-        _w.warn(
-            f"[shader_pack guard] head_camera_global upper region is {100*near_black_frac:.0f}% near-black. "
-            "This is the SAPIEN shader_pack=minimal symptom. Pass "
-            "sensor_configs=dict(shader_pack=\"default\") to gym.make to match data-gen. "
-            "See ~/.claude/projects/-iris-u-mikulrai/memory/feedback_sapien_shader_pack_eval_mismatch.md",
-            stacklevel=2,
-        )
+# SAPIEN shader_pack / login-node / black-sky fidelity guards now live in the shared
+# robofactory.utils.eval_guards module (PR3): assert_shader_pack_default (hard),
+# shader_bg_guard (PROMOTED warn -> hard fail; RF_ALLOW_SHADER_MISMATCH=1 downgrades),
+# assert_not_login_node (hard). See memory/feedback_sapien_shader_pack_eval_mismatch.md.
 
 
 @dataclasses.dataclass
@@ -243,10 +221,11 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     non-masked image inputs (see main()); each recorded frame tiles all of them.
     """
     obs, _ = env.reset(seed=seed)
-    try:
-        _shader_bg_guard(_extract_image(obs, view_sensors[0]))
-    except Exception:
-        pass
+    # Hard-fail (once/process) if the first head_camera_global frame is black-skied (PR3).
+    # NOTE: no try/except — a black sky must abort the run, not be silently swallowed.
+    from robofactory.utils.eval_guards import shader_bg_guard
+    _global_view = "head_camera_global" if "head_camera_global" in view_sensors else view_sensors[0]
+    shader_bg_guard(_extract_image(obs, _global_view))
     success = False
     t0 = time.time()
 
@@ -333,6 +312,10 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
 
 
 def main(args: Args) -> None:
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front.
+    from robofactory.utils.eval_guards import assert_not_login_node, assert_shader_pack_default
+    assert_not_login_node()
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -374,6 +357,7 @@ def main(args: Args) -> None:
     )
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
+    assert_shader_pack_default(env_kwargs)
     env = gym.make(args.task, **env_kwargs)
     # ManiSkill uses URDF body name (e.g. "panda") for action_space keys but the
     # registered agent uid (e.g. "panda_wristcam_multi") for obs["agent"] keys.
@@ -483,9 +467,11 @@ def main(args: Args) -> None:
         n_succ = sum(1 for r in results if r["success"])
         print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
+        from robofactory.utils.eval_guards import shader_mismatch_override_active
         out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
         out_file.write_text(json.dumps({
             "args": dataclasses.asdict(args),
+            "shader_mismatch_override": shader_mismatch_override_active(),
             "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
             "results": results,
         }, indent=2))
