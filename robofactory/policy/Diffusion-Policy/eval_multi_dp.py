@@ -169,6 +169,17 @@ class Args:
     skip_collapse_probe: bool = False
     """Skip the S1 encoder-collapse probe between env.make and the first per-seed env.reset. Use when the probe interferes with downstream env state (observed for WC-trained ckpts on orion: probe predict_action with shape-mismatched obs corrupts PhysX init)."""
 
+    save_trajectory: bool = False
+    """PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    env_states with shader_pack=default). The recorded actions are the ABSOLUTE joint
+    targets stepped into the env, directly consumable by
+    parse_h5_to_zarr_unified.py --state-source qpos. Default off."""
+
+    trajectory_root: Optional[str] = None
+    """PR9: root dir for --save-trajectory h5s. Defaults to /iris/u/mikulrai/data/eval_trajs/
+    (symlinked, never the project tree) or $RF_EVAL_TRAJ_ROOT."""
+
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
     ckpt_full = checkpoint if os.path.isabs(checkpoint) else './' + checkpoint
@@ -579,7 +590,18 @@ def main(args: Args):
 
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     record_root = args.record_dir.format(env_id=env_id) + f'/eval_{ts}_data{args.data_num}_ckpt{args.checkpoint_num}'
-    env = RecordEpisodeMA(env, record_root, info_on_video=False, save_trajectory=False, save_video=False, max_steps_per_video=30000)
+    # PR9: when --save-trajectory is set, wrap with the self-training capture config
+    # (env_states + actions + qpos, NO rgb, symlinked root). The DP runners step ABSOLUTE
+    # joint targets, so the recorded actions are absolute — no converter-side delta fix.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        _traj_label = f'eval_multi_dp_{env_id}_data{args.data_num}_ckpt{args.checkpoint_num}_{ts}'
+        _traj_dir = trajectory_output_dir(args.trajectory_root, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name='trajectory')
+        print(f"[eval_multi_dp] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+    else:
+        env = RecordEpisodeMA(env, record_root, info_on_video=False, save_trajectory=False, save_video=False, max_steps_per_video=30000)
 
     raw_obs, _ = env.reset(seed=seeds[0])
     planner = PandaArmMotionPlanningSolver(
@@ -660,6 +682,7 @@ def main(args: Args):
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
         view_sensors=view_sensors, video_dir=video_dir,
         video_frame_stride=args.video_frame_stride,
+        save_trajectory=args.save_trajectory, trajectory_h5=traj_h5_path,  # PR9
         provenance=provenance,  # PR6: eval_protocol v2
     )
     with open(jsonl_path, 'w') as f:
@@ -710,6 +733,12 @@ def main(args: Args):
                 metrics = dict(seed=int(seed), success=0, steps=-1, wallclock_s=0.0,
                                infer_ms_mean_per_arm=[], vram_peak_mb=0.0, error=repr(_e))
             metrics['episode_idx'] = idx
+            # PR9: record where this episode's trajectory lands (h5 path + traj group id).
+            # RecordEpisodeMA flushes on the NEXT reset / env.close(); group ids are
+            # assigned in episode order, so episode `idx` is traj_{idx} in the h5.
+            if traj_h5_path is not None:
+                metrics['trajectory_path'] = traj_h5_path
+                metrics['trajectory_group'] = f'traj_{idx}'
             results.append(metrics)
             with open(jsonl_path, 'a') as f:
                 f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')

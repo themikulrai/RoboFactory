@@ -111,6 +111,13 @@ class Args:
     robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
     robot_uids_csv: str = ""  # comma-separated UIDs for gym.make; empty = use default
     trajectory_log_path: str = ""  # if set (and num_envs==1), write JSONL per-step trajectory data
+    save_trajectory: bool = False
+    """PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    env_states). The pi0.5 client decodes delta->absolute (cur_qpos + delta) BEFORE
+    env.step, so the recorded actions are the ABSOLUTE joint targets — directly consumable
+    by parse_h5_to_zarr_unified.py --state-source qpos. num_envs==1 only. Default off."""
+    trajectory_root: str = ""  # PR9: root for --save-trajectory h5s; "" => default eval_trajs root
     wandb: bool = False
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,cent"
@@ -630,6 +637,20 @@ def main(args: Args) -> None:
         action_prefix = "panda"  # placeholder; flat path uses key 'panda-0' internally
     print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}' is_dict_action={is_dict_action}", flush=True)
 
+    # PR9: optional self-training trajectory capture. The client decodes delta->absolute
+    # BEFORE env.step, so RecordEpisodeMA buffers ABSOLUTE joint targets (no converter-side
+    # fix). RGB is dropped (re-renderable); qpos rides along via the recorded obs.
+    traj_h5_path = None
+    if args.save_trajectory:
+        if args.num_envs != 1:
+            raise RuntimeError("--save-trajectory requires --num-envs 1 (per-episode h5 capture)")
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        _ts = int(time.time())
+        _traj_label = f"eval_pi05_cent_{args.task}_run{_resolve_run_id(args.run_id)}_{_ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root or None, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_pi05] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     server_metadata = dict(policy.get_server_metadata() or {})
     print(f"Server metadata: {server_metadata}", flush=True)
@@ -732,6 +753,10 @@ def main(args: Args) -> None:
                         r = run_episode(env, policy, args, cam_map, active_dim, ep_seed, action_prefix, video_path, is_dict_action=is_dict_action)
                     except Exception as e:  # noqa: BLE001
                         r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
+                    if traj_h5_path is not None:
+                        # PR9: episodes flush in order; episode_global_idx -> traj_{idx} in the h5.
+                        r["trajectory_path"] = traj_h5_path
+                        r["trajectory_group"] = f"traj_{episode_global_idx}"
                     results.append(r)
                     print(
                         f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
@@ -784,6 +809,8 @@ def main(args: Args) -> None:
             "provenance": provenance,            # PR6: eval_protocol v2
             "prompt_validation": prompt_validation,
             "validity": validity,                # PR6: valid / invalid_reason
+            "save_trajectory": args.save_trajectory,  # PR9
+            "trajectory_h5": traj_h5_path,            # PR9
             "results": results,
         }, indent=2))
         print(f"Saved {out_file}")

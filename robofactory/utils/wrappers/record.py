@@ -20,6 +20,18 @@ from mani_skill.utils.wrappers.record import RecordEpisode, Step, parse_env_info
 
 from .. import sapien_utils
 
+
+def drop_image_streams(obs: dict) -> dict:
+    """PR9: return a shallow copy of an obs dict with the heavy image streams
+    (the top-level ``sensor_data`` subtree: per-camera rgb/depth/seg) removed,
+    while keeping the lightweight proprio under ``agent`` (qpos/qvel) and any
+    other top-level keys. RGB is re-renderable from env_states (shader_pack=
+    default), so eval trajectories stay small. The input is not mutated."""
+    if not isinstance(obs, dict):
+        return obs
+    return {k: v for k, v in obs.items() if k != "sensor_data"}
+
+
 class RecordEpisodeMA(RecordEpisode):
     """Record trajectories or videos for episodes. Support multi-agent environments.
     
@@ -40,6 +52,7 @@ class RecordEpisodeMA(RecordEpisode):
         record_env_state: bool = True,
         record_observation: bool = True,
         record_simple_observation: bool = False,
+        record_rgb: bool = True,
         video_fps: int = 30,
         avoid_overwriting_video: bool = False,
         source_type: Optional[str] = None,
@@ -66,7 +79,15 @@ class RecordEpisodeMA(RecordEpisode):
 
         self.record_observation = record_observation
         self.record_simple_observation = record_simple_observation
-        
+        # PR9: when False, the observation's heavy image streams
+        # (obs/sensor_data/*/rgb|depth|seg) are dropped from the trajectory at
+        # flush time (see flush_trajectory) so they never land in the h5, while
+        # the lightweight proprio (obs/agent/.../qpos) rides along. RGB is
+        # re-renderable from the recorded env_states (shader_pack=default), so
+        # eval trajectories stay small. Default True preserves the historical
+        # full-obs recording.
+        self.record_rgb = record_rgb
+
         if info_on_video and self.num_envs > 1:
             raise ValueError(
                 "Cannot turn info_on_video=True when the number of environments parallelized is > 1"
@@ -234,9 +255,15 @@ class RecordEpisodeMA(RecordEpisode):
                 # Observations need special processing
                 if self.record_observation:
                     if isinstance(self._trajectory_buffer.observation, dict):
-                        recursive_add_to_h5py(
-                            group, self._trajectory_buffer.observation, "obs"
-                        )
+                        obs_to_write = self._trajectory_buffer.observation
+                        # PR9: drop the heavy image streams (sensor_data/*/rgb|depth|seg)
+                        # from the written obs while keeping proprio (agent/.../qpos). The
+                        # buffered ndarrays are NOT mutated — we only pass a filtered view
+                        # to the h5 writer, so videos/other consumers are unaffected. RGB is
+                        # re-renderable from env_states (shader_pack=default).
+                        if not self.record_rgb:
+                            obs_to_write = drop_image_streams(obs_to_write)
+                        recursive_add_to_h5py(group, obs_to_write, "obs")
                     elif isinstance(self._trajectory_buffer.observation, np.ndarray):
                         if self.cpu_wrapped_env:
                             group.create_dataset(

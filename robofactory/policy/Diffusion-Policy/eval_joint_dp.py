@@ -107,6 +107,16 @@ class Args:
     jsonl_path: Optional[str] = None
     """Path for per-episode JSONL log; auto-created if None."""
 
+    save_trajectory: bool = False
+    """PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    env_states). The joint runner steps ABSOLUTE joint targets, so the recorded actions are
+    absolute — directly consumable by parse_h5_to_zarr_unified.py --state-source qpos."""
+
+    trajectory_root: Optional[str] = None
+    """PR9: root dir for --save-trajectory h5s. Defaults to /iris/u/mikulrai/data/eval_trajs/
+    (symlinked, never the project tree) or $RF_EVAL_TRAJ_ROOT."""
+
 
 def _import_multiview():
     """Mirror the eval_context import: add the policy/ parent to sys.path then import."""
@@ -218,6 +228,19 @@ def main(args: Args):
 
     env = runner._make_env()
 
+    # PR9: optional self-training trajectory capture. The joint runner steps ABSOLUTE joint
+    # targets, so RecordEpisodeMA buffers absolute actions (no converter-side fix). RGB is
+    # dropped (re-renderable from env_states); qpos rides along via the recorded obs. The
+    # runner resets/steps THIS wrapped env, so episodes flush in order on each reset.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        dataset_tag = "d1" if args.camera_family == "workspace" else "d2"
+        _traj_label = f"eval_joint_dp_{args.env_id}_{dataset_tag}_{ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_joint_dp] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+
     # --- Multiview recording: tile EVERY camera the policy actually consumes. ---
     # The joint policy's image inputs (see RobotJointImageRunner._build_obs_dict) are
     # one camera per agent from the camera-family template, plus the global overhead
@@ -267,6 +290,7 @@ def main(args: Args):
         git_sha=git_sha, host=socket.gethostname(),
         shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
+        save_trajectory=args.save_trajectory, trajectory_h5=traj_h5_path,  # PR9
         provenance=provenance,  # PR6: eval_protocol v2
     )
     with open(jsonl_path, 'w') as f:
@@ -318,6 +342,10 @@ def main(args: Args):
                 seed=int(seed), success=int(result['success']),
                 steps=int(result['length']), vram_peak_mb=vram_mb, episode_idx=idx,
             )
+            if traj_h5_path is not None:
+                # PR9: episodes flush in order; episode idx -> traj_{idx} in the h5.
+                metrics['trajectory_path'] = traj_h5_path
+                metrics['trajectory_group'] = f'traj_{idx}'
             results.append(metrics)
             with open(jsonl_path, 'a') as f:
                 f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')

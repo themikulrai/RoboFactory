@@ -118,6 +118,13 @@ class Args:
     results_dir: str = "/iris/u/mikulrai/projects/RoboFactory/eval_results"
     video_dir: str = ""  # video output dir; defaults to <results_dir>/videos (always records)
     video_frame_stride: int = 2  # subsample factor before writing mp4 (1 = every frame)
+    # PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    # --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    # env_states). The LL clients decode delta->absolute (cur_q + delta) BEFORE env.step,
+    # so the recorded actions are the ABSOLUTE joint targets — directly consumable by
+    # parse_h5_to_zarr_unified.py --state-source qpos. Default off.
+    save_trajectory: bool = False
+    trajectory_root: str = ""  # PR9: root for --save-trajectory h5s; "" => default eval_trajs root
     # ---- cameras ----
     camera_family: str = "wristcam"  # {wristcam, workspace}; workspace = head cams (trained-on)
     # ---- live dashboard ----
@@ -674,6 +681,19 @@ def main(args: Args):
     env = gym.make(args.task, **gym_make_kwargs)
     action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
 
+    # PR9: optional self-training trajectory capture. The LL clients decode delta->absolute
+    # BEFORE env.step, so RecordEpisodeMA buffers ABSOLUTE joint targets (no converter-side
+    # fix). RGB dropped (re-renderable); qpos rides along via obs. Wrap before the rollout
+    # loop so each env.reset() flushes the prior episode in order.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _traj_label = f"eval_hier_{args.task}_{_ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root or None, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_hier] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+
     ll_policies = _make_ll_policies(args)
 
     # PR2 server-identity handshake for the LL pi0.5 servers (skipped under --mock-ll,
@@ -762,9 +782,18 @@ def main(args: Args):
         video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
         rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, base,
                           video_path, view_sensors, env_seed=env_seed, record_seed=base)
+        if traj_h5_path is not None:
+            # PR9: episodes flush in order; episode idx `ep` -> traj_{ep} in the h5.
+            rec["trajectory_path"] = traj_h5_path
+            rec["trajectory_group"] = f"traj_{ep}"
         episodes.append(rec)
         print(f"[episode {ep}] {rec}")
         _write_live("running", episodes)
+
+    # PR9: flush the final episode's trajectory + close the h5 (TERM-before-KILL discipline
+    # for launchers; memory project_h5_cancel_corruption). No-op when not recording.
+    if traj_h5_path is not None:
+        env.close()
 
     n = len(episodes)
     n_success = sum(1 for e in episodes if e["success"])
@@ -782,6 +811,8 @@ def main(args: Args):
         "num_episodes": n,
         "num_success": n_success,
         "success_rate": success_rate,
+        "save_trajectory": args.save_trajectory,  # PR9
+        "trajectory_h5": traj_h5_path,            # PR9
         "episodes": episodes,
     }
 
