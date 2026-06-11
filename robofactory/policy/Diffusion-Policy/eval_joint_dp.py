@@ -63,7 +63,19 @@ class Args:
     """Comma-separated robot UIDs to override env defaults. D2 wristcam requires 'panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi'."""
 
     seed: Annotated[Union[int, List[int]], tyro.conf.arg(aliases=["-s"])] = 10010
-    """Single seed or list of seeds."""
+    """Final env seed(s) passed straight to env.reset. DEPRECATED alias for --env-seeds;
+    prefer --seed-pool (PR4)."""
+
+    seed_pool: str = ""
+    """PR4: name of a frozen seed pool (robofactory.utils.eval_seeds), e.g. canonical_env_60.
+    When set, overrides --seed/--env-seeds. DP and pi0.5 resolve the SAME final env seeds
+    from a pool name -> true seed pairing."""
+
+    env_seeds: str = ""
+    """PR4: ad-hoc comma/space list of FINAL env seeds (recorded as pool 'adhoc'). Overrides --seed."""
+
+    allow_train_seeds: bool = False
+    """PR4: permit datagen seeds 0..182 (recorded in the result manifest)."""
 
     max_steps: int = 200
     """Max env steps per episode."""
@@ -169,7 +181,21 @@ def main(args: Args):
     from robofactory.utils.eval_guards import assert_not_login_node
     assert_not_login_node()
 
-    seeds = [args.seed] if isinstance(args.seed, int) else list(args.seed)
+    # PR4: resolve FINAL env seeds via the single source of truth (same as the pi0.5
+    # drivers) so a pool name yields identical env seeds across methods -> true pairing.
+    from robofactory.utils.eval_seeds import resolve_seeds
+    if args.seed_pool or args.env_seeds:
+        seeds, seed_provenance = resolve_seeds(
+            pool=args.seed_pool or None,
+            env_seeds=args.env_seeds or None,
+            allow_train=args.allow_train_seeds,
+        )
+    else:
+        _legacy = [args.seed] if isinstance(args.seed, int) else list(args.seed)
+        seeds, seed_provenance = resolve_seeds(
+            env_seeds=",".join(str(s) for s in _legacy),
+            allow_train=args.allow_train_seeds,
+        )
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
 
     policy = load_policy(args.ckpt_path)
@@ -224,6 +250,7 @@ def main(args: Args):
         task=env_id, scene_config=args.config,
         ckpt_path=args.ckpt_path, camera_family=args.camera_family,
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
+        seed_provenance=seed_provenance,  # PR4: pool name + sha + allow_train
         git_sha=git_sha, host=socket.gethostname(),
         shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,

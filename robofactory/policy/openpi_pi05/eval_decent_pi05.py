@@ -74,7 +74,14 @@ class Args:
     # pass job-unique free ports explicitly (PR1).
     ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING
     num_episodes: int = 1
-    seeds: Annotated[str, tyro.conf.arg(help="comma-separated seed list")] = "10010,10011,10012"
+    # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
+    # Prefer --seed-pool; --env-seeds is an ad-hoc final-env-seed list. Resolved seeds are
+    # FINAL env seeds handed straight to env.reset — NO x100_000 transform (that historical
+    # transform is folded into the canonical_env_60 pool). --seeds = legacy alias.
+    seed_pool: str = ""
+    env_seeds: str = ""
+    allow_train_seeds: bool = False
+    seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
     max_env_steps: int = 200
     replan_after: int = 8
     prompt: str = DEFAULT_PROMPT
@@ -318,7 +325,13 @@ def main(args: Args) -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    # PR4: resolve FINAL env seeds via the single source of truth. No x100_000.
+    from robofactory.utils.eval_seeds import resolve_seeds
+    seeds, seed_provenance = resolve_seeds(
+        pool=args.seed_pool or None,
+        env_seeds=(args.env_seeds or args.seeds) or None,
+        allow_train=args.allow_train_seeds,
+    )
     ports = [int(p) for p in args.ports.split(",") if p.strip()]
     assert len(ports) == args.num_arms, f"Need {args.num_arms} ports, got {ports}"
 
@@ -436,7 +449,9 @@ def main(args: Args) -> None:
         episode_global_idx = 0
         for seed_idx, seed in enumerate(seeds):
             for ep_i in range(args.num_episodes):
-                ep_seed = seed * 100_000 + ep_i
+                # PR4: `seed` is the FINAL env seed; ep_i offsets additively only for
+                # >1 episode/seed (identity for the canonical num_episodes==1). No x100_000.
+                ep_seed = seed + ep_i
                 # cap maps to (seed, ep_i): record first N (seed_idx, ep_i==0) pairs only
                 # ALWAYS record every seed/episode (no per-seed cap). videos.record_dir
                 # is video_dir, which always resolves to a real path (<out_dir>/videos).
@@ -471,6 +486,7 @@ def main(args: Args) -> None:
         out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
         out_file.write_text(json.dumps({
             "args": dataclasses.asdict(args),
+            "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train
             "shader_mismatch_override": shader_mismatch_override_active(),
             "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
             "results": results,

@@ -27,9 +27,7 @@ bash "$LAUNCHER" \
   --ll-ckpt-arm1 "$LL_CKPT_ARM1" \
   --camera-family workspace \
   --hl-query-interval 25 \
-  --n-episodes 60 \
-  --base-seed 100 \
-  --seed-stride 100000 \
+  --seed-pool canonical_env_60 \
   --max-env-steps 400 \
   --replan-after 8 \
   --live-json "$LIVE_JSON" \

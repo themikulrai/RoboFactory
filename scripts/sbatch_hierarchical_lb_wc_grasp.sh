@@ -24,7 +24,7 @@ bash "$LAUNCHER" \
   --ll-config-arm0 pi05_robofactory_lb_wc_decent_arm0 --ll-ckpt-arm0 "$LL_CKPT_ARM0" \
   --ll-config-arm1 pi05_robofactory_lb_wc_decent_arm1 --ll-ckpt-arm1 "$LL_CKPT_ARM1" \
   --camera-family wristcam --hl-query-interval 25 \
-  --n-episodes 30 --base-seed 100 --seed-stride 100000 \
+  --env-seeds 10000000,10100000,10200000,10300000,10400000,10500000,10600000,10700000,10800000,10900000,11000000,11100000,11200000,11300000,11400000,11500000,11600000,11700000,11800000,11900000,12000000,12100000,12200000,12300000,12400000,12500000,12600000,12700000,12800000,12900000 \
   --max-env-steps 400 --replan-after 8 \
   --live-json "$LIVE_JSON" --results-dir "$RESULTS_DIR"
 

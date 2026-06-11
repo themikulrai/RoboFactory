@@ -78,7 +78,19 @@ class Args:
     """Disable verbose output."""
 
     seed: Annotated[Optional[Union[int, List[int]]], tyro.conf.arg(aliases=["-s"])] = 10000
-    """Seed(s) for random actions and simulator. Can be a single integer or a list of integers. Default is None (no seeds)"""
+    """Seed(s) for random actions and simulator. Final env seed(s) passed straight to env.reset.
+    DEPRECATED alias for --env-seeds; prefer --seed-pool (PR4)."""
+
+    seed_pool: str = ""
+    """PR4: name of a frozen seed pool (robofactory.utils.eval_seeds), e.g. canonical_env_60.
+    When set, overrides --seed/--env-seeds. Both DP and pi0.5 resolve the SAME final env seeds
+    from a pool name -> true seed pairing (an env seed is just an int to env.reset)."""
+
+    env_seeds: str = ""
+    """PR4: ad-hoc comma/space list of FINAL env seeds (recorded as pool 'adhoc'). Overrides --seed."""
+
+    allow_train_seeds: bool = False
+    """PR4: permit datagen seeds 0..182 (recorded in the result manifest)."""
 
     data_num: int = 100
     """The number of episode data used for training the policy"""
@@ -430,9 +442,26 @@ def main(args: Args):
     assert_not_login_node()
     np.set_printoptions(suppress=True, precision=5)
     verbose = not args.quiet
-    if isinstance(args.seed, int):
-        args.seed = [args.seed]
-    seeds = list(args.seed) if args.seed is not None else [10000]
+    # PR4: resolve FINAL env seeds via the single source of truth. --seed-pool/--env-seeds
+    # take precedence over the legacy --seed. DP and pi0.5 resolve the same env seeds from a
+    # pool name -> true seed pairing. No transform: each seed is passed straight to env.reset.
+    if args.seed_pool or args.env_seeds:
+        from robofactory.utils.eval_seeds import resolve_seeds
+        seeds, seed_provenance = resolve_seeds(
+            pool=args.seed_pool or None,
+            env_seeds=args.env_seeds or None,
+            allow_train=args.allow_train_seeds,
+        )
+    else:
+        if isinstance(args.seed, int):
+            args.seed = [args.seed]
+        seeds = list(args.seed) if args.seed is not None else [10000]
+        from robofactory.utils.eval_seeds import resolve_seeds
+        # Record provenance for the legacy --seed path too (recorded as pool 'adhoc').
+        seeds, seed_provenance = resolve_seeds(
+            env_seeds=",".join(str(s) for s in seeds),
+            allow_train=args.allow_train_seeds,
+        )
     np.random.seed(seeds[0])
     parallel_in_single_scene = args.render_mode == "human"
     if args.render_mode == "human" and args.obs_mode in ["sensor_data", "rgb", "rgbd", "depth", "point_cloud"]:
@@ -524,6 +553,7 @@ def main(args: Args):
         gripper_source=args.gripper_source,
         ckpt_paths=[m.ckpt_path for m in dp_models],
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
+        seed_provenance=seed_provenance,  # PR4: pool name + sha + allow_train
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
         git_sha=git_sha, host=socket.gethostname(),
         shader_mismatch_override=shader_mismatch_override_active(),

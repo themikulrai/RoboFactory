@@ -71,7 +71,16 @@ class Args:
     # field ordering valid while marking --port required on the CLI.
     port: int = tyro.MISSING
     num_episodes: int = 50
-    seeds: Annotated[str, tyro.conf.arg(help="comma-separated seed list")] = "0,1,2"
+    # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
+    # Prefer --seed-pool <name>; --env-seeds is an ad-hoc final-env-seed list (recorded
+    # as pool "adhoc"). The resolved seeds are FINAL env seeds — handed straight to
+    # env.reset, NO x100_000 transform (that historical transform is now folded into the
+    # canonical_env_60 pool itself). --seeds is the legacy alias for --env-seeds, kept so
+    # old launchers still parse; it is interpreted as final env seeds too.
+    seed_pool: str = ""  # e.g. "canonical_env_60"; empty => fall back to --env-seeds/--seeds
+    env_seeds: str = ""  # comma/space list of FINAL env seeds; empty => use --seeds
+    allow_train_seeds: bool = False  # permit datagen seeds 0..182 (recorded in JSON)
+    seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
     max_env_steps: int = 1800
     replan_after: int = 8
     prompt: str = DEFAULT_PROMPT
@@ -459,8 +468,9 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
     results = []
     for i, sd in enumerate(seeds):
         if video_frames[i]:
-            seed_base, ep_i = divmod(int(sd), 100_000)
-            vp = str(Path(video_dir) / _video_filename(args.task, run_id, seed_base, ep_i))
+            # PR4: `sd` is already the FINAL env seed (no x100_000 to reverse). The
+            # episode index is supplied by the caller via the per-seed video path.
+            vp = str(Path(video_dir) / _video_filename(args.task, run_id, int(sd), 0))
             _write_mp4(vp, subsample(video_frames[i], args.video_frame_stride))
         results.append({"seed": int(sd), "success": successes[i], "steps": steps[i] or args.max_env_steps, "wall_s": time.time() - t0})
     return results
@@ -476,7 +486,13 @@ def main(args: Args) -> None:
     # Always-on recording: --video-dir only chooses location; default to <out_dir>/videos.
     if not args.video_dir:
         args.video_dir = str(out_dir / "videos")
-    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    # PR4: resolve FINAL env seeds via the single source of truth. No x100_000.
+    from robofactory.utils.eval_seeds import resolve_seeds
+    seeds, seed_provenance = resolve_seeds(
+        pool=args.seed_pool or None,
+        env_seeds=(args.env_seeds or args.seeds) or None,
+        allow_train=args.allow_train_seeds,
+    )
 
     cam_map = _resolve_camera_mapping(args.camera_mapping)
     active_dim = args.active_dim or args.num_arms * 8
@@ -576,7 +592,10 @@ def main(args: Args) -> None:
         episode_global_idx = 0
         if args.num_envs > 1:
             # Vectorised path: one batch of size num_envs, all seeds run in lockstep.
-            all_ep_seeds = [seed * 100_000 + ep_i for seed in seeds for ep_i in range(args.num_episodes)]
+            # PR4: `seeds` are FINAL env seeds. Episodes within a seed offset by ep_i
+            # additively (identity when num_episodes==1, the canonical case); the
+            # recorded "seed" field is the actual env seed used. No x100_000 transform.
+            all_ep_seeds = [seed + ep_i for seed in seeds for ep_i in range(args.num_episodes)]
             for batch_start in range(0, len(all_ep_seeds), args.num_envs):
                 batch = all_ep_seeds[batch_start : batch_start + args.num_envs]
                 if len(batch) < args.num_envs:
@@ -605,7 +624,9 @@ def main(args: Args) -> None:
         else:
             for seed_idx, seed in enumerate(seeds):
                 for ep_i in range(args.num_episodes):
-                    ep_seed = seed * 100_000 + ep_i
+                    # PR4: `seed` is the FINAL env seed. ep_i offsets additively only when
+                    # running >1 episode/seed (identity for the canonical num_episodes==1).
+                    ep_seed = seed + ep_i
                     # Always record every episode (args.video_dir defaulted in main()).
                     video_path = str(Path(args.video_dir) / _video_filename(args.task, run_id, seed, ep_i))
                     try:
@@ -635,6 +656,7 @@ def main(args: Args) -> None:
         out_file = out_dir / f"eval_{args.task}_{int(time.time())}.json"
         out_file.write_text(json.dumps({
             "args": dataclasses.asdict(args),
+            "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train
             "shader_mismatch_override": shader_mismatch_override_active(),
             "server_metadata": {f"port_{args.port}": server_metadata},
             "results": results,

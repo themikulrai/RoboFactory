@@ -30,8 +30,14 @@ launchers:
       max_steps: 400
       replan_after: 8
     seeds:
-      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
-      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      # PR4 FIX: was eval_seeds_60_dp.txt (raw 10000s/1000s). run_eval.py fed those raw
+      # seeds to eval_pi05.py, which multiplied by 100_000 -> the pi0.5 run never touched
+      # the same env seeds DP did, so this "paired" entry was silently UN-paired (A3 §2).
+      # eval_pi05.py now consumes FINAL env seeds directly (no x100_000), and this file is
+      # the resolved canonical_env_60 pool. DP launchers pointed at the SAME file (or
+      # --seed-pool canonical_env_60) now produce truly seed-paired numbers.
+      file: /iris/u/mikulrai/runs/eval_seeds_env_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_env_60.txt.sha256
       delim: ","
     server:
       # NOTE: `ports` are now LOGICAL ARM INDICES, not real TCP ports. run_eval.py

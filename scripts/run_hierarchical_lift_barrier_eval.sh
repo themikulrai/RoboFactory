@@ -65,7 +65,11 @@ LL_GPU1=0
 LL_XLA_MEM_FRACTION=0.30
 N_EPISODES=20
 BASE_SEED=1000
-SEED_STRIDE=1
+SEED_STRIDE=1          # DEPRECATED (PR4): accepted for back-compat; the driver no
+                       # longer multiplies by it. --seed-stride 100000 --base-seed 100
+                       # is auto-translated to --seed-pool canonical_env_60 below.
+SEED_POOL=""           # PR4: preferred — name a frozen pool (canonical_env_60, ...)
+ENV_SEEDS=""           # PR4: ad-hoc final-env-seed list (comma/space)
 MAX_ENV_STEPS=500
 REPLAN_AFTER=8
 CAMERA_FAMILY="wristcam"
@@ -94,6 +98,8 @@ while [[ $# -gt 0 ]]; do
     --n-episodes) N_EPISODES="$2"; shift 2;;
     --base-seed) BASE_SEED="$2"; shift 2;;
     --seed-stride) SEED_STRIDE="$2"; shift 2;;
+    --seed-pool) SEED_POOL="$2"; shift 2;;
+    --env-seeds) ENV_SEEDS="$2"; shift 2;;
     --max-env-steps) MAX_ENV_STEPS="$2"; shift 2;;
     --replan-after) REPLAN_AFTER="$2"; shift 2;;
     --camera-family) CAMERA_FAMILY="$2"; shift 2;;
@@ -220,13 +226,30 @@ if [[ "$MOCK" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------- 3) eval
+# PR4 seed resolution. The driver consumes FINAL env seeds (no in-driver transform):
+#   - --seed-pool / --env-seeds: forwarded straight through (preferred).
+#   - legacy --seed-stride 100000 --base-seed 100: the historical canonical convention
+#     (bases 100..159 -> env seeds 10_000_000..) is exactly the canonical_env_60 pool, so
+#     auto-translate to --seed-pool canonical_env_60.
+#   - otherwise: forward --seed <base> + --max-episodes (driver runs base..base+N-1 as
+#     FINAL env seeds; the *seed_stride multiply is gone).
+SEED_ARGS=()
+if [[ -n "$SEED_POOL" ]]; then
+  SEED_ARGS=(--seed-pool "$SEED_POOL")
+elif [[ -n "$ENV_SEEDS" ]]; then
+  SEED_ARGS=(--env-seeds "$ENV_SEEDS")
+elif [[ "$SEED_STRIDE" == "100000" && "$BASE_SEED" == "100" ]]; then
+  echo "[launcher] PR4: --seed-stride 100000 --base-seed 100 -> --seed-pool canonical_env_60"
+  SEED_ARGS=(--seed-pool canonical_env_60)
+else
+  [[ "$SEED_STRIDE" != "1" ]] && echo "[launcher] WARNING (PR4): --seed-stride $SEED_STRIDE is ignored; the driver runs --seed as FINAL env seeds. Use --seed-pool for the canonical convention." >&2
+  SEED_ARGS=(--seed "$BASE_SEED" --max-episodes "$N_EPISODES")
+fi
+
 EVAL_ARGS=(
   --ports "$LL_PORT0,$LL_PORT1"
   --hl-host 127.0.0.1 --hl-port "$HL_PORT"
   --hl-query-interval "$HL_QUERY_INTERVAL"
-  --max-episodes "$N_EPISODES"
-  --seed "$BASE_SEED"
-  --seed-stride "$SEED_STRIDE"
   --max-env-steps "$MAX_ENV_STEPS"
   --replan-after "$REPLAN_AFTER"
   --camera-family "$CAMERA_FAMILY"
@@ -234,6 +257,7 @@ EVAL_ARGS=(
   --hl-ckpt "$HL_MODEL"
   --arm0-ckpt "$LL_CKPT_ARM0"
   --arm1-ckpt "$LL_CKPT_ARM1"
+  "${SEED_ARGS[@]}"
 )
 [[ -n "$VIDEO_DIR" ]] && EVAL_ARGS+=(--video-dir "$VIDEO_DIR")
 [[ -n "$LIVE_JSON" ]] && EVAL_ARGS+=(--live-json "$LIVE_JSON")

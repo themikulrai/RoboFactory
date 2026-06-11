@@ -38,6 +38,16 @@ F) No hardcoded ``80[0-9][0-9]`` PORT literal may appear in a targeted launcher
    standalone ``80xx`` numeric tokens that are not part of a longer number and
    are not preceded by a path/word character.
 
+G) A 60-seed launcher must source its seeds from the single seed-convention
+   module (solution_E6.md §PR4): either a ``--seed-pool <name>`` flag (a name in
+   ``robofactory.utils.eval_seeds.POOL_NAMES``) OR one of the PINNED env-seed
+   files under ``/iris/u/mikulrai/runs/`` (``eval_seeds_env_60.txt`` =
+   canonical_env_60, the frozen ``eval_seeds_60_dp.txt`` = dp_legacy, or
+   ``eval_seeds_60.txt``). A launcher with neither is feeding raw/ad-hoc seeds —
+   the exact pattern that produced never-seed-paired cross-method comparisons and
+   the silently-unpaired "paired" manifest entry. A ``--seed-pool`` referencing an
+   unknown pool name is also flagged.
+
 Exit code: 0 if clean, 1 if any violation found.
 
 Usage
@@ -116,9 +126,57 @@ RE_LITERAL_SEED_BLOCK = re.compile(
 # `8000/8001`, `,8000)`, `--port 8000`, `start_server 0 8000` — DO match.
 RE_HARDCODED_PORT = re.compile(r'(?<![\w./-])80[0-9][0-9](?![0-9])')
 
+# Rule G — seed-convention sourcing. A 60-seed launcher must source its seeds from
+# the single seed-convention module (PR4): either a `--seed-pool <name>` flag or a
+# PINNED env-seed file. The pinned files are the frozen seed pins under
+# /iris/u/mikulrai/runs/ (matched by basename so the lint is path-prefix robust).
+RE_SEED_POOL_FLAG = re.compile(r'--seed-pool[=\s]+([A-Za-z0-9_]+)')
+# Pinned env-seed files (basenames). canonical_env_60, the frozen dp_legacy pin, and
+# the historical bases pin (kept for launchers that still reference it).
+PINNED_SEED_FILES = (
+    "eval_seeds_env_60.txt",
+    "eval_seeds_60_dp.txt",
+    "eval_seeds_60.txt",
+)
+RE_PINNED_SEED_FILE = re.compile(
+    r'(?:' + "|".join(re.escape(name) for name in PINNED_SEED_FILES) + r')'
+)
+# Does the launcher set seeds at all? (If it never passes seeds, rule G is N/A — the
+# driver default / manifest handles it; rule G only governs how an explicitly-seeded
+# 60-seed launcher names its seeds.)
+RE_SETS_SEEDS = re.compile(
+    r'(?:^|\s)(?:-s|--seeds?|--env-seeds|--seed-pool)\b'
+    r'|^\s*SEEDS\s*='
+    r'|\bpaste\s+-sd',
+    re.MULTILINE,
+)
+# Valid pool names live in eval_seeds; import lazily so the lint has no hard dep at
+# import time (e.g. when invoked outside the RoboFactory env). Falls back to a static
+# copy if the import fails.
+def _valid_pool_names() -> frozenset:
+    try:
+        from robofactory.utils.eval_seeds import POOL_NAMES
+        return POOL_NAMES
+    except Exception:
+        return frozenset({
+            "train_datagen", "canonical_env_60", "fresh_ood_60",
+            "upstream_100", "dp_legacy_60",
+        })
+
 
 def _line_no_of(text: str, span_start: int) -> int:
     return text.count("\n", 0, span_start) + 1
+
+
+def _rel_display(path: Path, root: Path) -> str:
+    """Path for display, robust to launchers outside `root` (the repo-root sbatch
+    hier scripts live at root.parent, which relative_to(root) cannot express)."""
+    for base in (root, root.parent):
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            continue
+    return str(path)
 
 
 def lint_one(path: Path) -> LauncherReport:
@@ -229,6 +287,38 @@ def lint_one(path: Path) -> LauncherReport:
                     ),
                 ))
 
+    # Rule G — seed-convention sourcing (PR4). Only 60-seed launchers are in scope
+    # (sbatch_hierarchical_*.sh are covered for rule F only). A launcher that sets
+    # seeds at all must do so via --seed-pool <valid-name> OR a pinned env-seed file.
+    if "60seeds" in path.name and RE_SETS_SEEDS.search(text):
+        pool_m = RE_SEED_POOL_FLAG.search(text)
+        pinned_m = RE_PINNED_SEED_FILE.search(text)
+        if pool_m is not None:
+            pool_name = pool_m.group(1)
+            if pool_name not in _valid_pool_names():
+                rpt.findings.append(LauncherFinding(
+                    path=path,
+                    line_no=_line_no_of(text, pool_m.start()),
+                    rule="G",
+                    message=(
+                        f"--seed-pool {pool_name!r} is not a known pool. Valid pools: "
+                        f"{sorted(_valid_pool_names())} (robofactory.utils.eval_seeds)."
+                    ),
+                ))
+        elif pinned_m is None:
+            rpt.findings.append(LauncherFinding(
+                path=path,
+                line_no=0,
+                rule="G",
+                message=(
+                    "60-seed launcher sets seeds but uses neither `--seed-pool "
+                    "<name>` nor a PINNED env-seed file "
+                    f"({list(PINNED_SEED_FILES)}). Raw/ad-hoc seeds are the "
+                    "never-seed-paired pattern PR4 retires — drive seeds from "
+                    "robofactory.utils.eval_seeds (solution_E6.md §PR4)."
+                ),
+            ))
+
     return rpt
 
 
@@ -278,12 +368,12 @@ def main(argv: list[str] | None = None) -> int:
     for rpt in reports:
         if rpt.ok:
             if args.verbose:
-                print(f"OK  {rpt.path.relative_to(args.root)}")
+                print(f"OK  {_rel_display(rpt.path, args.root)}")
             continue
         bad_files += 1
         total_findings += len(rpt.findings)
         for f in rpt.findings:
-            rel = f.path.relative_to(args.root)
+            rel = _rel_display(f.path, args.root)
             print(f"{rel}:{f.line_no}: rule {f.rule}: {f.message}")
 
     if total_findings:

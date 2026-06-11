@@ -103,11 +103,15 @@ class Args:
     hl_query_interval: int = 25  # K: query HL every K env steps
     hl_instruction: str = "lift the steel barrier using two robot arms"
     # ---- rollout / eval control ----
-    seed: int = 1000  # base seed; episode i uses base = seed + i
-    # Lift-Barrier pi0.5 project convention: env reset seed = base * seed_stride (+0). With
-    # seed_stride=100000, bases 100..159 map to env seeds 10_000_000.. ; the recorded/live
-    # "seed" field stays the BASE (100..159). seed_stride=1 (default) = consecutive bases.
-    seed_stride: int = 1
+    # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
+    # Prefer --seed-pool; --env-seeds is an ad-hoc final-env-seed list. When either is set,
+    # the driver runs exactly those FINAL env seeds (one episode each) and ignores
+    # --seed/--max-episodes. The old (seed+ep)*seed_stride transform — the stride trap that
+    # made early hier waves run raw 1000s — is DELETED: --seed-stride no longer exists.
+    seed_pool: str = ""
+    env_seeds: str = ""
+    allow_train_seeds: bool = False
+    seed: int = 1000  # DEPRECATED (pre-PR4): base FINAL env seed when no --seed-pool/--env-seeds given.
     max_episodes: int = 20
     max_env_steps: int = 500  # LiftBarrier-rf max_episode_steps is 500
     sim_backend: str = "auto"
@@ -598,6 +602,21 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
 def main(args: Args):
     _assert_not_login_node()
 
+    # PR4: resolve FINAL env seeds via the single source of truth. If --seed-pool or
+    # --env-seeds is given, run exactly those env seeds (one episode each) — the old
+    # (seed+ep)*seed_stride transform is deleted. Otherwise fall back to the legacy
+    # --seed/--seed-stride/--max-episodes path (kept for backward compat) and record
+    # its identity in the same provenance shape.
+    seed_provenance = None
+    resolved_env_seeds = None
+    if args.seed_pool or args.env_seeds:
+        from robofactory.utils.eval_seeds import resolve_seeds
+        resolved_env_seeds, seed_provenance = resolve_seeds(
+            pool=args.seed_pool or None,
+            env_seeds=args.env_seeds or None,
+            allow_train=args.allow_train_seeds,
+        )
+
     if args.camera_family not in CAMERA_FAMILIES:
         raise ValueError(f"--camera-family must be one of {sorted(CAMERA_FAMILIES)}, got {args.camera_family!r}")
     cam_map = dict(CAMERA_FAMILIES[args.camera_family])      # LL helpers' cameras
@@ -681,7 +700,7 @@ def main(args: Args):
             "status": status,
             "camera_family": args.camera_family,
             "checkpoints": {"hl": args.hl_ckpt, "arm0": args.arm0_ckpt, "arm1": args.arm1_ckpt},
-            "seeds_total": int(args.max_episodes),
+            "seeds_total": len(episode_seeds),  # PR4: actual resolved episode count
             "episodes": [
                 {
                     "seed": e["seed"],
@@ -700,11 +719,23 @@ def main(args: Args):
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(p)
 
+    # PR4: build the (recorded_seed, env_seed) episode list.
+    if resolved_env_seeds is not None:
+        # Pool / ad-hoc path: each resolved value IS the FINAL env seed. The recorded
+        # seed equals the env seed (no base/stride distinction remains).
+        episode_seeds = [(int(s), int(s)) for s in resolved_env_seeds]
+    else:
+        # Legacy --seed path (no pool given). PR4: the recorded seed IS the FINAL env
+        # seed (base + ep) — the *seed_stride multiply is DELETED. Retained for backward
+        # compat; deprecated by --seed-pool.
+        episode_seeds = [
+            (args.seed + ep, args.seed + ep)
+            for ep in range(args.max_episodes)
+        ]
+
     episodes = []
     _write_live("running", episodes)  # seed an empty live file so a reader sees us start
-    for ep in range(args.max_episodes):
-        base = args.seed + ep                 # recorded/live seed (e.g. 100..159)
-        env_seed = base * args.seed_stride     # actual env reset seed (project convention)
+    for ep, (base, env_seed) in enumerate(episode_seeds):
         video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
         rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, base,
                           video_path, view_sensors, env_seed=env_seed, record_seed=base)
@@ -719,6 +750,7 @@ def main(args: Args):
     results = {
         "task": args.task,
         "args": dataclasses.asdict(args),
+        "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train (None on legacy --seed path)
         "server_metadata": {f"arm{i}": ll_server_metadata[i] for i in range(len(ll_server_metadata))},
         "mode": "flat-baseline" if args.flat_baseline else "hierarchical",
         "mock_ll": args.mock_ll,
