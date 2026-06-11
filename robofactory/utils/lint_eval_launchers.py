@@ -48,6 +48,17 @@ G) A 60-seed launcher must source its seeds from the single seed-convention
    the silently-unpaired "paired" manifest entry. A ``--seed-pool`` referencing an
    unknown pool name is also flagged.
 
+H) A self-contained 60-seed launcher — one that runs an eval driver INLINE — must
+   call ``scripts/log_eval.py`` at the end (WEEK1_EXECUTION §A8, solution_E13 §C).
+   That auto-posts a field-notes cell carrying the run's job id + result jsonl +
+   SR, so the "new-cell-per-run" convention stops depending on a human
+   remembering. Thin EXEC-dispatch wrappers (whose last meaningful line is
+   ``exec .../submit_eval.sh ...``) are EXEMPT: they hand off to the manifest
+   dispatcher and never run the eval inline, so a trailing call would be dead
+   code — the auto-post for those belongs in the dispatcher. A launcher that runs
+   a driver inline but omits the ``log_eval.py`` call is the exact "result lands
+   on disk, nobody logs a cell, verdict crystallizes from memory" loop A8 kills.
+
 Exit code: 0 if clean, 1 if any violation found.
 
 Usage
@@ -83,7 +94,7 @@ SBATCH_HIER_GLOBS = (
 class LauncherFinding:
     path: Path
     line_no: int
-    rule: str  # A | B | C | D | E
+    rule: str  # A | B | C | D | E | F | G | H
     message: str
 
 
@@ -162,6 +173,26 @@ def _valid_pool_names() -> frozenset:
             "train_datagen", "canonical_env_60", "fresh_ood_60",
             "upstream_100", "dp_legacy_60",
         })
+
+
+# Rule H — the A8 auto-post convention. A self-contained 60-seed launcher must
+# call `log_eval.py` at the end so a field-notes cell (job id + jsonl + SR) is
+# posted mechanically. Match any `log_eval.py` invocation anywhere in the file
+# (it is appended near the end). The wrapper-exemption is decided by whether the
+# launcher's LAST meaningful line is an `exec ...` handoff.
+RE_LOG_EVAL_CALL = re.compile(r'\blog_eval\.py\b')
+RE_EXEC_HANDOFF = re.compile(r'^\s*exec\s+')
+
+
+def _last_meaningful_line(text: str) -> str:
+    """Return the last non-blank, non-comment line (a pure `exec` here marks a
+    thin manifest-dispatch wrapper, exempt from rule H)."""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return line
+    return ""
 
 
 def _line_no_of(text: str, span_start: int) -> int:
@@ -316,6 +347,28 @@ def lint_one(path: Path) -> LauncherReport:
                     f"({list(PINNED_SEED_FILES)}). Raw/ad-hoc seeds are the "
                     "never-seed-paired pattern PR4 retires — drive seeds from "
                     "robofactory.utils.eval_seeds (solution_E6.md §PR4)."
+                ),
+            ))
+
+    # Rule H — the A8 auto-post convention (WEEK1_EXECUTION §A8). Only 60-seed
+    # launchers are in scope (sbatch_hierarchical_*.sh are rule-F-only). A thin
+    # EXEC-dispatch wrapper hands off to the manifest dispatcher and never runs
+    # the eval inline, so it is exempt (a trailing log_eval would be dead code);
+    # everything else that runs a driver inline must call log_eval.py at the end.
+    if "60seeds" in path.name:
+        last = _last_meaningful_line(text)
+        is_exec_wrapper = bool(RE_EXEC_HANDOFF.match(last))
+        if not is_exec_wrapper and not RE_LOG_EVAL_CALL.search(text):
+            rpt.findings.append(LauncherFinding(
+                path=path,
+                line_no=0,
+                rule="H",
+                message=(
+                    "inline 60-seed launcher does not call `scripts/log_eval.py` "
+                    "at the end. Append a log_eval.py invocation so a field-notes "
+                    "cell (job id + result jsonl + SR) is auto-posted per run — "
+                    "the A8 loop-killer convention (WEEK1_EXECUTION §A8). "
+                    "(Thin `exec .../submit_eval.sh` wrappers are exempt.)"
                 ),
             ))
 

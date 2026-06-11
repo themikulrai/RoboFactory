@@ -151,3 +151,13 @@ mkdir -p "$VIDEO_DIR" "$OUT_DIR"
     --wandb-project openpi-robofactory \
     --wandb-name 'Eval 2SC wc Pi0.5 [Decent IID promptswap]' \
     --wandb-tags 'eval,pi05,decent,2sc,wristcam,table-scene,promptswap,ood-audit'
+
+echo "Done at $(date)"
+RESULT_FILE="$(ls -t $OUT_DIR/eval_decent_TwoRobotsStackCube-rf_*.json 2>/dev/null | head -1)"
+echo "Results JSON: $RESULT_FILE"
+# A8 loop-killer: auto-post a field-notes cell (job id + result jsonl + SR) so the
+# new-cell-per-run convention is mechanical, not memory-dependent (WEEK1 §A8).
+python scripts/log_eval.py \
+    --jsonl "$RESULT_FILE" \
+    --job "${SLURM_JOB_ID:-manual}" \
+    --title "Eval 2SC wc Pi0.5 [Decent promptswap, 60seeds]" || true

@@ -140,4 +140,11 @@ SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
     --wandb-tags "eval,pi05,decent,2sc,wristcam,table-scene,60seeds,step-${CKPT_STEP},propriodrop"
 
 echo "Done at $(date)"
-echo "Results JSON: $(ls -t $OUT_DIR/eval_decent_TwoRobotsStackCube-rf_*.json 2>/dev/null | head -1)"
+RESULT_FILE="$(ls -t $OUT_DIR/eval_decent_TwoRobotsStackCube-rf_*.json 2>/dev/null | head -1)"
+echo "Results JSON: $RESULT_FILE"
+# A8 loop-killer: auto-post a field-notes cell (job id + result jsonl + SR) so the
+# new-cell-per-run convention is mechanical, not memory-dependent (WEEK1 §A8).
+python scripts/log_eval.py \
+    --jsonl "$RESULT_FILE" \
+    --job "${SLURM_JOB_ID:-manual}" \
+    --title "Eval 2SC wc Pi0.5 [Decent, 60seeds]" || true

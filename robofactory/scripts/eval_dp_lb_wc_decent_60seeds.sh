@@ -78,4 +78,11 @@ SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
 
 echo "Done at $(date)"
 echo "Videos: $VIDEO_DIR"
-echo "Results JSONL: ${OUT_DIR}/lb_wc_decent_ckpt300_60seeds_${SLURM_JOB_ID}.jsonl"
+RESULT_FILE="${OUT_DIR}/lb_wc_decent_ckpt300_60seeds_${SLURM_JOB_ID}.jsonl"
+echo "Results JSONL: $RESULT_FILE"
+# A8 loop-killer: auto-post a field-notes cell (job id + result jsonl + SR) so the
+# new-cell-per-run convention is mechanical, not memory-dependent (WEEK1 §A8).
+python scripts/log_eval.py \
+    --jsonl "$RESULT_FILE" \
+    --job "${SLURM_JOB_ID:-manual}" \
+    --title "Eval LB wc DP [Decent ckpt300, 60seeds]" || true

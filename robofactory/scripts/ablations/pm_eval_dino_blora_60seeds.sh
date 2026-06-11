@@ -39,6 +39,7 @@ python -u -m robofactory.utils.preflight_eval \
   --ckpt-path /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_dino_blora.ckpt \
   --scene-config configs/table/pick_meat.yaml || exit 1
 
+RESULT_FILE="/iris/u/mikulrai/logs/phase2_debug/pm_eval_dino_blora_${SLURM_JOB_ID:-manual}.jsonl"
 python -u ./policy/Diffusion-Policy/eval_dp.py \
   --config=configs/table/pick_meat.yaml \
   --ckpt-path=/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_dino_blora.ckpt \
@@ -49,5 +50,13 @@ python -u ./policy/Diffusion-Policy/eval_dp.py \
   -s $SEEDS \
   --quiet \
   --max-steps=200 \
+  --jsonl-path "$RESULT_FILE" \
   --wandb \
   --wandb-tags='eval,pm,track-b,encoder-dino-blora,60seeds,xbucket,seedset-dp-xbucket'
+
+# A8 loop-killer: auto-post a field-notes cell (job id + result jsonl + SR) so the
+# new-cell-per-run convention is mechanical, not memory-dependent (WEEK1 §A8).
+python scripts/log_eval.py \
+    --jsonl "$RESULT_FILE" \
+    --job "${SLURM_JOB_ID:-manual}" \
+    --title "Eval PickMeat WC DP [dino-blora enc, 60seeds]" || true

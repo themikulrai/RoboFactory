@@ -45,6 +45,7 @@ mkdir -p /iris/u/mikulrai/logs/eval_dp_lb_wc_cent
 # DP seed pool (x-bucket), passed space-separated.
 SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
 
+RESULT_FILE="/iris/u/mikulrai/logs/eval_dp_lb_wc_cent/lb_wc_cent_joint_60seeds_${SLURM_JOB_ID:-manual}.jsonl"
 "$PY" -u ./policy/Diffusion-Policy/eval_joint_dp.py \
     --ckpt-path "$CKPT" \
     --config configs/table/lift_barrier.yaml \
@@ -54,7 +55,15 @@ SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
     --robot-uids "panda_wristcam_multi,panda_wristcam_multi" \
     --max-steps 150 \
     --record-dir "$RECORD_DIR" \
+    --jsonl-path "$RESULT_FILE" \
     --seed $SEEDS
 
 echo "Done at $(date)"
 echo "Record dir: $RECORD_DIR"
+echo "Results JSONL: $RESULT_FILE"
+# A8 loop-killer: auto-post a field-notes cell (job id + result jsonl + SR) so the
+# new-cell-per-run convention is mechanical, not memory-dependent (WEEK1 §A8).
+python scripts/log_eval.py \
+    --jsonl "$RESULT_FILE" \
+    --job "${SLURM_JOB_ID:-manual}" \
+    --title "Eval LB wc DP [Cent joint, 60seeds]" || true
