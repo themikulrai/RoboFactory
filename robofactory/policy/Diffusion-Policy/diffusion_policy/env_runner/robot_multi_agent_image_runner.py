@@ -175,12 +175,20 @@ class RobotMultiAgentImageRunner:
         return frame.astype(np.uint8)
 
     def _rollout_single_episode(self, env, policies, dp_runners, seed: int, record_frames: bool) -> dict:
+        import random as _random
         for runner in dp_runners.values():
             runner.reset_obs()
 
         raw_obs, _ = env.reset(seed=seed)
         if env.action_space is not None:
             env.action_space.seed(seed)
+        # PR5: seed the diffusion sampler RNG per episode (same env seed on the same
+        # node/GPU -> identical trajectory; cross-GPU bitwise determinism NOT promised).
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed % 2**32)
+        _random.seed(seed)
 
         # Hard-fail (once/process) if the first rendered head_camera_global frame is
         # black-skied (shader_pack=minimal / login-node symptom).

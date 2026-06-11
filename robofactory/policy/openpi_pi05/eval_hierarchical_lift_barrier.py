@@ -496,7 +496,8 @@ def fidelity_check(
 
 def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path,
                 view_sensors, env_seed=None, record_seed=None):
-    obs, _ = env.reset(seed=(env_seed if env_seed is not None else seed))
+    _eff_seed = int(env_seed if env_seed is not None else seed)  # PR5: per-episode LL rng key
+    obs, _ = env.reset(seed=_eff_seed)
     if hl_client is not None:
         hl_client.reset()
 
@@ -552,6 +553,7 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         for i in range(args.num_arms):
             if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                 obs_i = _build_ll_obs(obs, args, cam_map, prompts[i])
+                obs_i["_episode_seed"] = _eff_seed  # PR5: re-key this LL server's rng per episode (popped server-side)
                 chunks[i] = np.asarray(ll_policies[i].infer(obs_i)["actions"])
                 chunk_idxs[i] = 0
                 replanned[i] = True

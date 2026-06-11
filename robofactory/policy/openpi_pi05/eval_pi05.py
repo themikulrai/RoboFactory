@@ -325,6 +325,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
             replanned = False
             if chunk is None or chunk_idx >= args.replan_after:
                 obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, args.state_pad_to)
+                obs_dict["_episode_seed"] = int(seed)  # PR5: server re-keys self._rng per episode (popped before transforms)
                 result = policy.infer(obs_dict)
                 chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
                 chunk_idx = 0
@@ -431,6 +432,7 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
                 continue
             if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                 obs_dict = _build_obs_dict_at(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, i)
+                obs_dict["_episode_seed"] = int(seeds[i])  # PR5: re-key per env seed (lockstep envs alternate seeds -> server re-keys each call)
                 result = policy.infer(obs_dict)
                 chunks[i] = np.asarray(result["actions"])[:, :active_dim]
                 chunk_idxs[i] = 0

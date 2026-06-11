@@ -155,6 +155,10 @@ class LauncherCfg(StrictModel):
     env_hooks: list[str] = Field(default_factory=list)
     wandb: WandbCfg
     sbatch: SbatchCfg
+    # PR5: number of repeat eval runs (same seeds, different sampler RNG is pinned per
+    # episode so reps differ only by GPU-kernel nondeterminism). Default 3 for canonical
+    # rows; set 1 for ablations. The N_REPEATS env var overrides this at dispatch time.
+    n_repeats: Optional[int] = None
 
     @model_validator(mode="after")
     def _check_policy_consistency(self):

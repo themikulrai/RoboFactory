@@ -7,6 +7,7 @@ shells out to.
 """
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -269,3 +270,111 @@ class TestDryRunFlow:
         assert run_mock.call_count == 1
         called_cmd = run_mock.call_args[0][0]
         assert "preflight_eval_guards" in " ".join(called_cmd)
+
+
+# ---------------------------------------------------------------------------
+# PR5: N_REPEATS resolution + repeat loop
+# ---------------------------------------------------------------------------
+class TestResolveNRepeats:
+    def setup_method(self):
+        # Make sure no ambient N_REPEATS env leaks into the precedence tests.
+        os.environ.pop("N_REPEATS", None)
+
+    def teardown_method(self):
+        os.environ.pop("N_REPEATS", None)
+
+    def test_canonical_default_is_3(self):
+        cfg = _cfg("pm_dp_in1k")
+        assert r.resolve_n_repeats(cfg, "pm_dp_in1k") == 3
+
+    def test_ablation_prefix_default_is_1(self):
+        cfg = _cfg("pm_dp_in1k")
+        assert r.resolve_n_repeats(cfg, "ablation_dino_blora") == 1
+        assert r.resolve_n_repeats(cfg, "abl_in1k_crop") == 1
+
+    def test_manifest_field_overrides_default(self):
+        cfg = _cfg("pm_dp_in1k").model_copy(update={"n_repeats": 5})
+        assert r.resolve_n_repeats(cfg, "pm_dp_in1k") == 5
+
+    def test_env_var_overrides_everything(self):
+        os.environ["N_REPEATS"] = "7"
+        cfg = _cfg("pm_dp_in1k").model_copy(update={"n_repeats": 5})
+        # env (7) beats cfg.n_repeats (5) beats default (3).
+        assert r.resolve_n_repeats(cfg, "pm_dp_in1k") == 7
+
+    def test_zero_or_negative_rejected(self):
+        os.environ["N_REPEATS"] = "0"
+        cfg = _cfg("pm_dp_in1k")
+        with pytest.raises(ValueError):
+            r.resolve_n_repeats(cfg, "pm_dp_in1k")
+
+
+class TestRepeatLoop:
+    def setup_method(self):
+        os.environ.pop("N_REPEATS", None)
+
+    def teardown_method(self):
+        os.environ.pop("N_REPEATS", None)
+
+    def test_dp_runs_driver_once_per_rep(self):
+        """N_REPEATS=3 => preflight (1) + driver (3) = 4 subprocess.run calls; each
+        driver argv carries a distinct _rep{k} jsonl path."""
+        os.environ["N_REPEATS"] = "3"
+        cfg = _cfg("pm_dp_in1k")
+        with mock.patch.object(r.subprocess, "run") as run_mock:
+            run_mock.return_value.returncode = 0
+            rc = r.run_launcher(cfg, "pm_dp_in1k", slurm_job_id="JOB", dry_run=False)
+        assert rc == 0
+        assert run_mock.call_count == 4  # 1 preflight + 3 driver reps
+        driver_cmds = [
+            c.args[0] for c in run_mock.call_args_list
+            if "eval_dp.py" in " ".join(c.args[0])
+        ]
+        assert len(driver_cmds) == 3
+        rep_paths = []
+        for cmd in driver_cmds:
+            jp = [a for a in cmd if a.startswith("--jsonl-path=")]
+            assert len(jp) == 1, f"expected one --jsonl-path, got {jp}"
+            rep_paths.append(jp[0])
+        # All three rep paths are distinct (rep0/rep1/rep2).
+        assert len(set(rep_paths)) == 3
+        assert any("rep0" in p for p in rep_paths)
+        assert any("rep2" in p for p in rep_paths)
+
+    def test_single_rep_keeps_legacy_naming(self):
+        """N_REPEATS=1 => no _rep suffix injected (legacy timestamp filename preserved)."""
+        os.environ["N_REPEATS"] = "1"
+        cfg = _cfg("pm_dp_in1k")
+        with mock.patch.object(r.subprocess, "run") as run_mock:
+            run_mock.return_value.returncode = 0
+            rc = r.run_launcher(cfg, "pm_dp_in1k", slurm_job_id="JOB", dry_run=False)
+        assert rc == 0
+        assert run_mock.call_count == 2  # 1 preflight + 1 driver
+        driver_cmds = [
+            c.args[0] for c in run_mock.call_args_list
+            if "eval_dp.py" in " ".join(c.args[0])
+        ]
+        assert len(driver_cmds) == 1
+        # No injected per-rep jsonl path in single-rep mode.
+        assert not any(a.startswith("--jsonl-path=") for a in driver_cmds[0])
+
+    def test_nonzero_rc_surfaces_but_all_reps_run(self):
+        """A failing rep sets the final rc nonzero but doesn't abort remaining reps."""
+        os.environ["N_REPEATS"] = "3"
+        cfg = _cfg("pm_dp_in1k")
+        calls = {"n": 0}
+
+        def fake_run(cmd, *a, **k):
+            m = mock.Mock()
+            # preflight (call 0) ok; one driver rep fails.
+            if "eval_dp.py" in " ".join(cmd):
+                calls["n"] += 1
+                m.returncode = 1 if calls["n"] == 2 else 0
+            else:
+                m.returncode = 0
+            return m
+
+        with mock.patch.object(r.subprocess, "run", side_effect=fake_run):
+            rc = r.run_launcher(cfg, "pm_dp_in1k", slurm_job_id="JOB", dry_run=False)
+        assert rc == 1            # nonzero surfaced
+        assert calls["n"] == 3    # all three driver reps still ran

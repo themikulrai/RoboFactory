@@ -255,6 +255,9 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                     if obs_dict is None:
                         obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                    # PR5: re-key each per-arm server's rng per episode. Set fresh every call
+                    # because Policy.infer pops the key in place (each arm is a separate server).
+                    obs_dict["_episode_seed"] = int(seed)
                     result = policies[i].infer(obs_dict)
                     chunks[i] = np.asarray(result["actions"])  # (H, 8)
                     chunk_idxs[i] = 0

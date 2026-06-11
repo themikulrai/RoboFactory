@@ -8,6 +8,20 @@ exact recipe that produced each canonical result is reproducible.
 Sister directory: [`scripts/ablations/`](../ablations/) for image-encoder
 ablations and similar studies.
 
+## Reporting policy (PR5) — headline = mean ± Wilson CI over >= 3 reps
+
+Every canonical launcher runs `N_REPEATS` repeats (default **3** for `scripts/canonical/*`,
+**1** for ablations; override via the `N_REPEATS` env var). The headline number for any
+canonical row is the **mean ± Wilson 95% CI pooled over >= 3 repeat runs**, computed with
+`python -m robofactory.tools.summarize_eval_runs <rep0.json> <rep1.json> ...`. A
+single-run number is binomial noise of about **±10-14 pp** (84% ± 14 on one seed × 25 — A9);
+the summarizer refuses to print one without a `single-run (noise ±10-14pp)` tag.
+**Single-run deltas < 15 pp are not findings.** PR5 pins the sampler RNG per episode
+(torch/np/random + the pi0.5 `_episode_seed` hook), so the same seed on the same node/GPU
+reproduces; repeats quantify the residual cross-run spread. Cross-GPU bitwise determinism
+is **not** promised (no `cudnn.deterministic`; A40/A5000/A6000 kernels differ) — the contract
+is pinned-noise + repeats, not bit-identity.
+
 ## Launchers
 
 ### Pick Meat (workspace cam) — DP

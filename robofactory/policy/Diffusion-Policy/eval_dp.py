@@ -214,11 +214,20 @@ def get_model_input(observation, agent_pos, img_h: Optional[int] = None, img_w: 
 def run_episode(env, planner, dp_model, seed, args, verbose, video_path: Optional[str] = None):
     """Run one PickMeat-style single-agent episode. Returns metrics dict."""
     import time as _t
+    import random as _random
     torch.cuda.reset_peak_memory_stats()
     t_ep = _t.perf_counter()
     raw_obs, _ = env.reset(seed=seed)
     if env.action_space is not None:
         env.action_space.seed(seed)
+    # PR5: seed the diffusion sampler RNG per episode so the same env seed on the same
+    # node/GPU yields an identical trajectory. torch is NEVER seeded at eval otherwise →
+    # diffusion sampling noise free-runs. Cross-GPU bitwise determinism is NOT promised.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed % 2**32)
+    _random.seed(seed)
     # Hard-fail (once/process) if the first global frame is black-skied (PR3).
     from robofactory.utils.eval_guards import shader_bg_guard
     shader_bg_guard(_global_frame_for_guard(raw_obs))
