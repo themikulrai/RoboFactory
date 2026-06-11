@@ -87,6 +87,46 @@ def test_action_dim_match_ok():
     assert diag is None
 
 
+def test_dim_arm_disabled_config_match_does_not_reject():
+    """Regression for E10 false-reject (2026-06-11): the drivers now pass
+    expect_action_dim=None because serve_policy reports the PADDED model dim (32),
+    not the task-specific dim (PM=8 / LB cent=16 / LB-decent-arm=8). With the dim arm
+    disabled, a config_name MATCH must proceed even though the served action_dim (32)
+    can never equal the task dim — config_name remains the hard guard."""
+    # Centralised driver previously passed expect_action_dim=num_arms*8 (e.g. 16);
+    # decent/hier passed 8. All now pass None.
+    for task_dim in (8, 16, 24):  # PM, LB-cent, hypothetical — none equals padded 32
+        # Sanity: with the dim arm ENABLED this WOULD have false-rejected.
+        ok_enabled, _ = check_server_identity(
+            ARM0_META,
+            expect_config="pi05_robofactory_lb_wc_decent_arm0",
+            expect_action_dim=task_dim,
+        )
+        assert ok_enabled is False, f"dim arm should reject {task_dim} vs served 32"
+        # With the dim arm DISABLED (None), a config MATCH proceeds.
+        ok, diag = check_server_identity(
+            ARM0_META,
+            expect_config="pi05_robofactory_lb_wc_decent_arm0",
+            expect_action_dim=None,
+        )
+        assert ok is True
+        assert diag is None
+    # And assert_*_or_exit is a no-op (does not exit) in the disabled-dim config-match case.
+    assert_server_identity_or_exit(
+        ARM0_META,
+        expect_config="pi05_robofactory_lb_wc_decent_arm0",
+        expect_action_dim=None,
+    )
+    # config_name MISMATCH must still hard-reject even with the dim arm disabled.
+    ok_bad, diag_bad = check_server_identity(
+        ARM0_META,
+        expect_config="pi05_robofactory_lb_wc_decent_arm1",
+        expect_action_dim=None,
+    )
+    assert ok_bad is False
+    assert "SERVER IDENTITY MISMATCH" in diag_bad
+
+
 def test_missing_metadata_is_unverifiable_ok():
     # Legacy server (pre-PR2) sends {} -> cannot verify -> proceed.
     ok, diag = check_server_identity({}, expect_config="anything", expect_action_dim=8)

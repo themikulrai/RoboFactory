@@ -654,14 +654,17 @@ def main(args: Args) -> None:
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
     server_metadata = dict(policy.get_server_metadata() or {})
     print(f"Server metadata: {server_metadata}", flush=True)
-    # PR2 server-identity handshake: refuse to run (exit 3) if the served config or
-    # action dim is not what this client was told to expect. Centralised model action
-    # dim is num_arms*8. Missing metadata (legacy server) is un-verifiable -> proceeds.
+    # PR2 server-identity handshake: refuse to run (exit 3) if the served config is not
+    # what this client was told to expect. Missing metadata (legacy server) is
+    # un-verifiable -> proceeds. (action_dim arm disabled — see comment below.)
     from robofactory.utils.server_identity import assert_server_identity_or_exit
     assert_server_identity_or_exit(
         server_metadata,
         args.expect_config or None,
-        expect_action_dim=(args.num_arms * 8),
+        # action_dim from serve_policy is the padded model dim (32), not task-specific;
+        # config_name is the real guard (server reports a fixed real_action_dim too) —
+        # PR2 dim-arm disabled, see E10 false-reject 2026-06-11.
+        expect_action_dim=None,
         label=f"port {args.port}",
     )
     print(f"num_arms={args.num_arms} active_dim={active_dim} cam_map={cam_map}")

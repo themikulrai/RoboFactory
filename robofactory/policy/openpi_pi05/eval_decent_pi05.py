@@ -494,7 +494,10 @@ def main(args: Args) -> None:
         assert_server_identity_or_exit(
             server_metadata[i],
             expect_configs[i] if expect_configs else None,
-            expect_action_dim=8,
+            # action_dim from serve_policy is the padded model dim (32), not task-specific;
+            # config_name is the real guard (server reports a fixed real_action_dim too) —
+            # PR2 dim-arm disabled, see E10 false-reject 2026-06-11.
+            expect_action_dim=None,
             label=f"arm{i} (port {ports[i]})",
         )
     print(f"num_arms={args.num_arms} ports={ports} cam_map={cam_map}")
