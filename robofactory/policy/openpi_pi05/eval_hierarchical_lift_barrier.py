@@ -125,6 +125,11 @@ class Args:
     flat_baseline: bool = False  # skip HL; fixed prompt for both arms
     flat_prompt: str = "lift the steel barrier using two robot arms"
     mock_ll: bool = False  # zero-action chunks instead of contacting LL servers
+    # PR2 server-identity handshake for the LL pi0.5 servers. If set, hard-fail (exit 3)
+    # before episode 1 unless each LL arm's metadata config_name matches AND action_dim==8.
+    # Accepts a single name (broadcast to all arms) OR a comma-separated name per arm,
+    # aligned with --ports. Ignored under --mock-ll (no real server). Empty => no check.
+    expect_config: str = ""
 
 
 # ----------------------------------------------------------------------------- obs helpers
@@ -629,6 +634,34 @@ def main(args: Args):
 
     ll_policies = _make_ll_policies(args)
 
+    # PR2 server-identity handshake for the LL pi0.5 servers (skipped under --mock-ll,
+    # which has no real metadata). Per-arm decent dim is 8. A wrong served config or
+    # action dim hard-fails before episode 1 instead of silently rolling out.
+    ll_server_metadata: list[dict] = []
+    for i, p in enumerate(ll_policies):
+        meta = dict(p.get_server_metadata() or {}) if hasattr(p, "get_server_metadata") else {}
+        ll_server_metadata.append(meta)
+        print(f"[arm{i}] server metadata: {meta}")
+    if args.expect_config and not args.mock_ll:
+        expect_configs = [c.strip() for c in args.expect_config.split(",")]
+        if len(expect_configs) == 1:
+            expect_configs = expect_configs * args.num_arms  # broadcast single name
+        if len(expect_configs) != args.num_arms:
+            print(
+                f"SERVER IDENTITY MISMATCH: --expect-config has {len(expect_configs)} entries "
+                f"but --num-arms={args.num_arms} (single name or one per arm); refusing to run",
+                file=_sys.stderr, flush=True,
+            )
+            _sys.exit(3)
+        from robofactory.utils.server_identity import assert_server_identity_or_exit
+        for i in range(args.num_arms):
+            assert_server_identity_or_exit(
+                ll_server_metadata[i],
+                expect_configs[i],
+                expect_action_dim=8,
+                label=f"arm{i}",
+            )
+
     hl_client = None
     if not args.flat_baseline:
         hl_client = HLClient(args.hl_host, args.hl_port, args.hl_instruction, hl_cam_map)
@@ -685,6 +718,8 @@ def main(args: Args):
 
     results = {
         "task": args.task,
+        "args": dataclasses.asdict(args),
+        "server_metadata": {f"arm{i}": ll_server_metadata[i] for i in range(len(ll_server_metadata))},
         "mode": "flat-baseline" if args.flat_baseline else "hierarchical",
         "mock_ll": args.mock_ll,
         "hl_query_interval": args.hl_query_interval,

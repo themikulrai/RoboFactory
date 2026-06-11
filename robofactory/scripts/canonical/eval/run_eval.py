@@ -152,6 +152,10 @@ def build_pi05_single_argv(
         "--wandb-project", cfg.wandb.project,
         "--wandb-tags", ",".join(cfg.wandb.tags),
     ]
+    # PR2 server-identity handshake: pass the config name the supervisor will serve so
+    # the client hard-fails before episode 1 on a wrong-policy-behind-the-port mismatch.
+    if cfg.ckpt.train_config:
+        argv.extend(["--expect-config", cfg.ckpt.train_config])
     if cfg.task.prompt:
         argv.extend(["--prompt", cfg.task.prompt])
     return argv
@@ -188,6 +192,11 @@ def build_pi05_decent_argv(
         "--wandb-project", cfg.wandb.project,
         "--wandb-tags", ",".join(cfg.wandb.tags),
     ]
+    # PR2 server-identity handshake: one expected config per arm, in --ports order.
+    # The supervisor serves cfg.server.arm_configs[i] on real_ports[i] (see
+    # _build_server_specs), so the alignment matches by construction.
+    if cfg.server.arm_configs:
+        argv.extend(["--expect-config", ",".join(cfg.server.arm_configs)])
     return argv
 
 

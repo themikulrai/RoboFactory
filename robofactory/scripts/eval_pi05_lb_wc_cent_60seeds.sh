@@ -106,6 +106,7 @@ SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
     --config /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml \
     --host 127.0.0.1 \
     --port "${PORT}" \
+    --expect-config "${CENT_CFG}" \
     --camera-mapping /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/lift_barrier_wristcam.json \
     --robot-uid panda_wristcam_multi \
     --robot-uids-csv "panda_wristcam_multi,panda_wristcam_multi" \

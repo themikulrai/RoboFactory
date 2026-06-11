@@ -83,6 +83,8 @@ class Args:
     num_envs: int = 1  # >1 = vectorize; one batch of size num_envs runs in lockstep
     num_arms: int = 3
     active_dim: int = 0  # 0 => num_arms * 8
+    expect_config: str = ""  # if set, hard-fail (exit 3) before episode 1 unless the
+    # server's metadata config_name matches AND action_dim == num_arms*8 (PR2)
     state_pad_to: int = 0  # 0 => no padding; set to model's active_dim to pad env state w/ zeros (curriculum models)
     camera_mapping: str = ""  # path to JSON; empty => DEFAULT_CAMERA_MAPPING
     robot_uid: str = "panda"  # agent key prefix, e.g. "panda_wristcam_multi" for D2
@@ -499,7 +501,18 @@ def main(args: Args) -> None:
     print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}' is_dict_action={is_dict_action}", flush=True)
 
     policy = WebsocketClientPolicy(host=args.host, port=args.port)
-    print(f"Server metadata: {policy.get_server_metadata()}", flush=True)
+    server_metadata = dict(policy.get_server_metadata() or {})
+    print(f"Server metadata: {server_metadata}", flush=True)
+    # PR2 server-identity handshake: refuse to run (exit 3) if the served config or
+    # action dim is not what this client was told to expect. Centralised model action
+    # dim is num_arms*8. Missing metadata (legacy server) is un-verifiable -> proceeds.
+    from robofactory.utils.server_identity import assert_server_identity_or_exit
+    assert_server_identity_or_exit(
+        server_metadata,
+        args.expect_config or None,
+        expect_action_dim=(args.num_arms * 8),
+        label=f"port {args.port}",
+    )
     print(f"num_arms={args.num_arms} active_dim={active_dim} cam_map={cam_map}")
 
     run_id = _resolve_run_id(args.run_id)
@@ -604,7 +617,11 @@ def main(args: Args) -> None:
         print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
         out_file = out_dir / f"eval_{args.task}_{int(time.time())}.json"
-        out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
+        out_file.write_text(json.dumps({
+            "args": dataclasses.asdict(args),
+            "server_metadata": {f"port_{args.port}": server_metadata},
+            "results": results,
+        }, indent=2))
         print(f"Saved {out_file}")
 
         wandb_run.log_summary(

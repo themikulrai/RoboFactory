@@ -120,6 +120,7 @@ SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
     --config /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/two_robots_stack_cube.yaml \
     --host 127.0.0.1 \
     --ports "${PORT0},${PORT1}" \
+    --expect-config "${ARM0_CFG},${ARM1_CFG}" \
     --num-arms 2 \
     --num-episodes 1 \
     --seeds "$SEEDS" \

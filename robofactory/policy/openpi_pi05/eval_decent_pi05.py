@@ -108,6 +108,10 @@ class Args:
     video_all: bool = False  # DEPRECATED/ignored: every seed always records. Kept so --video-all still parses.
     run_id: str = ""  # disambiguates videos across runs; "" => $SLURM_JOB_ID or unix-ts
     num_arms: int = 3
+    # If set, hard-fail (exit 3) before episode 1 unless each arm's server metadata
+    # config_name matches (comma-separated, one per arm, aligned with --ports) AND its
+    # action_dim == 8 (per-arm decent dim). Empty => no identity check (PR2).
+    expect_config: Annotated[str, tyro.conf.arg(help="comma-separated config names, one per arm, aligned with --ports")] = ""
     camera_mapping: str = ""
     robot_uid: str = "panda_wristcam_multi"
     robot_uids_csv: str = ""
@@ -377,8 +381,28 @@ def main(args: Args) -> None:
     print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}'", flush=True)
 
     policies = [WebsocketClientPolicy(host=args.host, port=p) for p in ports]
+    server_metadata = [dict(p.get_server_metadata() or {}) for p in policies]
     for i, p in enumerate(policies):
-        print(f"[arm{i}] server metadata: {p.get_server_metadata()}")
+        print(f"[arm{i}] server metadata: {server_metadata[i]}")
+    # PR2 server-identity handshake (one expected config per arm, aligned with --ports).
+    # Per-arm decent model action dim is 8. A mismatch (or arm/config count mismatch)
+    # hard-fails before episode 1 instead of producing per-episode IndexErrors.
+    expect_configs = [c.strip() for c in args.expect_config.split(",")] if args.expect_config else []
+    if expect_configs and len(expect_configs) != args.num_arms:
+        print(
+            f"SERVER IDENTITY MISMATCH: --expect-config has {len(expect_configs)} entries "
+            f"but --num-arms={args.num_arms} (one per arm, aligned with --ports); refusing to run",
+            file=_sys.stderr, flush=True,
+        )
+        _sys.exit(3)
+    from robofactory.utils.server_identity import assert_server_identity_or_exit
+    for i in range(args.num_arms):
+        assert_server_identity_or_exit(
+            server_metadata[i],
+            expect_configs[i] if expect_configs else None,
+            expect_action_dim=8,
+            label=f"arm{i} (port {ports[i]})",
+        )
     print(f"num_arms={args.num_arms} ports={ports} cam_map={cam_map}")
 
     run_id = _resolve_run_id(args.run_id)
@@ -460,7 +484,11 @@ def main(args: Args) -> None:
         print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
 
         out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
-        out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
+        out_file.write_text(json.dumps({
+            "args": dataclasses.asdict(args),
+            "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
+            "results": results,
+        }, indent=2))
         print(f"Saved {out_file}")
 
         wandb_run.log_summary(
