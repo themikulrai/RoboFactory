@@ -168,9 +168,49 @@ def test_dart_rng_does_not_consume_global():
 # ---------------------------------------------------------------------------
 # SIM tests (GPU compute node only; DART_RUN_SIM=1)
 # ---------------------------------------------------------------------------
+def _run_liftbarrier_recovered(tmp_path, sigma=0.05, p_inject=0.5, dart_seed=0,
+                               capture_disturbances=True):
+    """Run a tiny LiftBarrier DART rollout that RELIABLY yields >=1 recorded,
+    successful episode containing >=1 captured disturbance.
+
+    Design rationale (the prior p_inject=1.0 helper was so disruptive the
+    scripted solver never recovered -> 0 trajs recorded -> the real
+    noise-not-recorded contract was never reached):
+      - small sigma=0.05 (~3deg/joint) -> the planner re-solves easily,
+      - p_inject=0.5 -> disturbances DO fire (so the sink is non-empty) but not
+        on every move,
+      - num=1 with override_seeds=range(8) and max_retries_per_seed=2 -> run()
+        loops seeds, discarding failed-recovery episodes, until ONE success is
+        recorded (up to 8 candidate seeds * 2 retries = 16 chances).
+
+    Returns (out_h5, disturbances) where disturbances is the captured sink list
+    (each entry a dict {"panda-0": (8,), "panda-1": (8,)} of emitted noisy
+    action targets) or None if capture was disabled.
+    """
+    from dart import run_dart_rollouts as rdr
+
+    sink = [] if capture_disturbances else None
+    rdr._DISTURBANCE_SINK = sink
+    record_dir = str(tmp_path / f"sigma{sigma}")
+    try:
+        out_h5 = rdr.run(
+            "LiftBarrier", 1, record_dir,
+            sigma=sigma, k_min=5, k_max=8, p_inject=p_inject,
+            dart_seed=dart_seed, max_retries_per_seed=2,
+            per_attempt_timeout=300,
+            override_seeds=list(range(8)),
+        )
+    finally:
+        rdr._DISTURBANCE_SINK = None
+    return out_h5, sink
+
+
 def _run_liftbarrier(tmp_path, sigma, num=1, dart_seed=0, p_inject=1.0,
                      capture_disturbances=False):
-    """Run a tiny LiftBarrier DART rollout, returning (out_h5, disturbances)."""
+    """Thin wrapper kept for the limits/huge-sigma sim tests that still want a
+    raw single-run handle. Uses override_seeds=range(num*2) for a little
+    head-room but does NOT guarantee a recovered episode (those tests tolerate
+    zero/low yield)."""
     from dart import run_dart_rollouts as rdr
 
     sink = [] if capture_disturbances else None
@@ -190,42 +230,90 @@ def _run_liftbarrier(tmp_path, sigma, num=1, dart_seed=0, p_inject=1.0,
 
 @sim
 def test_sim_noise_not_recorded(tmp_path):
-    """(1) No recorded actions/panda-i row equals any emitted disturbance."""
-    out_h5, disturbances = _run_liftbarrier(
-        tmp_path, sigma=0.15, num=1, p_inject=1.0, capture_disturbances=True)
+    """CORE CONTRACT: no recorded actions/panda-i row equals any emitted
+    disturbance action. Redesigned to RELIABLY produce a recovered episode
+    (sigma=0.05, p_inject=0.5) before asserting the contract."""
+    out_h5, disturbances = _run_liftbarrier_recovered(
+        tmp_path, sigma=0.05, p_inject=0.5, capture_disturbances=True)
     assert osp.exists(out_h5)
-    assert len(disturbances) > 0, "no disturbance was injected"
-
-    # flatten emitted disturbance arrays per agent
-    emitted = {0: [], 1: []}
-    for d in disturbances:
-        for aid in (0, 1):
-            emitted[aid].append(np.asarray(d[f"panda-{aid}"], dtype=np.float64))
 
     with h5py.File(out_h5, "r") as f:
         trajs = merge_h5_keys(f)
-        assert trajs, "no trajectory recorded"
+        # (a) at least one recorded traj — else the env couldn't recover even at
+        # sigma=0.05; fail loudly, do NOT silently skip.
+        assert trajs, (
+            "no trajectory was recorded even at sigma=0.05/p_inject=0.5 across "
+            "8 candidate seeds x 2 retries — the LiftBarrier solver could not "
+            "recover from a tiny disturbance; the contract could not be tested")
+
+        # (b) at least one disturbance must have actually been emitted, else the
+        # contract is vacuously true and we've tested nothing.
+        assert disturbances is not None and len(disturbances) > 0, (
+            "no disturbance was captured — with p_inject=0.5 over a full "
+            "episode at least one injection is expected; cannot verify contract")
+
+        # flatten emitted disturbance arrays per agent
+        emitted = {0: [], 1: []}
+        for d in disturbances:
+            for aid in (0, 1):
+                emitted[aid].append(np.asarray(d[f"panda-{aid}"], dtype=np.float64))
+
+        # (c) for EVERY recorded action row across all trajs/agents, it must NOT
+        # match ANY emitted disturbance action for that agent (tight tol). A
+        # match means the unwrapped-env noise leaked into the recorded dataset.
         for k in trajs:
             for aid in (0, 1):
-                rec = np.asarray(f[k]["actions"][f"panda-{aid}"][:], dtype=np.float64)
-                for row in rec:
-                    for em in emitted[aid]:
-                        assert not np.allclose(row, em, atol=1e-6), (
-                            "a recorded action equals an injected disturbance — "
-                            "noise leaked into the dataset")
+                rec = np.asarray(
+                    f[k]["actions"][f"panda-{aid}"][:], dtype=np.float64)
+                for ri, row in enumerate(rec):
+                    for di, em in enumerate(emitted[aid]):
+                        if np.allclose(row, em, atol=1e-4):
+                            raise AssertionError(
+                                "NOISE LEAKED: recorded "
+                                f"{k}/actions/panda-{aid}[{ri}]={row.tolist()} "
+                                f"matches emitted disturbance #{di} "
+                                f"{em.tolist()} within atol=1e-4")
 
 
 @sim
 def test_sim_recovery_shifts_qpos(tmp_path):
-    """(2) Recorded qpos at the first recovery step after an injection differs
-    from the pre-injection qpos by ~the drift (i.e. the arm actually moved)."""
-    out_h5, _ = _run_liftbarrier(tmp_path, sigma=0.3, num=1, p_inject=1.0)
+    """Recovery left a real fingerprint in the recorded qpos: the arm moved off
+    the clean path and the planner re-solved. Uses the same robust helper
+    (sigma=0.05) so a recovered episode is guaranteed first.
+
+    Assertion strategy (robust, not brittle): the exact "first recovery step
+    after injection" index cannot be recovered from the H5 alone (the noise
+    steps run on the unwrapped env and are not recorded, so there is no marker
+    row). Instead we establish a CLEAN baseline (sigma=0, p_inject=0) on the
+    same seed pool, take its max per-step qpos delta, then require the disturbed
+    episode to contain at least one per-step delta NOTICEABLY larger than that
+    clean ceiling — i.e. a recovery jump that the undisturbed planner never
+    produces."""
+    # disturbed run (guaranteed recovered episode)
+    out_h5, _ = _run_liftbarrier_recovered(
+        tmp_path / "dist", sigma=0.05, p_inject=0.5, capture_disturbances=False)
     with h5py.File(out_h5, "r") as f:
         k = merge_h5_keys(f)[0]
-        qpos = np.asarray(f[k]["obs"]["agent"]["panda-0"]["qpos"][:])
-        # consecutive qpos deltas should show non-trivial motion somewhere
-        deltas = np.abs(np.diff(qpos[:, :7], axis=0)).max()
-        assert deltas > 1e-3, "recorded qpos shows no recovery motion"
+        qpos_d = np.asarray(f[k]["obs"]["agent"]["panda-0"]["qpos"][:])
+    assert qpos_d.shape[0] >= 2, "recorded qpos too short to measure motion"
+    dist_step_deltas = np.abs(np.diff(qpos_d[:, :7], axis=0)).max(axis=1)
+    assert dist_step_deltas.max() > 1e-3, "recorded qpos shows no motion at all"
+
+    # clean baseline (no injection) over the same seed pool
+    clean_h5, _ = _run_liftbarrier_recovered(
+        tmp_path / "clean", sigma=0.0, p_inject=0.0, capture_disturbances=False)
+    with h5py.File(clean_h5, "r") as f:
+        ck = merge_h5_keys(f)
+        assert ck, "clean baseline produced no trajectory"
+        qpos_c = np.asarray(f[ck[0]]["obs"]["agent"]["panda-0"]["qpos"][:])
+    clean_max_step = np.abs(np.diff(qpos_c[:, :7], axis=0)).max()
+
+    # the disturbed episode must contain a recovery jump clearly above the
+    # clean planner's largest single-step motion (1.5x margin for robustness).
+    assert dist_step_deltas.max() > 1.5 * clean_max_step, (
+        f"disturbed max per-step qpos delta {dist_step_deltas.max():.4f} is not "
+        f"clearly above the clean-baseline max {clean_max_step:.4f} (1.5x "
+        f"threshold {1.5 * clean_max_step:.4f}) — no recovery shift detected")
 
 
 @sim
