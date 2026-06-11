@@ -70,6 +70,12 @@ done
 SERVER_LOG_DIR=${LOG_BASE}/servers
 mkdir -p "$SERVER_LOG_DIR"
 
+# Job-unique free ports (one per arm) so co-scheduled evals never collide on a
+# shared hardcoded port. See _lib/free_ports.sh.
+source /iris/u/mikulrai/projects/RoboFactory/robofactory/scripts/_lib/free_ports.sh
+read -r PORT0 PORT1 <<<"$(free_ports 2)"
+echo "[server] promptswap decent will use ports ${PORT0} ${PORT1}"
+
 start_server () {
     local gpu_idx=$1 port=$2 cfg=$3 dir=$4 logname=$5
     echo "[server] starting arm GPU=${gpu_idx} port=${port} cfg=${cfg} dir=${dir}"
@@ -86,8 +92,8 @@ start_server () {
     echo $! > "${SERVER_LOG_DIR}/${logname}.pid"
 }
 
-start_server 0 8000 "$ARM0_CFG" "$ARM0_DIR" arm0
-start_server 1 8001 "$ARM1_CFG" "$ARM1_DIR" arm1
+start_server 0 "$PORT0" "$ARM0_CFG" "$ARM0_DIR" arm0
+start_server 1 "$PORT1" "$ARM1_CFG" "$ARM1_DIR" arm1
 
 cleanup () {
     echo "[cleanup] stopping policy servers"
@@ -103,8 +109,8 @@ cleanup () {
 }
 trap cleanup EXIT INT TERM
 
-echo "[wait] probing ports 8000/8001 ..."
-for port in 8000 8001; do
+echo "[wait] probing ports ${PORT0}/${PORT1} ..."
+for port in "$PORT0" "$PORT1"; do
     deadline=$((SECONDS + 600))
     while ! "$PREFLIGHT_PYTHON" -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(0 if s.connect_ex(('127.0.0.1',${port}))==0 else 1)" 2>/dev/null; do
         if [ $SECONDS -ge $deadline ]; then
@@ -127,7 +133,7 @@ mkdir -p "$VIDEO_DIR" "$OUT_DIR"
     --task TwoRobotsStackCube-rf \
     --config /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/two_robots_stack_cube.yaml \
     --host 127.0.0.1 \
-    --ports 8000,8001 \
+    --ports "${PORT0},${PORT1}" \
     --num-arms 2 \
     --num-episodes 1 \
     --seeds "$SEEDS" \

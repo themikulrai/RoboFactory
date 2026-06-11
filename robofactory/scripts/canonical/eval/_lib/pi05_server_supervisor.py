@@ -18,6 +18,7 @@ import ctypes
 import os
 import platform
 import signal
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -28,6 +29,34 @@ from typing import Optional
 # Linux PR_SET_PDEATHSIG = 1; see <sys/prctl.h>.
 _PR_SET_PDEATHSIG = 1
 _IS_LINUX = platform.system() == "Linux"
+
+
+def free_ports(n: int, host: str = "127.0.0.1") -> list[int]:
+    """Return ``n`` DISTINCT, currently-free TCP ports on ``host``.
+
+    The single source of truth for runtime port allocation in the eval
+    pipeline (mirrors ``robofactory/scripts/_lib/free_ports.sh`` for bash
+    launchers). Co-scheduled eval jobs on one node used to collide on the
+    hardcoded 8000/8001/8002 server ports; a same-node clash silently routes a
+    client to the wrong policy server. Allocating job-unique ports here removes
+    that whole class (solution_E6.md §PR1).
+
+    All ``n`` sockets are bound (to port 0 -> OS-assigned) BEFORE any is
+    closed. Binding one-at-a-time would let the kernel re-hand the just-freed
+    port, producing duplicates. There is an unavoidable TOCTOU window between
+    closing here and the server re-binding, but two simultaneous binds never
+    alias, which is the collision we actually saw in the wild.
+    """
+    if n < 1:
+        raise ValueError(f"free_ports: n must be >= 1, got {n}")
+    socks = [socket.socket() for _ in range(n)]
+    try:
+        for s in socks:
+            s.bind((host, 0))
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
 
 
 def _set_pdeathsig_then_setsid() -> None:
@@ -192,4 +221,4 @@ class Pi05ServerSupervisor:
         return [s.port for s in self.specs]
 
 
-__all__ = ["ServerSpec", "Pi05ServerSupervisor"]
+__all__ = ["ServerSpec", "Pi05ServerSupervisor", "free_ports"]

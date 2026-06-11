@@ -29,6 +29,7 @@ from typing import Callable, Optional
 from robofactory.scripts.canonical.eval._lib.pi05_server_supervisor import (
     Pi05ServerSupervisor,
     ServerSpec,
+    free_ports,
 )
 from robofactory.scripts.canonical.eval._lib.port_wait import wait_for_ports
 from robofactory.scripts.canonical.eval.manifest_schema import (
@@ -121,7 +122,9 @@ def _video_out_dirs(cfg: LauncherCfg, slurm_job_id: str) -> tuple[Path, Path]:
     return out_dir, video_dir
 
 
-def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_pi05_single_argv(
+    cfg: LauncherCfg, seeds: str, slurm_job_id: str, real_ports: list[int]
+) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +136,7 @@ def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--task", cfg.task.env_id,
         "--config", str(REPO_ROOT / cfg.task.scene_config),
         "--host", "127.0.0.1",
-        "--port", str(cfg.server.ports[0]),
+        "--port", str(real_ports[0]),
         "--num-arms", str(cfg.task.num_arms),
         "--num-episodes", "1",
         "--seeds", seeds,
@@ -154,7 +157,9 @@ def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
     return argv
 
 
-def build_pi05_decent_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_pi05_decent_argv(
+    cfg: LauncherCfg, seeds: str, slurm_job_id: str, real_ports: list[int]
+) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +171,7 @@ def build_pi05_decent_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--task", cfg.task.env_id,
         "--config", str(REPO_ROOT / cfg.task.scene_config),
         "--host", "127.0.0.1",
-        "--ports", ",".join(str(p) for p in cfg.server.ports),
+        "--ports", ",".join(str(p) for p in real_ports),
         "--num-arms", str(cfg.task.num_arms),
         "--num-episodes", "1",
         "--seeds", seeds,
@@ -280,9 +285,21 @@ DRIVER_BUILDERS: dict[PolicyType, Callable[..., list[str]]] = {
 }
 
 
-def build_driver_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_driver_argv(
+    cfg: LauncherCfg,
+    seeds: str,
+    slurm_job_id: str,
+    real_ports: Optional[list[int]] = None,
+) -> list[str]:
     builder = DRIVER_BUILDERS[cfg.policy_type]
-    argv = builder(cfg, seeds, slurm_job_id)
+    if cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT):
+        # Pi0.5 builders take the runtime-allocated real ports (manifest stores
+        # only logical arm indices now — PR1).
+        if real_ports is None:
+            raise ValueError("pi0.5 driver argv requires runtime-allocated real_ports")
+        argv = builder(cfg, seeds, slurm_job_id, real_ports)
+    else:
+        argv = builder(cfg, seeds, slurm_job_id)
     argv.extend(cfg.extra_argv)
     return argv
 
@@ -290,7 +307,7 @@ def build_driver_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[s
 # ---------------------------------------------------------------------------
 # Top-level driver
 # ---------------------------------------------------------------------------
-def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
+def _build_server_specs(cfg: LauncherCfg, real_ports: list[int]) -> list[ServerSpec]:
     assert cfg.server is not None
     if cfg.policy_type == PolicyType.PI05_SINGLE:
         # Single arm: train_config + ckpt.dir.
@@ -298,7 +315,7 @@ def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
             raise ValueError("pi05_single needs ckpt.train_config and ckpt.dir")
         return [
             ServerSpec(
-                port=cfg.server.ports[0],
+                port=real_ports[0],
                 gpu_index=cfg.server.gpu_indices[0],
                 policy_config=cfg.ckpt.train_config,
                 policy_dir=cfg.ckpt.dir,
@@ -310,7 +327,7 @@ def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
     assert cfg.server.arm_configs and cfg.server.arm_dirs
     specs = []
     for i, (port, gpu, acfg, adir) in enumerate(zip(
-        cfg.server.ports,
+        real_ports,
         cfg.server.gpu_indices,
         cfg.server.arm_configs,
         cfg.server.arm_dirs,
@@ -353,11 +370,21 @@ def run_launcher(
     is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
     if is_pi05:
         assert cfg.server is not None
+        # Manifest stores logical arm indices in `cfg.server.ports`; allocate one
+        # job-unique real port per arm at runtime so co-scheduled evals never
+        # collide (PR1). The index list defines only arm count/order.
+        real_ports = free_ports(len(cfg.server.ports))
+        print(
+            f"[run_eval] allocated runtime ports {real_ports} for "
+            f"{len(cfg.server.ports)} arm(s) (manifest indices "
+            f"{cfg.server.ports})",
+            file=sys.stderr, flush=True,
+        )
         server_log_dir = Path(
             f"/iris/u/mikulrai/logs/eval_pi05/run_eval_{slurm_job_id}_servers"
         )
-        specs = _build_server_specs(cfg)
-        argv = build_driver_argv(cfg, seeds, slurm_job_id)
+        specs = _build_server_specs(cfg, real_ports)
+        argv = build_driver_argv(cfg, seeds, slurm_job_id, real_ports)
         print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
         if dry_run:
             for spec in specs:
@@ -368,7 +395,7 @@ def run_launcher(
                 )
             return 0
         with Pi05ServerSupervisor(specs, log_dir=server_log_dir):
-            wait_for_ports(cfg.server.ports, deadline_s=600.0, poll_s=5.0)
+            wait_for_ports(real_ports, deadline_s=600.0, poll_s=5.0)
             print("[run_eval] all server ports up; launching eval driver", file=sys.stderr, flush=True)
             rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
             return rc

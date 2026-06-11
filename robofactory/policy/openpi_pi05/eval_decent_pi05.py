@@ -91,7 +91,10 @@ class Args:
         "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/three_robots_stack_cube.yaml"
     )
     host: str = "127.0.0.1"
-    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm")] = "8000,8001,8002"
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to colliding ports when co-scheduled. Launchers/run_eval.py always
+    # pass job-unique free ports explicitly (PR1).
+    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING
     num_episodes: int = 1
     seeds: Annotated[str, tyro.conf.arg(help="comma-separated seed list")] = "10010,10011,10012"
     max_env_steps: int = 200

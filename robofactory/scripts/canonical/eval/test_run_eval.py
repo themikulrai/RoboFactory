@@ -78,10 +78,12 @@ class TestBuildPi05SingleArgv:
     def test_required_flags_present(self):
         cfg = _cfg("pm_pi05_paired_dp_seeds")
         seeds = r._load_seeds(cfg)
-        argv = r.build_pi05_single_argv(cfg, seeds, "JOB123")
+        # PR1: builders take runtime-allocated real ports, NOT manifest indices.
+        argv = r.build_pi05_single_argv(cfg, seeds, "JOB123", [54321])
         assert "eval_pi05.py" in " ".join(argv)
         assert "--task" in argv and "PickMeat-rf" in argv
-        assert "--port" in argv and "8000" in argv
+        assert "--port" in argv and "54321" in argv  # the runtime-allocated port
+        assert "8000" not in argv  # no hardcoded port leaks through
         assert "--seeds" in argv and seeds in argv
         assert "--max-env-steps" in argv and "400" in argv
         assert "--robot-uid" in argv and "panda" in argv
@@ -94,7 +96,7 @@ class TestBuildPi05SingleArgv:
         cfg2 = cfg.model_copy(update={
             "task": cfg.task.model_copy(update={"prompt": None})
         })
-        argv = r.build_pi05_single_argv(cfg2, "1,2", "J")
+        argv = r.build_pi05_single_argv(cfg2, "1,2", "J", [12345])
         assert "--prompt" not in argv
 
 
@@ -102,9 +104,11 @@ class TestBuildPi05DecentArgv:
     def test_multi_port_csv(self):
         cfg = _cfg("tsc_pi05_d1_decent")
         seeds = r._load_seeds(cfg)
-        argv = r.build_pi05_decent_argv(cfg, seeds, "JOB123")
+        # PR1: real ports are passed at runtime; manifest holds only indices.
+        argv = r.build_pi05_decent_argv(cfg, seeds, "JOB123", [40001, 40002, 40003])
         assert "eval_decent_pi05.py" in " ".join(argv)
-        assert "--ports" in argv and "8000,8001,8002" in argv
+        assert "--ports" in argv and "40001,40002,40003" in argv
+        assert "8000,8001,8002" not in argv  # no hardcoded ports leak through
         assert "--num-arms" in argv and "3" in argv
         assert "--robot-uids-csv" in argv
         # No --prompt for decent (joint task).
@@ -214,17 +218,18 @@ class TestExtraAndHooks:
 class TestBuildServerSpecs:
     def test_single_spec_for_pi05_single(self):
         cfg = _cfg("pm_pi05_paired_dp_seeds")
-        specs = r._build_server_specs(cfg)
+        # PR1: real ports allocated at runtime, passed into _build_server_specs.
+        specs = r._build_server_specs(cfg, [54321])
         assert len(specs) == 1
         assert specs[0].name == "pm"
-        assert specs[0].port == 8000
+        assert specs[0].port == 54321
         assert specs[0].gpu_index == 0
 
     def test_per_arm_specs_for_pi05_decent(self):
         cfg = _cfg("tsc_pi05_d1_decent")
-        specs = r._build_server_specs(cfg)
+        specs = r._build_server_specs(cfg, [40001, 40002, 40003])
         assert [s.name for s in specs] == ["arm0", "arm1", "arm2"]
-        assert [s.port for s in specs] == [8000, 8001, 8002]
+        assert [s.port for s in specs] == [40001, 40002, 40003]
         assert [s.gpu_index for s in specs] == [0, 1, 2]
 
 

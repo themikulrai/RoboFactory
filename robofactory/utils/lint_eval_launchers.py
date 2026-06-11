@@ -28,6 +28,16 @@ E) The eval driver's seed argv must be ``$SEEDS`` (unquoted for DP nargs='+'
    consumers, quoted for Pi0.5 comma-list consumers). A literal multi-line
    numeric list is the drift pattern this lint is designed to kill.
 
+F) No hardcoded ``80[0-9][0-9]`` PORT literal may appear in a targeted launcher
+   (``scripts/{canonical,ablations}/*_60seeds.sh`` or any
+   ``sbatch_hierarchical_*.sh`` at the repo root). Co-scheduled evals that share
+   a hardcoded server port silently route a client to the wrong policy server
+   (solution_E6.md §PR1). Ports must be allocated job-uniquely via
+   ``_lib/free_ports.sh`` (bash) or ``free_ports()`` (python). Checkpoint-step
+   path components (e.g. ``/18000``, ``_v1/18000``) are NOT flagged — only
+   standalone ``80xx`` numeric tokens that are not part of a longer number and
+   are not preceded by a path/word character.
+
 Exit code: 0 if clean, 1 if any violation found.
 
 Usage
@@ -51,6 +61,11 @@ LAUNCHER_GLOBS = (
     "scripts/canonical/*_60seeds_*.sh",  # variants e.g. *_60seeds_reeval.sh
     "scripts/ablations/*_60seeds.sh",
     "scripts/ablations/*_60seeds_*.sh",
+)
+# Rule F also covers the repo-root hierarchical sbatch launchers, which live in
+# `<repo>/scripts/` (one level above `robofactory/`), NOT under `robofactory/`.
+SBATCH_HIER_GLOBS = (
+    "scripts/sbatch_hierarchical_*.sh",
 )
 
 
@@ -93,6 +108,13 @@ RE_LITERAL_SEED_BLOCK = re.compile(
     r'(?:^|\s)(-s|--seed|--seeds)\s+(?:\d+\s+){5,}',
     re.MULTILINE,
 )
+# Rule F — a hardcoded 80xx PORT literal. Match a standalone `80[0-9][0-9]`
+# token: not preceded by a digit (so `18000` -> the inner `8000` is rejected),
+# not preceded by a path/word char `/`, `_`, `.`, `-` (so ckpt-step paths like
+# `/18000`, `_v1/18000`, `step-8000` are not flagged), and not followed by a
+# digit (so `80001` is rejected). Bare port usages — `8000`, `8000,8001`,
+# `8000/8001`, `,8000)`, `--port 8000`, `start_server 0 8000` — DO match.
+RE_HARDCODED_PORT = re.compile(r'(?<![\w./-])80[0-9][0-9](?![0-9])')
 
 
 def _line_no_of(text: str, span_start: int) -> int:
@@ -187,6 +209,26 @@ def lint_one(path: Path) -> LauncherReport:
             ),
         ))
 
+    # Rule F — no hardcoded 80xx PORT literal. Scanned per-line so we can skip
+    # pure-comment lines (a comment explaining the free-port fix is allowed).
+    for i, line in enumerate(text.splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue  # comment line: free-port explanation is fine
+        if RE_HARDCODED_PORT.search(line):
+            for pm in RE_HARDCODED_PORT.finditer(line):
+                rpt.findings.append(LauncherFinding(
+                    path=path,
+                    line_no=i,
+                    rule="F",
+                    message=(
+                        f"hardcoded port literal {pm.group(0)!r}. Allocate "
+                        "job-unique ports via _lib/free_ports.sh (bash) or "
+                        "free_ports() (python) — a shared hardcoded port routes "
+                        "co-scheduled clients to the wrong policy server (PR1)."
+                    ),
+                ))
+
     return rpt
 
 
@@ -195,6 +237,14 @@ def collect_launchers(root: Path) -> list[Path]:
     for glob in LAUNCHER_GLOBS:
         for p in root.glob(glob):
             seen.add(p.resolve())
+    # Rule-F also covers repo-root hierarchical sbatch launchers. `root` is the
+    # `robofactory/` package dir; the sbatch launchers live in `<repo>/scripts/`
+    # (root.parent/scripts). Glob both root and root.parent to be robust to
+    # whether `root` is passed as the package dir or the repo root.
+    for base in (root, root.parent):
+        for glob in SBATCH_HIER_GLOBS:
+            for p in base.glob(glob):
+                seen.add(p.resolve())
     return sorted(seen)
 
 

@@ -44,14 +44,17 @@ EVAL="$RF_DIR/robofactory/policy/openpi_pi05/eval_hierarchical_lift_barrier.py"
 
 # ---- defaults (override via flags) ----
 HL_MODEL=""
-HL_PORT=8200
+# Ports default to "" -> job-unique free ports allocated AFTER arg parsing (so
+# co-scheduled hier-eval jobs never collide on a shared hardcoded port). Pass
+# --hl-port / --ll-port0 / --ll-port1 to pin explicit ports.
+HL_PORT=""
 HL_QUERY_INTERVAL=25
 LL_CONFIG_ARM0="pi05_robofactory_lb_ws_decent_arm0"
 LL_CONFIG_ARM1="pi05_robofactory_lb_ws_decent_arm1"
 LL_CKPT_ARM0=""
 LL_CKPT_ARM1=""
-LL_PORT0=8000
-LL_PORT1=8001
+LL_PORT0=""
+LL_PORT1=""
 # GPU pinning (indices into CUDA_VISIBLE_DEVICES of the SLURM allocation). All default to 0
 # so HL Qwen-4B + 2x pi0.5 + SAPIEN share one 48GB GPU (a40/l40s). The LL JAX servers run at
 # XLA mem-fraction 0.30 with prealloc off (mirrors the user's decent eval scripts) so two of
@@ -102,6 +105,16 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# Allocate job-unique free ports for any port not explicitly pinned via flags.
+# One Python invocation hands back 3 DISTINCT free ports (HL + 2 LL), so even
+# the defaults never collide across co-scheduled jobs on the same node.
+source "$RF_DIR/robofactory/scripts/_lib/free_ports.sh"
+read -r _FP0 _FP1 _FP2 <<<"$(free_ports 3)"
+HL_PORT="${HL_PORT:-$_FP0}"
+LL_PORT0="${LL_PORT0:-$_FP1}"
+LL_PORT1="${LL_PORT1:-$_FP2}"
+echo "[launcher] ports: HL=$HL_PORT LL0=$LL_PORT0 LL1=$LL_PORT1"
 
 mkdir -p "$LOG_DIR" "$RESULTS_DIR"
 PIDS=()

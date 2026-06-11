@@ -65,7 +65,11 @@ class Args:
         "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/three_robots_stack_cube.yaml"
     )
     host: str = "127.0.0.1"
-    port: int = 8000
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to a colliding port when co-scheduled. Launchers/run_eval.py always
+    # pass a job-unique free port explicitly (PR1). tyro.MISSING keeps dataclass
+    # field ordering valid while marking --port required on the CLI.
+    port: int = tyro.MISSING
     num_episodes: int = 50
     seeds: Annotated[str, tyro.conf.arg(help="comma-separated seed list")] = "0,1,2"
     max_env_steps: int = 1800
