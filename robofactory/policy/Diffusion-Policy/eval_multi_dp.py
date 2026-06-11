@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import deque, defaultdict
 from robofactory.tasks import *
 import robofactory.agents  # register panda_wristcam_multi
+from robofactory.utils.success_persistence import probe_sustained, SUSTAIN_K  # PR7
 import traceback
 
 import yaml
@@ -102,7 +103,15 @@ class Args:
     """Directory to save recordings"""
 
     max_steps: int = 250
-    """Maximum number of steps to run the simulation"""
+    """DEPRECATED (PR7): this used to count CHUNK iterations (each ~variable env steps via
+    TOPP) and could overrun the 500-step TimeLimit. Kept as a launcher-compat alias: if set
+    away from its default while --max-env-steps is left at default, it is mapped onto the
+    ENV-step budget. Prefer --max-env-steps."""
+
+    max_env_steps: int = 400
+    """PR7: per-episode ENV-step budget (unified across all drivers: cap = 400 env steps,
+    recorded in the manifest). The success-persistence probe shares this budget. The episode
+    loop now counts ENV steps (not chunk iterations) and checks info["success"] every env step."""
 
     ckpt_suffix: str = ""
     """Suffix inside decent-DP ckpt dir name, e.g. 'd2_wristcam' -> checkpoints/{task}_agent{id}_d2_wristcam_{data_num}/. Empty = stock 'Agent{id}_{data_num}' path."""
@@ -340,16 +349,29 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
         dp_models[id].update_obs(obs_dict)
 
     infer_times_ms = [[] for _ in range(agent_num)]
-    cnt = 0
+    # PR7: ENV-step accounting (unified budget unit) + per-env-step success sampling.
+    # Pre-PR7 this loop counted CHUNK iterations (`cnt`) for both the budget and the
+    # success check, which (a) could run far past the 500-step TimeLimit and (b) only
+    # sampled info["success"] once per chunk — a structural pi0.5-favoring bias on the
+    # instantaneous LB criterion (audit_A3 §1). Now: cap on ENV steps, success checked
+    # every env step, truncated respected, steps = env steps.
+    env_steps = 0
     success = False
     info = {}
+    observation = raw_obs
+    last_true_action = None  # last per-arm action dict actually stepped (for the hold probe)
+    sustained_info = None
     _video_frames = []
-    while True:
-        if verbose:
-            print("Iteration:", cnt)
-        cnt += 1
-        if cnt > args.max_steps:
+
+    def _record_frame(_obs):
+        if video_path is not None and view_sensors:
+            _video_frames.append(tile_views([_extract_view_uint8(_obs, s) for s in view_sensors]))
+
+    while not success:
+        if env_steps >= args.max_env_steps:
             break
+        if verbose:
+            print("env_steps:", env_steps)
         action_dict = defaultdict(list)
         action_step_dict = defaultdict(list)
         for id in range(agent_num):
@@ -385,6 +407,7 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
                     action_dict[f'{action_prefix}-{id}'].append(true_action)
 
         start_idx = [0 for _ in range(agent_num)]
+        _budget_hit = False
         for i in range(args.max_chunk_actions):
             max_step = 0
             for id in range(agent_num):
@@ -395,11 +418,26 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
                     now_step = min(j, action_step_dict[f'{action_prefix}-{id}'][i] - 1)
                     true_action[f'{action_prefix}-{id}'] = action_dict[f'{action_prefix}-{id}'][start_idx[id] + now_step]
                 observation, reward, terminated, truncated, info = env.step(true_action)
-                if video_path is not None and view_sensors:
-                    _tiled = tile_views([_extract_view_uint8(observation, s) for s in view_sensors])
-                    _video_frames.append(_tiled)
+                env_steps += 1
+                last_true_action = true_action
+                _record_frame(observation)
                 if verbose:
                     env.render_human()
+                # PR7: per-ENV-step success check (parity with the pi0.5 drivers, which
+                # check info["success"] every env step). On the FIRST success, stop the
+                # policy loop and run the persistence probe below.
+                _succ = info.get('success', False)
+                if hasattr(_succ, 'item'):
+                    _succ = _succ.item()
+                if bool(_succ):
+                    success = True
+                    break
+                _trunc = bool(np.asarray(truncated).reshape(-1)[0]) if truncated is not None else False
+                if _trunc or env_steps >= args.max_env_steps:
+                    _budget_hit = True
+                    break
+            if success or _budget_hit:
+                break
             if verbose:
                 print(true_action)
                 print("max_step", max_step)
@@ -418,9 +456,31 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
             print("info", info)
         if args.render_mode is not None:
             env.render()
-        if info.get('success', False) == True:
-            success = True
-            break
+
+    # PR7: persistence probe — on a first success run K hold-qpos env steps (within the
+    # shared budget) and record success_sustained_10. A hold action commands each arm to
+    # stay at its current qpos with its last commanded gripper. Headline (success_first)
+    # is never silently redefined.
+    if success and last_true_action is not None:
+        def _hold():
+            act = {}
+            for id in range(agent_num):
+                q7 = observation['agent'][f'{agent_prefix}-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy().astype(np.float32)
+                grip = float(np.asarray(last_true_action[f'{action_prefix}-{id}']).reshape(-1)[-1])
+                act[f'{action_prefix}-{id}'] = np.hstack([q7, grip]).astype(np.float32)
+            return act
+
+        def _step(act):
+            nonlocal observation, env_steps
+            observation, _r, _term, _trunc, _info = env.step(act)
+            env_steps += 1
+            _record_frame(observation)
+            s = _info.get('success', False)
+            if hasattr(s, 'item'):
+                s = s.item()
+            return bool(s), bool(_term), bool(_trunc)
+
+        sustained_info = probe_sustained(_hold, _step, k=SUSTAIN_K, budget_left=args.max_env_steps - env_steps)
 
     if video_path is not None and _video_frames:
         _video_frames = subsample(_video_frames, args.video_frame_stride)
@@ -433,14 +493,21 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
     wallclock = _t.perf_counter() - t_ep
     vram_peak_mb = torch.cuda.max_memory_allocated() / 1e6
     infer_ms_mean = [float(np.mean(v)) if v else 0.0 for v in infer_times_ms]
-    return dict(
+    out = dict(
         seed=int(seed),
         success=int(success),
-        steps=int(cnt - 1),
+        success_first=int(success),  # PR7: explicit headline
+        steps=int(env_steps),        # PR7: ENV steps (unified budget unit)
         wallclock_s=round(wallclock, 3),
         infer_ms_mean_per_arm=[round(x, 2) for x in infer_ms_mean],
         vram_peak_mb=round(vram_peak_mb, 1),
     )
+    if sustained_info is not None:
+        out["success_sustained_10"] = bool(sustained_info["sustained"])
+        out["sustained_info"] = sustained_info
+    elif success:
+        out["success_sustained_10"] = None  # success at last budget step, no room to probe
+    return out
 
 
 def main(args: Args):
@@ -451,6 +518,14 @@ def main(args: Args):
     assert_not_login_node()
     np.set_printoptions(suppress=True, precision=5)
     verbose = not args.quiet
+    # PR7: launcher-compat. --max-steps was the old CHUNK-iteration budget; the loop now
+    # counts ENV steps. If a launcher overrode --max-steps but left --max-env-steps at its
+    # default, honor the launcher's intent as an ENV-step cap so old scripts don't silently
+    # explode the budget. Explicit --max-env-steps always wins.
+    if args.max_steps != 250 and args.max_env_steps == 400:
+        print(f"[eval_multi_dp] PR7: mapping legacy --max-steps {args.max_steps} -> --max-env-steps "
+              f"(env-step budget); pass --max-env-steps to override.", flush=True)
+        args.max_env_steps = args.max_steps
     # PR4: resolve FINAL env seeds via the single source of truth. --seed-pool/--env-seeds
     # take precedence over the legacy --seed. DP and pi0.5 resolve the same env seeds from a
     # pool name -> true seed pairing. No transform: each seed is passed straight to env.reset.
@@ -565,7 +640,7 @@ def main(args: Args):
         sim_backend=args.sim_backend,
         seed_provenance=seed_provenance,
         prompts=None,  # DP is not language-conditioned
-        max_env_steps=args.max_steps,
+        max_env_steps=args.max_env_steps,  # PR7: ENV-step budget (was chunk-iteration max_steps)
         chunk_config={"max_chunk_actions": args.max_chunk_actions, "gripper_source": args.gripper_source},
         ckpt_paths=_ckpt_paths,
         zarr_repo_id=args.ckpt_suffix or None,
@@ -576,7 +651,8 @@ def main(args: Args):
         ckpt_suffix=args.ckpt_suffix,
         gripper_source=args.gripper_source,
         ckpt_paths=_ckpt_paths,
-        max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
+        max_steps=args.max_steps, max_env_steps=args.max_env_steps,  # PR7: env-step cap
+        n_seeds=len(seeds), seeds=seeds,
         seed_provenance=seed_provenance,  # PR4: pool name + sha + allow_train
         sim_backend=args.sim_backend, obs_mode=args.obs_mode,
         git_sha=git_sha, host=socket.gethostname(),
@@ -655,6 +731,9 @@ def main(args: Args):
         n_total = len(results)
         n_succ = sum(r['success'] for r in results)
         sr = n_succ / n_total if n_total else 0.0
+        # PR7: persistence — success_sustained_10 alongside success_first (== success).
+        n_sustained = sum(1 for r in results if r.get('success_sustained_10') is True)
+        sr_sustained = n_sustained / n_total if n_total else 0.0
         # Wilson 95% CI half-width approximation via normal
         from math import sqrt
         ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
@@ -666,6 +745,8 @@ def main(args: Args):
         validity = classify_validity(results)
         summary = dict(
             n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
+            success_first_rate=sr,  # PR7: explicit headline
+            n_success_sustained_10=n_sustained, success_sustained_10_rate=sr_sustained,  # PR7
             mean_steps_on_success=mean_steps_succ,
             mean_episode_wallclock_s=float(np.mean([r['wallclock_s'] for r in results])) if results else 0.0,
             valid=validity['valid'], invalid_reason=validity['invalid_reason'],

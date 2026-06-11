@@ -39,6 +39,7 @@ from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403  (registers env IDs with gym)
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
+from robofactory.utils.success_persistence import probe_sustained, SUSTAIN_K  # PR7
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -82,7 +83,10 @@ class Args:
     env_seeds: str = ""  # comma/space list of FINAL env seeds; empty => use --seeds
     allow_train_seeds: bool = False  # permit datagen seeds 0..182 (recorded in JSON)
     seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
-    max_env_steps: int = 1800
+    max_env_steps: int = 400
+    """PR7: per-episode ENV-step budget (unified across all drivers: cap = 400 env steps,
+    recorded in the manifest). The success-persistence probe shares this budget — it does
+    NOT get a fresh K steps. Was 1800 pre-PR7."""
     replan_after: int = 8
     # PR6: --prompt is REQUIRED (tyro.MISSING). The old TSC DEFAULT_PROMPT silently
     # tagged every task. It is validated against the task prompts JSON (or the LB
@@ -199,6 +203,21 @@ def _delta_to_absolute_action(
     return out
 
 
+def _hold_qpos_action(obs: dict, last_gripper_per_arm: list[float], num_arms: int, robot_uid: str, action_prefix: str) -> dict:
+    """PR7: the action that commands every arm to STAY at its current qpos.
+
+    Used by the success-persistence probe: after a first success, step K more env
+    steps with this hold action and re-check the (instantaneous) criterion. A real
+    grasp+lift stays up under a hold; a transient bobble falls. The gripper channel
+    keeps the LAST commanded gripper per arm so an open/closed grasp is preserved."""
+    cur = _current_qpos_per_arm(obs, num_arms, robot_uid)
+    out: dict[str, np.ndarray] = {}
+    for i in range(num_arms):
+        target = np.concatenate([cur[i], np.array([last_gripper_per_arm[i]], dtype=np.float32)])
+        out[f"{action_prefix}-{i}"] = target.astype(np.float32)
+    return out
+
+
 def _flatten_action_dict_for_box(action_dict: dict, num_arms: int, action_prefix: str) -> np.ndarray:
     """Box single-arm path: return the per-arm[0] entry as a flat (8,) array.
 
@@ -310,6 +329,11 @@ def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix
 def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: int, seed: int, action_prefix: str, video_path: str = "", is_dict_action: bool = True) -> dict:
     obs, _ = env.reset(seed=seed)
     success = False
+    # PR7: persistence probe state (success_sustained_10). last_gripper_per_arm holds the
+    # most-recently commanded gripper so the hold action preserves an open/closed grasp.
+    sustained_info: dict | None = None
+    last_gripper_per_arm: list[float] = [0.0] * args.num_arms
+    env_steps = 0  # PR7: count ENV steps (the unified budget unit, cap = max_env_steps)
     t0 = time.time()
     chunk_idx: int = 10**9
     chunk: np.ndarray | None = None
@@ -341,6 +365,9 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
 
             cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
             action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, action_prefix)
+            # PR7: remember the commanded gripper per arm so the hold probe preserves the grasp.
+            for _a in range(args.num_arms):
+                last_gripper_per_arm[_a] = float(np.asarray(action_dict[f"{action_prefix}-{_a}"]).reshape(-1)[-1])
             local_chunk_idx = chunk_idx
             chunk_idx += 1
 
@@ -364,6 +391,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
 
             step_action = action_dict if is_dict_action else _flatten_action_dict_for_box(action_dict, args.num_arms, action_prefix)
             obs, reward, terminated, truncated, info = env.step(step_action)
+            env_steps += 1
             succ_field = info.get("success", False)
             if hasattr(succ_field, "item"):
                 succ_field = succ_field.item()
@@ -375,6 +403,31 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
                 traj_fp.flush()
 
             if success or terminated or truncated:
+                # PR7: on a FIRST success, do NOT stop at the first frame — run K more
+                # hold-qpos env steps (within the shared budget) and record whether the
+                # criterion still holds at +K (success_sustained_10). Both numbers are
+                # reported; the headline (success_first) is never silently redefined.
+                if success:
+                    def _hold():
+                        return (
+                            _hold_qpos_action(obs, last_gripper_per_arm, args.num_arms, args.robot_uid, action_prefix)
+                            if is_dict_action
+                            else _flatten_action_dict_for_box(
+                                _hold_qpos_action(obs, last_gripper_per_arm, args.num_arms, args.robot_uid, action_prefix),
+                                args.num_arms, action_prefix,
+                            )
+                        )
+
+                    def _step(act):
+                        nonlocal obs, env_steps
+                        obs, _r, _t, _tr, _info = env.step(act)
+                        env_steps += 1
+                        s = _info.get("success", False)
+                        if hasattr(s, "item"):
+                            s = s.item()
+                        return bool(s), bool(_t), bool(_tr)
+
+                    sustained_info = probe_sustained(_hold, _step, k=SUSTAIN_K, budget_left=args.max_env_steps - env_steps)
                 break
     finally:
         if traj_fp is not None:
@@ -383,7 +436,21 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
     if video_path and video_frames:
         _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
 
-    return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
+    out = {
+        "seed": seed,
+        # PR7: success_first is the historical headline (criterion ever met). steps = ENV steps.
+        "success": success,
+        "success_first": success,
+        "steps": env_steps,
+        "wall_s": time.time() - t0,
+    }
+    if sustained_info is not None:
+        out["success_sustained_10"] = bool(sustained_info["sustained"])
+        out["sustained_info"] = sustained_info
+    elif success:
+        # success at the very last budget step with no room to probe — record explicitly.
+        out["success_sustained_10"] = None
+    return out
 
 
 def _write_mp4(path: str, frames: list[np.ndarray]) -> None:
@@ -482,7 +549,16 @@ def run_batch_episodes(env, policy, args: Args, cam_map: dict[str, str], active_
             # episode index is supplied by the caller via the per-seed video path.
             vp = str(Path(video_dir) / _video_filename(args.task, run_id, int(sd), 0))
             _write_mp4(vp, subsample(video_frames[i], args.video_frame_stride))
-        results.append({"seed": int(sd), "success": successes[i], "steps": steps[i] or args.max_env_steps, "wall_s": time.time() - t0})
+        results.append({
+            "seed": int(sd), "success": successes[i],
+            "success_first": successes[i],
+            # PR7: the persistence probe needs per-env hold-stepping after a first success,
+            # which the lockstep vectorised path cannot do cleanly. Recorded as None
+            # ("not measured") so the headline is never silently redefined. Use the
+            # single-env path (num_envs==1, the canonical LB wc setting) to measure it.
+            "success_sustained_10": None,
+            "steps": steps[i] or args.max_env_steps, "wall_s": time.time() - t0,
+        })
     return results
 
 
@@ -673,7 +749,14 @@ def main(args: Args) -> None:
 
         n = len(results)
         n_succ = sum(1 for r in results if r["success"])
-        print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
+        # PR7: report BOTH headline (success_first == success) and persistence
+        # (success_sustained_10). Never silently redefine the headline.
+        n_sustained = sum(1 for r in results if r.get("success_sustained_10") is True)
+        print(
+            f"\n=== summary ===\nepisodes: {n}\n"
+            f"success_first: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)\n"
+            f"success_sustained_10: {n_sustained}/{n} ({100.0 * n_sustained / n:.1f}%)"
+        )
 
         from robofactory.utils.eval_guards import shader_mismatch_override_active
         # PR6: validity guard + full provenance (eval_protocol v2).
@@ -706,9 +789,12 @@ def main(args: Args) -> None:
         print(f"Saved {out_file}")
 
         wandb_run.log_summary(
-            success_rate=(n_succ / n) if n else 0.0,
+            success_rate=(n_succ / n) if n else 0.0,          # == success_first rate
+            success_first_rate=(n_succ / n) if n else 0.0,
+            success_sustained_10_rate=(n_sustained / n) if n else 0.0,  # PR7
             n_episodes=n,
             n_success=n_succ,
+            n_success_sustained_10=n_sustained,
             results_json_path=str(out_file),
             valid=validity["valid"],
         )

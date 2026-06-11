@@ -32,6 +32,7 @@ from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
+from robofactory.utils.success_persistence import probe_sustained, SUSTAIN_K  # PR7
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -83,7 +84,9 @@ class Args:
     env_seeds: str = ""
     allow_train_seeds: bool = False
     seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
-    max_env_steps: int = 200
+    max_env_steps: int = 400
+    """PR7: per-episode ENV-step budget (unified across all drivers: cap = 400 env steps,
+    recorded in the manifest). The success-persistence probe shares this budget. Was 200."""
     replan_after: int = 8
     # PR6: --prompt is REQUIRED (tyro.MISSING). The old TSC DEFAULT_PROMPT silently
     # tagged every task. Validated against the task prompts JSON (or the LB subtask
@@ -172,6 +175,20 @@ def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str) -> list[np.n
     ]
 
 
+def _hold_qpos_action(obs: dict, last_gripper_per_arm: list[float], num_arms: int, robot_uid: str, action_prefix: str) -> dict:
+    """PR7: action commanding every arm to STAY at its current qpos (hold-qpos probe).
+
+    See robofactory.utils.success_persistence. The gripper channel keeps the LAST
+    commanded gripper per arm so an open/closed grasp is preserved during the hold."""
+    cur = _current_qpos_per_arm(obs, num_arms, robot_uid)
+    return {
+        f"{action_prefix}-{i}": np.concatenate(
+            [cur[i], np.array([last_gripper_per_arm[i]], dtype=np.float32)]
+        ).astype(np.float32)
+        for i in range(num_arms)
+    }
+
+
 def _write_mp4(path: str, frames: list[np.ndarray]) -> None:
     import cv2
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +259,12 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     _global_view = "head_camera_global" if "head_camera_global" in view_sensors else view_sensors[0]
     shader_bg_guard(_extract_image(obs, _global_view))
     success = False
+    # PR7: persistence-probe state. last_gripper_per_arm holds the most-recently commanded
+    # gripper so the hold action preserves the grasp; env_steps counts ENV steps (the unified
+    # 400-step budget unit, shared with the probe).
+    sustained_info: dict | None = None
+    last_gripper_per_arm: list[float] = [0.0] * args.num_arms
+    env_steps = 0
     t0 = time.time()
 
     chunks: list[np.ndarray | None] = [None] * args.num_arms
@@ -280,6 +303,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 gripper = step_i[7]
                 target = np.concatenate([cur_qpos[i] + delta, np.array([gripper], dtype=np.float32)])
                 action_dict[f"{action_prefix}-{i}"] = target.astype(np.float32)
+                last_gripper_per_arm[i] = float(gripper)  # PR7: preserve grasp during hold probe
                 chunk_idxs[i] += 1
 
             if traj_fp is not None:
@@ -307,6 +331,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 }
 
             obs, _, terminated, truncated, info = env.step(action_dict)
+            env_steps += 1
             succ_field = info.get("success", False)
             if hasattr(succ_field, "item"):
                 succ_field = succ_field.item()
@@ -318,6 +343,22 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 traj_fp.flush()
 
             if success or terminated or truncated:
+                # PR7: on a first success, run K more hold-qpos env steps (within the shared
+                # budget) and record success_sustained_10. Headline (success_first) unchanged.
+                if success:
+                    def _hold():
+                        return _hold_qpos_action(obs, last_gripper_per_arm, args.num_arms, args.robot_uid, action_prefix)
+
+                    def _step(act):
+                        nonlocal obs, env_steps
+                        obs, _r, _t, _tr, _info = env.step(act)
+                        env_steps += 1
+                        s = _info.get("success", False)
+                        if hasattr(s, "item"):
+                            s = s.item()
+                        return bool(s), bool(_t), bool(_tr)
+
+                    sustained_info = probe_sustained(_hold, _step, k=SUSTAIN_K, budget_left=args.max_env_steps - env_steps)
                 break
     finally:
         if traj_fp is not None:
@@ -326,7 +367,19 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     if video_path and video_frames:
         _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
 
-    return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
+    out = {
+        "seed": seed,
+        "success": success,
+        "success_first": success,  # PR7: explicit headline
+        "steps": env_steps,        # PR7: ENV steps (unified budget unit)
+        "wall_s": time.time() - t0,
+    }
+    if sustained_info is not None:
+        out["success_sustained_10"] = bool(sustained_info["sustained"])
+        out["sustained_info"] = sustained_info
+    elif success:
+        out["success_sustained_10"] = None  # success at last budget step, no room to probe
+    return out
 
 
 def main(args: Args) -> None:
@@ -505,7 +558,13 @@ def main(args: Args) -> None:
 
         n = len(results)
         n_succ = sum(1 for r in results if r["success"])
-        print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
+        # PR7: report BOTH success_first (headline) and success_sustained_10 (persistence).
+        n_sustained = sum(1 for r in results if r.get("success_sustained_10") is True)
+        print(
+            f"\n=== summary ===\nepisodes: {n}\n"
+            f"success_first: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)\n"
+            f"success_sustained_10: {n_sustained}/{n} ({100.0 * n_sustained / n:.1f}%)"
+        )
 
         from robofactory.utils.eval_guards import shader_mismatch_override_active
         # PR6: validity guard + full provenance (eval_protocol v2).
@@ -538,9 +597,12 @@ def main(args: Args) -> None:
         print(f"Saved {out_file}")
 
         wandb_run.log_summary(
-            success_rate=(n_succ / n) if n else 0.0,
+            success_rate=(n_succ / n) if n else 0.0,          # == success_first rate
+            success_first_rate=(n_succ / n) if n else 0.0,
+            success_sustained_10_rate=(n_sustained / n) if n else 0.0,  # PR7
             n_episodes=n,
             n_success=n_succ,
+            n_success_sustained_10=n_sustained,
             results_json_path=str(out_file),
             valid=validity["valid"],
         )
