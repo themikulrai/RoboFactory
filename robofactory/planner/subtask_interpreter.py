@@ -16,8 +16,22 @@ Design (see plan ``1-this-is-not-witty-quokka.md`` "Architecture: invert control
   label at the same loop iteration we build and step the action.
 * Between primitives the interpreter calls an optional
   ``boundary_hook(env, state)`` where the user's DART arm-noise / object-pose
-  perturbation runs on the UNWRAPPED env (unrecorded). The NEXT primitive re-plans
-  from the current state, so labels remain correct.
+  perturbation runs on the UNWRAPPED env (unrecorded).
+
+  RE-PLANNING CAVEAT (important): primitives are PRE-BUILT (their ``dry_run``
+  ticks are cached at build time, before ``run_program`` is called) and are
+  consumed here as-is — ``run_program`` does NOT re-plan the next primitive's
+  trajectory after a hook fires. So a hook that *moves an object* will NOT be
+  absorbed by the already-cached next primitive's waypoints. Two supported modes:
+    1. **Arm-joint noise only** (no object move): fully supported — the hook
+       nudges joints on the unwrapped env; the next cached primitive's screw plan
+       still drives toward its (unchanged) target, re-converging from the nudged
+       pose. Labels stay correct.
+    2. **Object-pose perturbation**: must be applied BEFORE the program is built
+       (e.g. jitter the actor at reset, then ``spec.build(planner, env)``), so the
+       cached grasp-pose resolvers read the moved actor. The label still tracks the
+       ACTOR (e.g. "the green cube"), so it stays correct. Perturbing an object
+       *inside* a boundary_hook would stale the next cached primitive — don't.
 * Per-primitive **success checks** (run after the primitive's last tick) drop
   trajectories whose labelled subtask did not actually happen (the liar-label
   guard / the crux).
@@ -28,6 +42,7 @@ passed-in wrapped ``env`` / ``planner`` at call time.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -35,6 +50,16 @@ import numpy as np
 
 from . import subtask_vocab as vocab
 from .subtask_primitives import Primitive, OPEN
+
+# Verbs whose label is a CLAIM about a spatial/grasp outcome and therefore MUST
+# carry a success_check, or a failed primitive silently mislabels the data (the
+# liar-label loophole): "close_gripper that did not grasp" must be droppable.
+# wait/open_gripper have no spatial claim to verify (open just releases), so they
+# are exempt. ``run_program`` lints the program against this set (warning by
+# default; raise with check_success_coverage="error").
+VERBS_REQUIRING_SUCCESS_CHECK = frozenset(
+    {vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT, vocab.PLACE}
+)
 
 # A per-primitive gate: advance this primitive only once predicate(env, state)
 # is True for the named other arm's progress. predicate signature:
@@ -265,6 +290,7 @@ def run_program(
     action_prefix: str = "panda",
     control_mode: Optional[str] = None,
     verbose: bool = False,
+    check_success_coverage: str = "warn",
 ) -> Dict:
     """Run per-arm primitive programs through the wrapped env, labelling live.
 
@@ -276,10 +302,19 @@ def run_program(
     recorder : SubtaskRecorder (already reset). One append per env.step.
     max_steps : hard cap on env.steps (safety).
     boundary_hook : optional callable(env, state) invoked BETWEEN primitives (when
-        any arm advances to a new primitive). Runs on the UNWRAPPED env, unrecorded.
-        The next primitive re-plans from the current state.
+        any arm advances to a new primitive; NOT before the first primitive). Runs
+        on the UNWRAPPED env, unrecorded. NOTE: primitives here are PRE-BUILT and
+        their cached ticks are NOT re-planned after the hook — arm-joint noise is
+        absorbed (the cached screw plan re-converges to its unchanged target), but
+        object-pose perturbation must be applied BEFORE building the program (at
+        reset), not inside this hook. See module docstring "RE-PLANNING CAVEAT".
     action_prefix : agent key prefix; action_dict keys are f"{action_prefix}-{i}".
     control_mode : env control mode; defaults to planner.control_mode.
+    check_success_coverage : how to handle primitives whose verb is in
+        VERBS_REQUIRING_SUCCESS_CHECK but that carry no success_check (the
+        liar-label loophole). "warn" (default) emits a UserWarning listing the
+        offenders; "error" raises ValueError; "off" skips the lint. This does NOT
+        change all_success semantics; it only flags programs that can mislabel.
 
     Returns
     -------
@@ -292,6 +327,9 @@ def run_program(
     """
     if control_mode is None:
         control_mode = getattr(planner, "control_mode", "pd_joint_pos")
+
+    if check_success_coverage != "off":
+        _lint_success_coverage(programs, mode=check_success_coverage)
 
     num_arms = recorder.num_arms
     arms: Dict[int, _ArmState] = {}
@@ -314,7 +352,14 @@ def run_program(
     # If any arm starts a brand-new primitive this iteration, we first call the
     # boundary hook (between-primitives perturbation), THEN plan/tick. We track the
     # last primitive index each arm has *entered* to detect transitions.
-    entered: Dict[int, int] = {i: -1 for i in range(num_arms)}
+    #
+    # Init to each arm's starting qi (NOT -1): the boundary_hook fires only BETWEEN
+    # primitives (after one completes, before the next starts), per the spec. On the
+    # first loop iteration entered[i]==a.qi so no transition is detected and the hook
+    # is NOT called before the first primitive — its plan was built (in the builders)
+    # against the same state the first tick runs against, so a leading hook would
+    # otherwise stale that plan (object jitter before the first reach was planned).
+    entered: Dict[int, int] = {i: arms[i].qi for i in range(num_arms)}
 
     while step < max_steps and not _all_done():
         state["step"] = step
@@ -418,6 +463,37 @@ def run_program(
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+def _lint_success_coverage(programs: Dict[int, List[QueuedPrimitive]], mode: str = "warn"):
+    """Flag primitives that CLAIM a spatial/grasp outcome but carry no success_check.
+
+    Closes the liar-label loophole: a primitive with verb in
+    VERBS_REQUIRING_SUCCESS_CHECK but ``success_check is None`` is silently treated
+    as passing in ``all_success`` (it contributes nothing to the ``checked`` list),
+    so a failed grasp/approach/lift/place could be written as if it happened.
+
+    ``mode``: "warn" -> UserWarning listing offenders; "error" -> ValueError.
+    """
+    offenders: List[str] = []
+    for arm, queue in programs.items():
+        for qi, qp in enumerate(queue):
+            prim = qp.primitive
+            if (prim.verb_id in VERBS_REQUIRING_SUCCESS_CHECK
+                    and prim.success_check is None):
+                offenders.append(f"arm{arm}[{qi}] {prim.name} (verb={prim.verb_id})")
+    if not offenders:
+        return
+    msg = (
+        "run_program: these primitives claim a spatial/grasp outcome but have NO "
+        "success_check, so a failed primitive would be mislabelled (liar-label "
+        f"loophole): {offenders}. Attach a success_check (approach->check_tcp_near, "
+        "close_gripper->check_is_grasping, lift->check_*_lifted, place->placed) or "
+        "pass check_success_coverage='off' if this is intentional."
+    )
+    if mode == "error":
+        raise ValueError(msg)
+    warnings.warn(msg, UserWarning, stacklevel=2)
 
 
 def _task_of(cur, programs, arm) -> str:

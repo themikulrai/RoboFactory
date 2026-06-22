@@ -655,14 +655,18 @@ def test_sim_dart_object_perturb_compat():
         new_p = np.asarray(p.p).reshape(-1)[:3] + np.array([0.02, 0.0, 0.0])
         u.barrier.set_pose(sapien.Pose(new_p, np.asarray(p.q).reshape(-1)[:4]))
 
-        hook_calls = {"n": 0}
+        hook_calls = {"n": 0, "first_step": None}
 
         def hook(unwrapped_env, state):
-            hook_calls["n"] += 1  # a real DART hook would step unwrapped env here
+            # a real DART hook would step unwrapped env here. Record the env-step
+            # count at the first call to prove the hook fires BETWEEN primitives,
+            # never before the first primitive runs.
+            if hook_calls["first_step"] is None:
+                hook_calls["first_step"] = int(state.get("step", -1))
+            hook_calls["n"] += 1
 
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)  # plans against the MOVED barrier
-        T_actions_before = None
         out = I.run_program(env, planner, prog, rec, max_steps=600,
                             boundary_hook=hook, control_mode=planner.control_mode)
         a = rec.to_arrays()
@@ -673,5 +677,12 @@ def test_sim_dart_object_perturb_compat():
         # recorder length == env steps == sum of primitive ticks.
         assert rec.length == out["steps"]
         assert hook_calls["n"] >= 1
+        # TIMING (regression-lock the blocker fix): the hook must NOT fire before
+        # the first primitive executes. The first call must land on step > 0 (i.e.
+        # after at least one env.step), never on step 0 / before the first reach.
+        assert hook_calls["first_step"] is not None
+        assert hook_calls["first_step"] > 0, (
+            f"boundary_hook fired before the first primitive "
+            f"(first_step={hook_calls['first_step']}); first reach plan would be stale")
     finally:
         env.close()

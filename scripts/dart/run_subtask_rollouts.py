@@ -303,7 +303,13 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                 pending = []  # [(episode_id, recorder, T)]
                 for spec in members:
                     rec, out = _run_one_variant(env, spec, max_steps, boundary_hook)
-                    if rec is None or out is None or not out.get("all_success", False):
+                    # Re-run must reproduce BOTH a clean finish (completed: all
+                    # queues emptied before max_steps) AND all_success. A variant
+                    # that times out/truncates but happens to have all_success=True
+                    # (some primitives lack checks) must NOT be kept -> mislabelled.
+                    if (rec is None or out is None
+                            or not out.get("all_success", False)
+                            or not out.get("completed", False)):
                         group_ok = False
                         try:
                             env.flush_trajectory(save=False)
