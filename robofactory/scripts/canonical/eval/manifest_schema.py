@@ -88,9 +88,17 @@ class SeedsCfg(StrictModel):
 
 
 class ServerCfg(StrictModel):
-    """Pi0.5 server bringup (single or decent multi-server)."""
+    """Pi0.5 server bringup (single or decent multi-server).
 
-    ports: list[int]
+    NOTE (PR1): `ports` are LOGICAL ARM INDICES (e.g. [0], [0, 1], [0, 1, 2]),
+    NOT real TCP ports. `run_eval.py` allocates job-unique real ports at runtime
+    via `free_ports()` and maps each logical index -> a real port. This removes
+    the hardcoded-port collision class where co-scheduled evals clashed on
+    8000/8001/8002 and silently routed a client to the wrong policy server.
+    The list still defines arm COUNT and ORDER, so the length checks below hold.
+    """
+
+    ports: list[int]  # logical arm indices; real ports allocated at runtime
     gpu_indices: list[int]
     xla_mem_fraction: float
     # Decent multi-server: per-arm config + dir lists. Same length as `ports`.
@@ -147,6 +155,10 @@ class LauncherCfg(StrictModel):
     env_hooks: list[str] = Field(default_factory=list)
     wandb: WandbCfg
     sbatch: SbatchCfg
+    # PR5: number of repeat eval runs (same seeds, different sampler RNG is pinned per
+    # episode so reps differ only by GPU-kernel nondeterminism). Default 3 for canonical
+    # rows; set 1 for ablations. The N_REPEATS env var overrides this at dispatch time.
+    n_repeats: Optional[int] = None
 
     @model_validator(mode="after")
     def _check_policy_consistency(self):

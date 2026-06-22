@@ -32,6 +32,7 @@ from mani_skill.envs.sapien_env import BaseEnv  # noqa: F401
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
+from robofactory.utils.success_persistence import probe_sustained, SUSTAIN_K  # PR7
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -40,7 +41,8 @@ from policy._shared.eval_context import WandbRun, VideoRecorder  # noqa: E402
 from policy._shared.multiview_video import ordered_unique, tile_views, subsample  # noqa: E402
 
 
-DEFAULT_PROMPT = "stack the three cubes using three robot arms"
+# PR6: the TSC DEFAULT_PROMPT that was silently used for EVERY task is DELETED.
+# --prompt is now REQUIRED and validated against the task / subtask vocab (see Args.prompt).
 DEFAULT_CAMERA_MAPPING = {
     "base_0_rgb_raw": "head_camera_global",
     "left_wrist_0_rgb_raw": "hand_camera_0",
@@ -56,32 +58,10 @@ DEFAULT_CAMERA_MAPPING = {
 # carries those 5 keys and they flow straight through to the obs dict.
 DEFAULT_IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
-# One-shot guard for the SAPIEN shader_pack regression. Data-gen uses
-# shader_pack="default" (gray clear). ManiSkill default is "minimal" (pure
-# black clear), which leaves the upper rows of head_camera_global pitch black
-# above the table geometry and silently desyncs eval from training. We check
-# the upper sixth of the global cam on the very first frame; if it's almost
-# entirely black warn loudly. See memory/feedback_sapien_shader_pack_eval_mismatch.md.
-_SHADER_BG_CHECK_DONE = False
-
-def _shader_bg_guard(global_img: np.ndarray) -> None:
-    global _SHADER_BG_CHECK_DONE
-    if _SHADER_BG_CHECK_DONE:
-        return
-    _SHADER_BG_CHECK_DONE = True
-    if global_img is None or global_img.ndim < 3:
-        return
-    upper = global_img[: max(1, global_img.shape[0] // 6)]
-    near_black_frac = float((upper.sum(axis=-1) < 6).mean())
-    if near_black_frac > 0.9:
-        import warnings as _w
-        _w.warn(
-            f"[shader_pack guard] head_camera_global upper region is {100*near_black_frac:.0f}% near-black. "
-            "This is the SAPIEN shader_pack=minimal symptom. Pass "
-            "sensor_configs=dict(shader_pack=\"default\") to gym.make to match data-gen. "
-            "See ~/.claude/projects/-iris-u-mikulrai/memory/feedback_sapien_shader_pack_eval_mismatch.md",
-            stacklevel=2,
-        )
+# SAPIEN shader_pack / login-node / black-sky fidelity guards now live in the shared
+# robofactory.utils.eval_guards module (PR3): assert_shader_pack_default (hard),
+# shader_bg_guard (PROMOTED warn -> hard fail; RF_ALLOW_SHADER_MISMATCH=1 downgrades),
+# assert_not_login_node (hard). See memory/feedback_sapien_shader_pack_eval_mismatch.md.
 
 
 @dataclasses.dataclass
@@ -91,12 +71,31 @@ class Args:
         "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/three_robots_stack_cube.yaml"
     )
     host: str = "127.0.0.1"
-    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm")] = "8000,8001,8002"
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to colliding ports when co-scheduled. Launchers/run_eval.py always
+    # pass job-unique free ports explicitly (PR1).
+    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING
     num_episodes: int = 1
-    seeds: Annotated[str, tyro.conf.arg(help="comma-separated seed list")] = "10010,10011,10012"
-    max_env_steps: int = 200
+    # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
+    # Prefer --seed-pool; --env-seeds is an ad-hoc final-env-seed list. Resolved seeds are
+    # FINAL env seeds handed straight to env.reset — NO x100_000 transform (that historical
+    # transform is folded into the canonical_env_60 pool). --seeds = legacy alias.
+    seed_pool: str = ""
+    env_seeds: str = ""
+    allow_train_seeds: bool = False
+    seeds: Annotated[str, tyro.conf.arg(help="DEPRECATED alias for --env-seeds (final env seeds)")] = ""
+    max_env_steps: int = 400
+    """PR7: per-episode ENV-step budget (unified across all drivers: cap = 400 env steps,
+    recorded in the manifest). The success-persistence probe shares this budget. Was 200."""
     replan_after: int = 8
-    prompt: str = DEFAULT_PROMPT
+    # PR6: --prompt is REQUIRED (tyro.MISSING). The old TSC DEFAULT_PROMPT silently
+    # tagged every task. Validated against the task prompts JSON (or the LB subtask
+    # vocab via --subtask-vocab); OOV hard-fails unless --allow-oov-prompt (recorded in JSON).
+    prompt: Annotated[str, tyro.conf.arg(help="task instruction (REQUIRED); validated against task/subtask vocab")] = tyro.MISSING
+    prompts_json: str = ""  # explicit prompts-JSON path; "" => derive from --task/--camera-mapping
+    subtask_vocab: bool = False  # validate against the LB sidecar subtask vocab (sidecar-trained ckpts)
+    subtask_npz: str = ""  # override the subtask vocab npz path (defaults to lb_subtask_index.npz)
+    allow_oov_prompt: bool = False  # permit an out-of-vocab prompt (recorded in JSON; for E1 prompt-swap probe)
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
     video_dir: str = ""  # location override; defaults to <out_dir>/videos. Video is ALWAYS recorded.
@@ -105,10 +104,21 @@ class Args:
     video_all: bool = False  # DEPRECATED/ignored: every seed always records. Kept so --video-all still parses.
     run_id: str = ""  # disambiguates videos across runs; "" => $SLURM_JOB_ID or unix-ts
     num_arms: int = 3
+    # If set, hard-fail (exit 3) before episode 1 unless each arm's server metadata
+    # config_name matches (comma-separated, one per arm, aligned with --ports) AND its
+    # action_dim == 8 (per-arm decent dim). Empty => no identity check (PR2).
+    expect_config: Annotated[str, tyro.conf.arg(help="comma-separated config names, one per arm, aligned with --ports")] = ""
     camera_mapping: str = ""
     robot_uid: str = "panda_wristcam_multi"
     robot_uids_csv: str = ""
     trajectory_log_path: str = ""  # if set, write JSONL per-step trajectory data
+    save_trajectory: bool = False
+    """PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    env_states). The per-arm clients decode delta->absolute (cur_qpos + delta) BEFORE
+    env.step, so the recorded actions are the ABSOLUTE joint targets — directly consumable
+    by parse_h5_to_zarr_unified.py --state-source qpos. Default off."""
+    trajectory_root: str = ""  # PR9: root for --save-trajectory h5s; "" => default eval_trajs root
     wandb: bool = False
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,decent"
@@ -170,6 +180,20 @@ def _current_qpos_per_arm(obs: dict, num_arms: int, robot_uid: str) -> list[np.n
         np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()[:7].astype(np.float32)
         for i in range(num_arms)
     ]
+
+
+def _hold_qpos_action(obs: dict, last_gripper_per_arm: list[float], num_arms: int, robot_uid: str, action_prefix: str) -> dict:
+    """PR7: action commanding every arm to STAY at its current qpos (hold-qpos probe).
+
+    See robofactory.utils.success_persistence. The gripper channel keeps the LAST
+    commanded gripper per arm so an open/closed grasp is preserved during the hold."""
+    cur = _current_qpos_per_arm(obs, num_arms, robot_uid)
+    return {
+        f"{action_prefix}-{i}": np.concatenate(
+            [cur[i], np.array([last_gripper_per_arm[i]], dtype=np.float32)]
+        ).astype(np.float32)
+        for i in range(num_arms)
+    }
 
 
 def _write_mp4(path: str, frames: list[np.ndarray]) -> None:
@@ -236,11 +260,18 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     non-masked image inputs (see main()); each recorded frame tiles all of them.
     """
     obs, _ = env.reset(seed=seed)
-    try:
-        _shader_bg_guard(_extract_image(obs, view_sensors[0]))
-    except Exception:
-        pass
+    # Hard-fail (once/process) if the first head_camera_global frame is black-skied (PR3).
+    # NOTE: no try/except — a black sky must abort the run, not be silently swallowed.
+    from robofactory.utils.eval_guards import shader_bg_guard
+    _global_view = "head_camera_global" if "head_camera_global" in view_sensors else view_sensors[0]
+    shader_bg_guard(_extract_image(obs, _global_view))
     success = False
+    # PR7: persistence-probe state. last_gripper_per_arm holds the most-recently commanded
+    # gripper so the hold action preserves the grasp; env_steps counts ENV steps (the unified
+    # 400-step budget unit, shared with the probe).
+    sustained_info: dict | None = None
+    last_gripper_per_arm: list[float] = [0.0] * args.num_arms
+    env_steps = 0
     t0 = time.time()
 
     chunks: list[np.ndarray | None] = [None] * args.num_arms
@@ -262,6 +293,9 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                     if obs_dict is None:
                         obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                    # PR5: re-key each per-arm server's rng per episode. Set fresh every call
+                    # because Policy.infer pops the key in place (each arm is a separate server).
+                    obs_dict["_episode_seed"] = int(seed)
                     result = policies[i].infer(obs_dict)
                     chunks[i] = np.asarray(result["actions"])  # (H, 8)
                     chunk_idxs[i] = 0
@@ -276,6 +310,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 gripper = step_i[7]
                 target = np.concatenate([cur_qpos[i] + delta, np.array([gripper], dtype=np.float32)])
                 action_dict[f"{action_prefix}-{i}"] = target.astype(np.float32)
+                last_gripper_per_arm[i] = float(gripper)  # PR7: preserve grasp during hold probe
                 chunk_idxs[i] += 1
 
             if traj_fp is not None:
@@ -303,6 +338,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 }
 
             obs, _, terminated, truncated, info = env.step(action_dict)
+            env_steps += 1
             succ_field = info.get("success", False)
             if hasattr(succ_field, "item"):
                 succ_field = succ_field.item()
@@ -314,6 +350,22 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 traj_fp.flush()
 
             if success or terminated or truncated:
+                # PR7: on a first success, run K more hold-qpos env steps (within the shared
+                # budget) and record success_sustained_10. Headline (success_first) unchanged.
+                if success:
+                    def _hold():
+                        return _hold_qpos_action(obs, last_gripper_per_arm, args.num_arms, args.robot_uid, action_prefix)
+
+                    def _step(act):
+                        nonlocal obs, env_steps
+                        obs, _r, _t, _tr, _info = env.step(act)
+                        env_steps += 1
+                        s = _info.get("success", False)
+                        if hasattr(s, "item"):
+                            s = s.item()
+                        return bool(s), bool(_t), bool(_tr)
+
+                    sustained_info = probe_sustained(_hold, _step, k=SUSTAIN_K, budget_left=args.max_env_steps - env_steps)
                 break
     finally:
         if traj_fp is not None:
@@ -322,13 +374,49 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     if video_path and video_frames:
         _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
 
-    return {"seed": seed, "success": success, "steps": step + 1, "wall_s": time.time() - t0}
+    out = {
+        "seed": seed,
+        "success": success,
+        "success_first": success,  # PR7: explicit headline
+        "steps": env_steps,        # PR7: ENV steps (unified budget unit)
+        "wall_s": time.time() - t0,
+    }
+    if sustained_info is not None:
+        out["success_sustained_10"] = bool(sustained_info["sustained"])
+        out["sustained_info"] = sustained_info
+    elif success:
+        out["success_sustained_10"] = None  # success at last budget step, no room to probe
+    return out
 
 
 def main(args: Args) -> None:
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front.
+    from robofactory.utils.eval_guards import assert_not_login_node, assert_shader_pack_default
+    assert_not_login_node()
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    # PR4: resolve FINAL env seeds via the single source of truth. No x100_000.
+    from robofactory.utils.eval_seeds import resolve_seeds
+    seeds, seed_provenance = resolve_seeds(
+        pool=args.seed_pool or None,
+        env_seeds=(args.env_seeds or args.seeds) or None,
+        allow_train=args.allow_train_seeds,
+    )
+
+    # PR6: required, vocab-checked prompt. OOV hard-fails (prints the vocab) unless
+    # --allow-oov-prompt is set. The validation dict is recorded in the result JSON.
+    from robofactory.utils.eval_validity import load_prompt_vocab, validate_prompt
+    _vocab, _vocab_src = load_prompt_vocab(
+        prompts_json=args.prompts_json or None,
+        task=args.camera_mapping or args.task,
+        use_subtask_vocab=args.subtask_vocab,
+        subtask_npz=args.subtask_npz or None,
+    )
+    prompt_validation = validate_prompt(
+        args.prompt, _vocab, allow_oov=args.allow_oov_prompt, vocab_source=_vocab_src
+    )
+
     ports = [int(p) for p in args.ports.split(",") if p.strip()]
     assert len(ports) == args.num_arms, f"Need {args.num_arms} ports, got {ports}"
 
@@ -367,15 +455,51 @@ def main(args: Args) -> None:
     )
     if args.robot_uids_csv:
         env_kwargs["robot_uids"] = tuple(args.robot_uids_csv.split(","))
+    assert_shader_pack_default(env_kwargs)
     env = gym.make(args.task, **env_kwargs)
     # ManiSkill uses URDF body name (e.g. "panda") for action_space keys but the
     # registered agent uid (e.g. "panda_wristcam_multi") for obs["agent"] keys.
     action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
     print(f"obs_prefix='{args.robot_uid}' action_prefix='{action_prefix}'", flush=True)
 
+    # PR9: optional self-training trajectory capture. The per-arm clients decode
+    # delta->absolute BEFORE env.step, so RecordEpisodeMA buffers ABSOLUTE joint targets
+    # (no converter-side fix). RGB dropped (re-renderable); qpos rides along via obs.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        _ts = int(time.time())
+        _traj_label = f"eval_pi05_decent_{args.task}_run{_resolve_run_id(args.run_id)}_{_ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root or None, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_decent_pi05] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+
     policies = [WebsocketClientPolicy(host=args.host, port=p) for p in ports]
+    server_metadata = [dict(p.get_server_metadata() or {}) for p in policies]
     for i, p in enumerate(policies):
-        print(f"[arm{i}] server metadata: {p.get_server_metadata()}")
+        print(f"[arm{i}] server metadata: {server_metadata[i]}")
+    # PR2 server-identity handshake (one expected config per arm, aligned with --ports).
+    # Per-arm decent model action dim is 8. A mismatch (or arm/config count mismatch)
+    # hard-fails before episode 1 instead of producing per-episode IndexErrors.
+    expect_configs = [c.strip() for c in args.expect_config.split(",")] if args.expect_config else []
+    if expect_configs and len(expect_configs) != args.num_arms:
+        print(
+            f"SERVER IDENTITY MISMATCH: --expect-config has {len(expect_configs)} entries "
+            f"but --num-arms={args.num_arms} (one per arm, aligned with --ports); refusing to run",
+            file=_sys.stderr, flush=True,
+        )
+        _sys.exit(3)
+    from robofactory.utils.server_identity import assert_server_identity_or_exit
+    for i in range(args.num_arms):
+        assert_server_identity_or_exit(
+            server_metadata[i],
+            expect_configs[i] if expect_configs else None,
+            # action_dim from serve_policy is the padded model dim (32), not task-specific;
+            # config_name is the real guard (server reports a fixed real_action_dim too) —
+            # PR2 dim-arm disabled, see E10 false-reject 2026-06-11.
+            expect_action_dim=None,
+            label=f"arm{i} (port {ports[i]})",
+        )
     print(f"num_arms={args.num_arms} ports={ports} cam_map={cam_map}")
 
     run_id = _resolve_run_id(args.run_id)
@@ -425,7 +549,9 @@ def main(args: Args) -> None:
         episode_global_idx = 0
         for seed_idx, seed in enumerate(seeds):
             for ep_i in range(args.num_episodes):
-                ep_seed = seed * 100_000 + ep_i
+                # PR4: `seed` is the FINAL env seed; ep_i offsets additively only for
+                # >1 episode/seed (identity for the canonical num_episodes==1). No x100_000.
+                ep_seed = seed + ep_i
                 # cap maps to (seed, ep_i): record first N (seed_idx, ep_i==0) pairs only
                 # ALWAYS record every seed/episode (no per-seed cap). videos.record_dir
                 # is video_dir, which always resolves to a real path (<out_dir>/videos).
@@ -437,6 +563,10 @@ def main(args: Args) -> None:
                     r = run_episode(env, policies, args, cam_map, view_sensors, ep_seed, action_prefix, video_path)
                 except Exception as e:  # noqa: BLE001
                     r = {"seed": ep_seed, "success": False, "steps": -1, "error": repr(e)}
+                if traj_h5_path is not None:
+                    # PR9: episodes flush in order; episode_global_idx -> traj_{idx} in the h5.
+                    r["trajectory_path"] = traj_h5_path
+                    r["trajectory_group"] = f"traj_{episode_global_idx}"
                 results.append(r)
                 print(
                     f"[seed_base={seed} ep={ep_i:03d}] success={r['success']} "
@@ -454,20 +584,61 @@ def main(args: Args) -> None:
 
         n = len(results)
         n_succ = sum(1 for r in results if r["success"])
-        print(f"\n=== summary ===\nepisodes: {n}\nsuccess: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)")
+        # PR7: report BOTH success_first (headline) and success_sustained_10 (persistence).
+        n_sustained = sum(1 for r in results if r.get("success_sustained_10") is True)
+        print(
+            f"\n=== summary ===\nepisodes: {n}\n"
+            f"success_first: {n_succ}/{n} ({100.0 * n_succ / n:.1f}%)\n"
+            f"success_sustained_10: {n_sustained}/{n} ({100.0 * n_sustained / n:.1f}%)"
+        )
 
+        from robofactory.utils.eval_guards import shader_mismatch_override_active
+        # PR6: validity guard + full provenance (eval_protocol v2).
+        from robofactory.utils.eval_validity import (
+            build_provenance, classify_validity, finalize_validity,
+        )
+        validity = classify_validity(results)
+        provenance = build_provenance(
+            shader_pack="default",
+            enable_shadow=False,
+            sim_backend=args.sim_backend,
+            seed_provenance=seed_provenance,
+            prompts=[args.prompt],
+            prompt_validation=prompt_validation,
+            max_env_steps=args.max_env_steps,
+            chunk_config={"replan_after": args.replan_after, "num_arms": args.num_arms},
+            server_metadata={f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
+        )
         out_file = out_dir / f"eval_decent_{args.task}_{int(time.time())}.json"
-        out_file.write_text(json.dumps({"args": dataclasses.asdict(args), "results": results}, indent=2))
+        out_file.write_text(json.dumps({
+            "args": dataclasses.asdict(args),
+            "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train
+            "shader_mismatch_override": shader_mismatch_override_active(),
+            "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
+            "provenance": provenance,            # PR6: eval_protocol v2
+            "prompt_validation": prompt_validation,
+            "validity": validity,                # PR6: valid / invalid_reason
+            "save_trajectory": args.save_trajectory,  # PR9
+            "trajectory_h5": traj_h5_path,            # PR9
+            "results": results,
+        }, indent=2))
         print(f"Saved {out_file}")
 
         wandb_run.log_summary(
-            success_rate=(n_succ / n) if n else 0.0,
+            success_rate=(n_succ / n) if n else 0.0,          # == success_first rate
+            success_first_rate=(n_succ / n) if n else 0.0,
+            success_sustained_10_rate=(n_sustained / n) if n else 0.0,  # PR7
             n_episodes=n,
             n_success=n_succ,
+            n_success_sustained_10=n_sustained,
             results_json_path=str(out_file),
+            valid=validity["valid"],
         )
 
         env.close()
+        # PR6: if >5% episodes invalid -> rename *_INVALID.json, tag wandb 'invalid',
+        # exit 2. Done after env.close() so the env shuts down cleanly first.
+        finalize_validity(validity, out_file, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":

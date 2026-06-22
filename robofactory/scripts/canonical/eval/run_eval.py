@@ -29,6 +29,7 @@ from typing import Callable, Optional
 from robofactory.scripts.canonical.eval._lib.pi05_server_supervisor import (
     Pi05ServerSupervisor,
     ServerSpec,
+    free_ports,
 )
 from robofactory.scripts.canonical.eval._lib.port_wait import wait_for_ports
 from robofactory.scripts.canonical.eval.manifest_schema import (
@@ -121,7 +122,9 @@ def _video_out_dirs(cfg: LauncherCfg, slurm_job_id: str) -> tuple[Path, Path]:
     return out_dir, video_dir
 
 
-def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_pi05_single_argv(
+    cfg: LauncherCfg, seeds: str, slurm_job_id: str, real_ports: list[int]
+) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +136,7 @@ def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--task", cfg.task.env_id,
         "--config", str(REPO_ROOT / cfg.task.scene_config),
         "--host", "127.0.0.1",
-        "--port", str(cfg.server.ports[0]),
+        "--port", str(real_ports[0]),
         "--num-arms", str(cfg.task.num_arms),
         "--num-episodes", "1",
         "--seeds", seeds,
@@ -149,12 +152,18 @@ def build_pi05_single_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--wandb-project", cfg.wandb.project,
         "--wandb-tags", ",".join(cfg.wandb.tags),
     ]
+    # PR2 server-identity handshake: pass the config name the supervisor will serve so
+    # the client hard-fails before episode 1 on a wrong-policy-behind-the-port mismatch.
+    if cfg.ckpt.train_config:
+        argv.extend(["--expect-config", cfg.ckpt.train_config])
     if cfg.task.prompt:
         argv.extend(["--prompt", cfg.task.prompt])
     return argv
 
 
-def build_pi05_decent_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_pi05_decent_argv(
+    cfg: LauncherCfg, seeds: str, slurm_job_id: str, real_ports: list[int]
+) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +175,7 @@ def build_pi05_decent_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--task", cfg.task.env_id,
         "--config", str(REPO_ROOT / cfg.task.scene_config),
         "--host", "127.0.0.1",
-        "--ports", ",".join(str(p) for p in cfg.server.ports),
+        "--ports", ",".join(str(p) for p in real_ports),
         "--num-arms", str(cfg.task.num_arms),
         "--num-episodes", "1",
         "--seeds", seeds,
@@ -183,6 +192,11 @@ def build_pi05_decent_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> l
         "--wandb-project", cfg.wandb.project,
         "--wandb-tags", ",".join(cfg.wandb.tags),
     ]
+    # PR2 server-identity handshake: one expected config per arm, in --ports order.
+    # The supervisor serves cfg.server.arm_configs[i] on real_ports[i] (see
+    # _build_server_specs), so the alignment matches by construction.
+    if cfg.server.arm_configs:
+        argv.extend(["--expect-config", ",".join(cfg.server.arm_configs)])
     return argv
 
 
@@ -280,9 +294,21 @@ DRIVER_BUILDERS: dict[PolicyType, Callable[..., list[str]]] = {
 }
 
 
-def build_driver_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[str]:
+def build_driver_argv(
+    cfg: LauncherCfg,
+    seeds: str,
+    slurm_job_id: str,
+    real_ports: Optional[list[int]] = None,
+) -> list[str]:
     builder = DRIVER_BUILDERS[cfg.policy_type]
-    argv = builder(cfg, seeds, slurm_job_id)
+    if cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT):
+        # Pi0.5 builders take the runtime-allocated real ports (manifest stores
+        # only logical arm indices now — PR1).
+        if real_ports is None:
+            raise ValueError("pi0.5 driver argv requires runtime-allocated real_ports")
+        argv = builder(cfg, seeds, slurm_job_id, real_ports)
+    else:
+        argv = builder(cfg, seeds, slurm_job_id)
     argv.extend(cfg.extra_argv)
     return argv
 
@@ -290,7 +316,7 @@ def build_driver_argv(cfg: LauncherCfg, seeds: str, slurm_job_id: str) -> list[s
 # ---------------------------------------------------------------------------
 # Top-level driver
 # ---------------------------------------------------------------------------
-def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
+def _build_server_specs(cfg: LauncherCfg, real_ports: list[int]) -> list[ServerSpec]:
     assert cfg.server is not None
     if cfg.policy_type == PolicyType.PI05_SINGLE:
         # Single arm: train_config + ckpt.dir.
@@ -298,7 +324,7 @@ def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
             raise ValueError("pi05_single needs ckpt.train_config and ckpt.dir")
         return [
             ServerSpec(
-                port=cfg.server.ports[0],
+                port=real_ports[0],
                 gpu_index=cfg.server.gpu_indices[0],
                 policy_config=cfg.ckpt.train_config,
                 policy_dir=cfg.ckpt.dir,
@@ -310,7 +336,7 @@ def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
     assert cfg.server.arm_configs and cfg.server.arm_dirs
     specs = []
     for i, (port, gpu, acfg, adir) in enumerate(zip(
-        cfg.server.ports,
+        real_ports,
         cfg.server.gpu_indices,
         cfg.server.arm_configs,
         cfg.server.arm_dirs,
@@ -326,6 +352,51 @@ def _build_server_specs(cfg: LauncherCfg) -> list[ServerSpec]:
     return specs
 
 
+def resolve_n_repeats(cfg: LauncherCfg, launcher_id: str) -> int:
+    """PR5: N_REPEATS precedence — env var N_REPEATS > cfg.n_repeats > policy default.
+
+    Policy default is 3 for canonical rows and 1 for ablations (the headline contract
+    is mean±Wilson-CI over >=3 reps; single-run deltas <15pp are not findings). We treat
+    a launcher whose id starts with `ablation`/`abl_` or that lives under scripts/ablations
+    as an ablation; everything else defaults to 3.
+    """
+    env_val = os.environ.get("N_REPEATS")
+    if env_val:
+        n = int(env_val)
+        if n < 1:
+            raise ValueError(f"N_REPEATS must be >=1, got {n}")
+        return n
+    if cfg.n_repeats is not None:
+        if cfg.n_repeats < 1:
+            raise ValueError(f"cfg.n_repeats must be >=1, got {cfg.n_repeats}")
+        return cfg.n_repeats
+    is_ablation = launcher_id.startswith(("ablation", "abl_", "abl-"))
+    return 1 if is_ablation else 3
+
+
+def _inject_rep_output(argv: list[str], cfg: LauncherCfg, rep: int) -> list[str]:
+    """Route this rep's result file to a `*_rep{k}.json[l]` path so reps never collide
+    and `summarize_eval_runs.py` can glob them. pi0.5 drivers take --out-dir; DP drivers
+    take --jsonl-path. Idempotent: only appended when the manifest didn't already set one.
+    """
+    argv = list(argv)
+    is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
+    if is_pi05:
+        # Point --out-dir at a per-rep subdir (driver still timestamps the filename;
+        # one JSON per subdir => one rep per dir, unambiguous for the summarizer).
+        if "--out-dir" in argv:
+            i = argv.index("--out-dir")
+            argv[i + 1] = str(Path(argv[i + 1]) / f"rep{rep}")
+        Path(argv[argv.index("--out-dir") + 1]).mkdir(parents=True, exist_ok=True)
+    else:
+        # DP: give the driver an explicit per-rep jsonl path (only if none set yet).
+        if "--jsonl-path" not in argv and not any(a.startswith("--jsonl-path=") for a in argv):
+            base = Path("/iris/u/mikulrai/logs/eval") / f"{cfg.task.env_id}_rep{rep}.jsonl"
+            base.parent.mkdir(parents=True, exist_ok=True)
+            argv.append(f"--jsonl-path={base}")
+    return argv
+
+
 def run_launcher(
     cfg: LauncherCfg,
     launcher_id: str,
@@ -335,9 +406,11 @@ def run_launcher(
     preflight_only: bool = False,
 ) -> int:
     seeds = _load_seeds(cfg)
+    n_repeats = resolve_n_repeats(cfg, launcher_id)
     print(
         f"[run_eval] launcher={launcher_id} policy={cfg.policy_type.value} "
-        f"seeds={cfg.seeds.file} (n={len(seeds.replace(',', ' ').split())})",
+        f"seeds={cfg.seeds.file} (n={len(seeds.replace(',', ' ').split())}) "
+        f"n_repeats={n_repeats}",
         file=sys.stderr, flush=True,
     )
 
@@ -351,34 +424,53 @@ def run_launcher(
         return 0
 
     is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
-    if is_pi05:
-        assert cfg.server is not None
-        server_log_dir = Path(
-            f"/iris/u/mikulrai/logs/eval_pi05/run_eval_{slurm_job_id}_servers"
-        )
-        specs = _build_server_specs(cfg)
-        argv = build_driver_argv(cfg, seeds, slurm_job_id)
-        print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
-        if dry_run:
-            for spec in specs:
-                print(
-                    f"[run_eval] would spawn {spec.name} gpu={spec.gpu_index} "
-                    f"port={spec.port} cfg={spec.policy_config} dir={spec.policy_dir}",
-                    file=sys.stderr, flush=True,
-                )
-            return 0
-        with Pi05ServerSupervisor(specs, log_dir=server_log_dir):
-            wait_for_ports(cfg.server.ports, deadline_s=600.0, poll_s=5.0)
-            print("[run_eval] all server ports up; launching eval driver", file=sys.stderr, flush=True)
+    rc_final = 0
+    for rep in range(n_repeats):
+        rep_job_id = f"{slurm_job_id}_rep{rep}" if n_repeats > 1 else slurm_job_id
+        print(f"[run_eval] === rep {rep + 1}/{n_repeats} (run_id={rep_job_id}) ===",
+              file=sys.stderr, flush=True)
+        if is_pi05:
+            assert cfg.server is not None
+            # Manifest stores logical arm indices in `cfg.server.ports`; allocate one
+            # job-unique real port per arm at runtime so co-scheduled evals never
+            # collide (PR1). The index list defines only arm count/order.
+            real_ports = free_ports(len(cfg.server.ports))
+            print(
+                f"[run_eval] allocated runtime ports {real_ports} for "
+                f"{len(cfg.server.ports)} arm(s) (manifest indices "
+                f"{cfg.server.ports})",
+                file=sys.stderr, flush=True,
+            )
+            server_log_dir = Path(
+                f"/iris/u/mikulrai/logs/eval_pi05/run_eval_{rep_job_id}_servers"
+            )
+            specs = _build_server_specs(cfg, real_ports)
+            argv = build_driver_argv(cfg, seeds, rep_job_id, real_ports)
+            argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
+            print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
+            if dry_run:
+                for spec in specs:
+                    print(
+                        f"[run_eval] would spawn {spec.name} gpu={spec.gpu_index} "
+                        f"port={spec.port} cfg={spec.policy_config} dir={spec.policy_dir}",
+                        file=sys.stderr, flush=True,
+                    )
+                continue
+            with Pi05ServerSupervisor(specs, log_dir=server_log_dir):
+                wait_for_ports(real_ports, deadline_s=600.0, poll_s=5.0)
+                print("[run_eval] all server ports up; launching eval driver", file=sys.stderr, flush=True)
+                rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
+        else:
+            # DP path: no server bringup.
+            argv = build_driver_argv(cfg, seeds, rep_job_id)
+            argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
+            print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
+            if dry_run:
+                continue
             rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
-            return rc
-
-    # DP path: no server bringup.
-    argv = build_driver_argv(cfg, seeds, slurm_job_id)
-    print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
-    if dry_run:
-        return 0
-    return subprocess.run(argv, cwd=REPO_ROOT).returncode
+        if rc != 0:
+            rc_final = rc  # keep going through reps but surface a nonzero exit
+    return rc_final
 
 
 def main(argv: Optional[list[str]] = None) -> int:

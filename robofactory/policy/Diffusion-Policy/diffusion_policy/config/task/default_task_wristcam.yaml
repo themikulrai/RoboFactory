@@ -19,7 +19,9 @@ shape_meta: &shape_meta
 env_runner:
   _target_: diffusion_policy.env_runner.robot_multi_agent_image_runner.RobotMultiAgentImageRunner
   env_id: "ThreeRobotsStackCube-rf"
-  config_path: null
+  # PR3: silent robocasa default removed from the runner; pass it EXPLICITLY here to
+  # preserve prior behavior. See memory project_robofactory_tsc_scene.
+  config_path: /iris/u/mikulrai/projects/RoboFactory/robofactory/configs/robocasa/three_robots_stack_cube.yaml
   current_agent_id: ${current_agent_id}
   n_agents: 3
   data_num: ${eval.data_num}

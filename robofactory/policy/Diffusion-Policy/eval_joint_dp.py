@@ -63,7 +63,19 @@ class Args:
     """Comma-separated robot UIDs to override env defaults. D2 wristcam requires 'panda_wristcam_multi,panda_wristcam_multi,panda_wristcam_multi'."""
 
     seed: Annotated[Union[int, List[int]], tyro.conf.arg(aliases=["-s"])] = 10010
-    """Single seed or list of seeds."""
+    """Final env seed(s) passed straight to env.reset. DEPRECATED alias for --env-seeds;
+    prefer --seed-pool (PR4)."""
+
+    seed_pool: str = ""
+    """PR4: name of a frozen seed pool (robofactory.utils.eval_seeds), e.g. canonical_env_60.
+    When set, overrides --seed/--env-seeds. DP and pi0.5 resolve the SAME final env seeds
+    from a pool name -> true seed pairing."""
+
+    env_seeds: str = ""
+    """PR4: ad-hoc comma/space list of FINAL env seeds (recorded as pool 'adhoc'). Overrides --seed."""
+
+    allow_train_seeds: bool = False
+    """PR4: permit datagen seeds 0..182 (recorded in the result manifest)."""
 
     max_steps: int = 200
     """Max env steps per episode."""
@@ -94,6 +106,16 @@ class Args:
 
     jsonl_path: Optional[str] = None
     """Path for per-episode JSONL log; auto-created if None."""
+
+    save_trajectory: bool = False
+    """PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    env_states). The joint runner steps ABSOLUTE joint targets, so the recorded actions are
+    absolute — directly consumable by parse_h5_to_zarr_unified.py --state-source qpos."""
+
+    trajectory_root: Optional[str] = None
+    """PR9: root dir for --save-trajectory h5s. Defaults to /iris/u/mikulrai/data/eval_trajs/
+    (symlinked, never the project tree) or $RF_EVAL_TRAJ_ROOT."""
 
 
 def _import_multiview():
@@ -163,7 +185,27 @@ def save_gif(mp4_path: str):
 
 
 def main(args: Args):
-    seeds = [args.seed] if isinstance(args.seed, int) else list(args.seed)
+    # Shared hard-fail eval fidelity guards (PR3): refuse the login node up front. The
+    # shader_pack assert + black-sky bg guard run inside RobotJointImageRunner (_make_env /
+    # _rollout_single_episode), which this driver delegates env construction/rollout to.
+    from robofactory.utils.eval_guards import assert_not_login_node
+    assert_not_login_node()
+
+    # PR4: resolve FINAL env seeds via the single source of truth (same as the pi0.5
+    # drivers) so a pool name yields identical env seeds across methods -> true pairing.
+    from robofactory.utils.eval_seeds import resolve_seeds
+    if args.seed_pool or args.env_seeds:
+        seeds, seed_provenance = resolve_seeds(
+            pool=args.seed_pool or None,
+            env_seeds=args.env_seeds or None,
+            allow_train=args.allow_train_seeds,
+        )
+    else:
+        _legacy = [args.seed] if isinstance(args.seed, int) else list(args.seed)
+        seeds, seed_provenance = resolve_seeds(
+            env_seeds=",".join(str(s) for s in _legacy),
+            allow_train=args.allow_train_seeds,
+        )
     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
 
     policy = load_policy(args.ckpt_path)
@@ -185,6 +227,19 @@ def main(args: Args):
     )
 
     env = runner._make_env()
+
+    # PR9: optional self-training trajectory capture. The joint runner steps ABSOLUTE joint
+    # targets, so RecordEpisodeMA buffers absolute actions (no converter-side fix). RGB is
+    # dropped (re-renderable from env_states); qpos rides along via the recorded obs. The
+    # runner resets/steps THIS wrapped env, so episodes flush in order on each reset.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        dataset_tag = "d1" if args.camera_family == "workspace" else "d2"
+        _traj_label = f"eval_joint_dp_{args.env_id}_{dataset_tag}_{ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_joint_dp] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
 
     # --- Multiview recording: tile EVERY camera the policy actually consumes. ---
     # The joint policy's image inputs (see RobotJointImageRunner._build_obs_dict) are
@@ -213,12 +268,30 @@ def main(args: Args):
     jsonl_path = args.jsonl_path or f'/iris/u/mikulrai/logs/eval_joint_{env_id}_{dataset_tag}_{ts}.jsonl'
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
 
+    from robofactory.utils.eval_guards import shader_mismatch_override_active
+    # PR6: full provenance (eval_protocol v2) — both-repo git sha+dirty, GPU, shader/shadow,
+    # seed pool+sha, ckpt path+md5, chunk config. DP has no --prompt (no language input).
+    from robofactory.utils.eval_validity import build_provenance
+    provenance = build_provenance(
+        shader_pack="default",
+        enable_shadow=False,
+        sim_backend="auto",
+        seed_provenance=seed_provenance,
+        prompts=None,  # DP is not language-conditioned
+        max_env_steps=args.max_steps,
+        chunk_config={"n_action_exec": args.n_action_exec, "camera_family": args.camera_family},
+        ckpt_paths=[args.ckpt_path],
+    )
     manifest = dict(
         task=env_id, scene_config=args.config,
         ckpt_path=args.ckpt_path, camera_family=args.camera_family,
         max_steps=args.max_steps, n_seeds=len(seeds), seeds=seeds,
+        seed_provenance=seed_provenance,  # PR4: pool name + sha + allow_train
         git_sha=git_sha, host=socket.gethostname(),
+        shader_mismatch_override=shader_mismatch_override_active(),
         start_utc=ts, record_root=record_root, jsonl_path=jsonl_path,
+        save_trajectory=args.save_trajectory, trajectory_h5=traj_h5_path,  # PR9
+        provenance=provenance,  # PR6: eval_protocol v2
     )
     with open(jsonl_path, 'w') as f:
         f.write(json.dumps({'kind': 'manifest', **manifest}) + '\n')
@@ -245,7 +318,18 @@ def main(args: Args):
             if not args.quiet:
                 print(f"[seed {seed}] running...", flush=True)
             torch.cuda.reset_peak_memory_stats()
-            result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
+            try:
+                result = runner._rollout_single_episode(env, policy, seed=seed, record_frames=True)
+            except Exception as _e:  # PR6: per-episode crash -> steps=-1+error so the >5%
+                # validity guard can fire instead of taking the whole run down silently.
+                vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
+                metrics = dict(seed=int(seed), success=0, steps=-1, vram_peak_mb=vram_mb,
+                               episode_idx=idx, error=repr(_e))
+                results.append(metrics)
+                with open(jsonl_path, 'a') as f:
+                    f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
+                print(f"[seed {seed}] ERROR: {metrics['error']}", flush=True)
+                continue
             vram_mb = round(torch.cuda.max_memory_allocated() / 1e6, 1)
 
             # ALWAYS-ON: all_seeds=True + real record_root => video_path is never None.
@@ -258,6 +342,10 @@ def main(args: Args):
                 seed=int(seed), success=int(result['success']),
                 steps=int(result['length']), vram_peak_mb=vram_mb, episode_idx=idx,
             )
+            if traj_h5_path is not None:
+                # PR9: episodes flush in order; episode idx -> traj_{idx} in the h5.
+                metrics['trajectory_path'] = traj_h5_path
+                metrics['trajectory_group'] = f'traj_{idx}'
             results.append(metrics)
             with open(jsonl_path, 'a') as f:
                 f.write(json.dumps({'kind': 'episode', **metrics}) + '\n')
@@ -280,12 +368,19 @@ def main(args: Args):
         sr = n_succ / n_total if n_total else 0.0
         from math import sqrt
         ci = 1.96 * sqrt(max(sr * (1 - sr), 1e-9) / max(n_total, 1))
-        summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci)
+        # PR6: validity guard — if >5% episodes invalid (steps==-1 or error) the run
+        # is invalid; JSONL renamed *_INVALID.jsonl + exit 2.
+        from robofactory.utils.eval_validity import classify_validity, finalize_validity
+        validity = classify_validity(results)
+        summary = dict(n_total=n_total, n_success=n_succ, success_rate=sr, ci95=ci,
+                       valid=validity['valid'], invalid_reason=validity['invalid_reason'])
         with open(jsonl_path, 'a') as f:
             f.write(json.dumps({'kind': 'summary', **summary}) + '\n')
+            f.write(json.dumps({'kind': 'validity', **validity}) + '\n')
         print('SUMMARY:', json.dumps(summary, indent=2), flush=True)
         wandb_run.log_summary(**summary)
         print('success' if sr > 0 else 'failed')
+        finalize_validity(validity, jsonl_path, wandb_run=wandb_run)
 
 
 if __name__ == '__main__':

@@ -28,6 +28,37 @@ E) The eval driver's seed argv must be ``$SEEDS`` (unquoted for DP nargs='+'
    consumers, quoted for Pi0.5 comma-list consumers). A literal multi-line
    numeric list is the drift pattern this lint is designed to kill.
 
+F) No hardcoded ``80[0-9][0-9]`` PORT literal may appear in a targeted launcher
+   (``scripts/{canonical,ablations}/*_60seeds.sh`` or any
+   ``sbatch_hierarchical_*.sh`` at the repo root). Co-scheduled evals that share
+   a hardcoded server port silently route a client to the wrong policy server
+   (solution_E6.md §PR1). Ports must be allocated job-uniquely via
+   ``_lib/free_ports.sh`` (bash) or ``free_ports()`` (python). Checkpoint-step
+   path components (e.g. ``/18000``, ``_v1/18000``) are NOT flagged — only
+   standalone ``80xx`` numeric tokens that are not part of a longer number and
+   are not preceded by a path/word character.
+
+G) A 60-seed launcher must source its seeds from the single seed-convention
+   module (solution_E6.md §PR4): either a ``--seed-pool <name>`` flag (a name in
+   ``robofactory.utils.eval_seeds.POOL_NAMES``) OR one of the PINNED env-seed
+   files under ``/iris/u/mikulrai/runs/`` (``eval_seeds_env_60.txt`` =
+   canonical_env_60, the frozen ``eval_seeds_60_dp.txt`` = dp_legacy, or
+   ``eval_seeds_60.txt``). A launcher with neither is feeding raw/ad-hoc seeds —
+   the exact pattern that produced never-seed-paired cross-method comparisons and
+   the silently-unpaired "paired" manifest entry. A ``--seed-pool`` referencing an
+   unknown pool name is also flagged.
+
+H) A self-contained 60-seed launcher — one that runs an eval driver INLINE — must
+   call ``scripts/log_eval.py`` at the end (WEEK1_EXECUTION §A8, solution_E13 §C).
+   That auto-posts a field-notes cell carrying the run's job id + result jsonl +
+   SR, so the "new-cell-per-run" convention stops depending on a human
+   remembering. Thin EXEC-dispatch wrappers (whose last meaningful line is
+   ``exec .../submit_eval.sh ...``) are EXEMPT: they hand off to the manifest
+   dispatcher and never run the eval inline, so a trailing call would be dead
+   code — the auto-post for those belongs in the dispatcher. A launcher that runs
+   a driver inline but omits the ``log_eval.py`` call is the exact "result lands
+   on disk, nobody logs a cell, verdict crystallizes from memory" loop A8 kills.
+
 Exit code: 0 if clean, 1 if any violation found.
 
 Usage
@@ -52,13 +83,18 @@ LAUNCHER_GLOBS = (
     "scripts/ablations/*_60seeds.sh",
     "scripts/ablations/*_60seeds_*.sh",
 )
+# Rule F also covers the repo-root hierarchical sbatch launchers, which live in
+# `<repo>/scripts/` (one level above `robofactory/`), NOT under `robofactory/`.
+SBATCH_HIER_GLOBS = (
+    "scripts/sbatch_hierarchical_*.sh",
+)
 
 
 @dataclass
 class LauncherFinding:
     path: Path
     line_no: int
-    rule: str  # A | B | C | D | E
+    rule: str  # A | B | C | D | E | F | G | H
     message: str
 
 
@@ -93,10 +129,85 @@ RE_LITERAL_SEED_BLOCK = re.compile(
     r'(?:^|\s)(-s|--seed|--seeds)\s+(?:\d+\s+){5,}',
     re.MULTILINE,
 )
+# Rule F — a hardcoded 80xx PORT literal. Match a standalone `80[0-9][0-9]`
+# token: not preceded by a digit (so `18000` -> the inner `8000` is rejected),
+# not preceded by a path/word char `/`, `_`, `.`, `-` (so ckpt-step paths like
+# `/18000`, `_v1/18000`, `step-8000` are not flagged), and not followed by a
+# digit (so `80001` is rejected). Bare port usages — `8000`, `8000,8001`,
+# `8000/8001`, `,8000)`, `--port 8000`, `start_server 0 8000` — DO match.
+RE_HARDCODED_PORT = re.compile(r'(?<![\w./-])80[0-9][0-9](?![0-9])')
+
+# Rule G — seed-convention sourcing. A 60-seed launcher must source its seeds from
+# the single seed-convention module (PR4): either a `--seed-pool <name>` flag or a
+# PINNED env-seed file. The pinned files are the frozen seed pins under
+# /iris/u/mikulrai/runs/ (matched by basename so the lint is path-prefix robust).
+RE_SEED_POOL_FLAG = re.compile(r'--seed-pool[=\s]+([A-Za-z0-9_]+)')
+# Pinned env-seed files (basenames). canonical_env_60, the frozen dp_legacy pin, and
+# the historical bases pin (kept for launchers that still reference it).
+PINNED_SEED_FILES = (
+    "eval_seeds_env_60.txt",
+    "eval_seeds_60_dp.txt",
+    "eval_seeds_60.txt",
+)
+RE_PINNED_SEED_FILE = re.compile(
+    r'(?:' + "|".join(re.escape(name) for name in PINNED_SEED_FILES) + r')'
+)
+# Does the launcher set seeds at all? (If it never passes seeds, rule G is N/A — the
+# driver default / manifest handles it; rule G only governs how an explicitly-seeded
+# 60-seed launcher names its seeds.)
+RE_SETS_SEEDS = re.compile(
+    r'(?:^|\s)(?:-s|--seeds?|--env-seeds|--seed-pool)\b'
+    r'|^\s*SEEDS\s*='
+    r'|\bpaste\s+-sd',
+    re.MULTILINE,
+)
+# Valid pool names live in eval_seeds; import lazily so the lint has no hard dep at
+# import time (e.g. when invoked outside the RoboFactory env). Falls back to a static
+# copy if the import fails.
+def _valid_pool_names() -> frozenset:
+    try:
+        from robofactory.utils.eval_seeds import POOL_NAMES
+        return POOL_NAMES
+    except Exception:
+        return frozenset({
+            "train_datagen", "canonical_env_60", "fresh_ood_60",
+            "upstream_100", "dp_legacy_60",
+        })
+
+
+# Rule H — the A8 auto-post convention. A self-contained 60-seed launcher must
+# call `log_eval.py` at the end so a field-notes cell (job id + jsonl + SR) is
+# posted mechanically. Match any `log_eval.py` invocation anywhere in the file
+# (it is appended near the end). The wrapper-exemption is decided by whether the
+# launcher's LAST meaningful line is an `exec ...` handoff.
+RE_LOG_EVAL_CALL = re.compile(r'\blog_eval\.py\b')
+RE_EXEC_HANDOFF = re.compile(r'^\s*exec\s+')
+
+
+def _last_meaningful_line(text: str) -> str:
+    """Return the last non-blank, non-comment line (a pure `exec` here marks a
+    thin manifest-dispatch wrapper, exempt from rule H)."""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return line
+    return ""
 
 
 def _line_no_of(text: str, span_start: int) -> int:
     return text.count("\n", 0, span_start) + 1
+
+
+def _rel_display(path: Path, root: Path) -> str:
+    """Path for display, robust to launchers outside `root` (the repo-root sbatch
+    hier scripts live at root.parent, which relative_to(root) cannot express)."""
+    for base in (root, root.parent):
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            continue
+    return str(path)
 
 
 def lint_one(path: Path) -> LauncherReport:
@@ -187,6 +298,80 @@ def lint_one(path: Path) -> LauncherReport:
             ),
         ))
 
+    # Rule F — no hardcoded 80xx PORT literal. Scanned per-line so we can skip
+    # pure-comment lines (a comment explaining the free-port fix is allowed).
+    for i, line in enumerate(text.splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue  # comment line: free-port explanation is fine
+        if RE_HARDCODED_PORT.search(line):
+            for pm in RE_HARDCODED_PORT.finditer(line):
+                rpt.findings.append(LauncherFinding(
+                    path=path,
+                    line_no=i,
+                    rule="F",
+                    message=(
+                        f"hardcoded port literal {pm.group(0)!r}. Allocate "
+                        "job-unique ports via _lib/free_ports.sh (bash) or "
+                        "free_ports() (python) — a shared hardcoded port routes "
+                        "co-scheduled clients to the wrong policy server (PR1)."
+                    ),
+                ))
+
+    # Rule G — seed-convention sourcing (PR4). Only 60-seed launchers are in scope
+    # (sbatch_hierarchical_*.sh are covered for rule F only). A launcher that sets
+    # seeds at all must do so via --seed-pool <valid-name> OR a pinned env-seed file.
+    if "60seeds" in path.name and RE_SETS_SEEDS.search(text):
+        pool_m = RE_SEED_POOL_FLAG.search(text)
+        pinned_m = RE_PINNED_SEED_FILE.search(text)
+        if pool_m is not None:
+            pool_name = pool_m.group(1)
+            if pool_name not in _valid_pool_names():
+                rpt.findings.append(LauncherFinding(
+                    path=path,
+                    line_no=_line_no_of(text, pool_m.start()),
+                    rule="G",
+                    message=(
+                        f"--seed-pool {pool_name!r} is not a known pool. Valid pools: "
+                        f"{sorted(_valid_pool_names())} (robofactory.utils.eval_seeds)."
+                    ),
+                ))
+        elif pinned_m is None:
+            rpt.findings.append(LauncherFinding(
+                path=path,
+                line_no=0,
+                rule="G",
+                message=(
+                    "60-seed launcher sets seeds but uses neither `--seed-pool "
+                    "<name>` nor a PINNED env-seed file "
+                    f"({list(PINNED_SEED_FILES)}). Raw/ad-hoc seeds are the "
+                    "never-seed-paired pattern PR4 retires — drive seeds from "
+                    "robofactory.utils.eval_seeds (solution_E6.md §PR4)."
+                ),
+            ))
+
+    # Rule H — the A8 auto-post convention (WEEK1_EXECUTION §A8). Only 60-seed
+    # launchers are in scope (sbatch_hierarchical_*.sh are rule-F-only). A thin
+    # EXEC-dispatch wrapper hands off to the manifest dispatcher and never runs
+    # the eval inline, so it is exempt (a trailing log_eval would be dead code);
+    # everything else that runs a driver inline must call log_eval.py at the end.
+    if "60seeds" in path.name:
+        last = _last_meaningful_line(text)
+        is_exec_wrapper = bool(RE_EXEC_HANDOFF.match(last))
+        if not is_exec_wrapper and not RE_LOG_EVAL_CALL.search(text):
+            rpt.findings.append(LauncherFinding(
+                path=path,
+                line_no=0,
+                rule="H",
+                message=(
+                    "inline 60-seed launcher does not call `scripts/log_eval.py` "
+                    "at the end. Append a log_eval.py invocation so a field-notes "
+                    "cell (job id + result jsonl + SR) is auto-posted per run — "
+                    "the A8 loop-killer convention (WEEK1_EXECUTION §A8). "
+                    "(Thin `exec .../submit_eval.sh` wrappers are exempt.)"
+                ),
+            ))
+
     return rpt
 
 
@@ -195,6 +380,14 @@ def collect_launchers(root: Path) -> list[Path]:
     for glob in LAUNCHER_GLOBS:
         for p in root.glob(glob):
             seen.add(p.resolve())
+    # Rule-F also covers repo-root hierarchical sbatch launchers. `root` is the
+    # `robofactory/` package dir; the sbatch launchers live in `<repo>/scripts/`
+    # (root.parent/scripts). Glob both root and root.parent to be robust to
+    # whether `root` is passed as the package dir or the repo root.
+    for base in (root, root.parent):
+        for glob in SBATCH_HIER_GLOBS:
+            for p in base.glob(glob):
+                seen.add(p.resolve())
     return sorted(seen)
 
 
@@ -228,12 +421,12 @@ def main(argv: list[str] | None = None) -> int:
     for rpt in reports:
         if rpt.ok:
             if args.verbose:
-                print(f"OK  {rpt.path.relative_to(args.root)}")
+                print(f"OK  {_rel_display(rpt.path, args.root)}")
             continue
         bad_files += 1
         total_findings += len(rpt.findings)
         for f in rpt.findings:
-            rel = f.path.relative_to(args.root)
+            rel = _rel_display(f.path, args.root)
             print(f"{rel}:{f.line_no}: rule {f.rule}: {f.message}")
 
     if total_findings:

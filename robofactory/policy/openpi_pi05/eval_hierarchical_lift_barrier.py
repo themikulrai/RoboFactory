@@ -103,17 +103,28 @@ class Args:
     hl_query_interval: int = 25  # K: query HL every K env steps
     hl_instruction: str = "lift the steel barrier using two robot arms"
     # ---- rollout / eval control ----
-    seed: int = 1000  # base seed; episode i uses base = seed + i
-    # Lift-Barrier pi0.5 project convention: env reset seed = base * seed_stride (+0). With
-    # seed_stride=100000, bases 100..159 map to env seeds 10_000_000.. ; the recorded/live
-    # "seed" field stays the BASE (100..159). seed_stride=1 (default) = consecutive bases.
-    seed_stride: int = 1
+    # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
+    # Prefer --seed-pool; --env-seeds is an ad-hoc final-env-seed list. When either is set,
+    # the driver runs exactly those FINAL env seeds (one episode each) and ignores
+    # --seed/--max-episodes. The old (seed+ep)*seed_stride transform — the stride trap that
+    # made early hier waves run raw 1000s — is DELETED: --seed-stride no longer exists.
+    seed_pool: str = ""
+    env_seeds: str = ""
+    allow_train_seeds: bool = False
+    seed: int = 1000  # DEPRECATED (pre-PR4): base FINAL env seed when no --seed-pool/--env-seeds given.
     max_episodes: int = 20
     max_env_steps: int = 500  # LiftBarrier-rf max_episode_steps is 500
     sim_backend: str = "auto"
     results_dir: str = "/iris/u/mikulrai/projects/RoboFactory/eval_results"
     video_dir: str = ""  # video output dir; defaults to <results_dir>/videos (always records)
     video_frame_stride: int = 2  # subsample factor before writing mp4 (1 = every frame)
+    # PR9: capture per-episode env_states + actions + proprio (qpos) to an h5 under
+    # --trajectory-root for future self-training. RGB is NOT recorded (re-renderable from
+    # env_states). The LL clients decode delta->absolute (cur_q + delta) BEFORE env.step,
+    # so the recorded actions are the ABSOLUTE joint targets — directly consumable by
+    # parse_h5_to_zarr_unified.py --state-source qpos. Default off.
+    save_trajectory: bool = False
+    trajectory_root: str = ""  # PR9: root for --save-trajectory h5s; "" => default eval_trajs root
     # ---- cameras ----
     camera_family: str = "wristcam"  # {wristcam, workspace}; workspace = head cams (trained-on)
     # ---- live dashboard ----
@@ -124,7 +135,19 @@ class Args:
     # ---- modes ----
     flat_baseline: bool = False  # skip HL; fixed prompt for both arms
     flat_prompt: str = "lift the steel barrier using two robot arms"
+    # PR6 prompt guard (flat-baseline path): the LL sidecar ckpts were conditioned on the
+    # subtask vocab (lb_subtask_index.npz), not an instruction string. In --flat-baseline
+    # mode --flat-prompt is validated against that vocab; OOV hard-fails (prints the vocab)
+    # unless --allow-oov-prompt is set (recorded in the result JSON — needed for prompt-swap
+    # probes; the default flat instruction IS deliberately OOV for the LL vocab).
+    subtask_npz: str = ""  # override the subtask vocab npz path (defaults to lb_subtask_index.npz)
+    allow_oov_prompt: bool = False  # permit an out-of-vocab --flat-prompt (recorded in JSON)
     mock_ll: bool = False  # zero-action chunks instead of contacting LL servers
+    # PR2 server-identity handshake for the LL pi0.5 servers. If set, hard-fail (exit 3)
+    # before episode 1 unless each LL arm's metadata config_name matches AND action_dim==8.
+    # Accepts a single name (broadcast to all arms) OR a comma-separated name per arm,
+    # aligned with --ports. Ignored under --mock-ll (no real server). Empty => no check.
+    expect_config: str = ""
 
 
 # ----------------------------------------------------------------------------- obs helpers
@@ -487,7 +510,8 @@ def fidelity_check(
 
 def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed, video_path,
                 view_sensors, env_seed=None, record_seed=None):
-    obs, _ = env.reset(seed=(env_seed if env_seed is not None else seed))
+    _eff_seed = int(env_seed if env_seed is not None else seed)  # PR5: per-episode LL rng key
+    obs, _ = env.reset(seed=_eff_seed)
     if hl_client is not None:
         hl_client.reset()
 
@@ -543,6 +567,7 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         for i in range(args.num_arms):
             if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                 obs_i = _build_ll_obs(obs, args, cam_map, prompts[i])
+                obs_i["_episode_seed"] = _eff_seed  # PR5: re-key this LL server's rng per episode (popped server-side)
                 chunks[i] = np.asarray(ll_policies[i].infer(obs_i)["actions"])
                 chunk_idxs[i] = 0
                 replanned[i] = True
@@ -593,6 +618,35 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
 def main(args: Args):
     _assert_not_login_node()
 
+    # PR4: resolve FINAL env seeds via the single source of truth. If --seed-pool or
+    # --env-seeds is given, run exactly those env seeds (one episode each) — the old
+    # (seed+ep)*seed_stride transform is deleted. Otherwise fall back to the legacy
+    # --seed/--seed-stride/--max-episodes path (kept for backward compat) and record
+    # its identity in the same provenance shape.
+    seed_provenance = None
+    resolved_env_seeds = None
+    if args.seed_pool or args.env_seeds:
+        from robofactory.utils.eval_seeds import resolve_seeds
+        resolved_env_seeds, seed_provenance = resolve_seeds(
+            pool=args.seed_pool or None,
+            env_seeds=args.env_seeds or None,
+            allow_train=args.allow_train_seeds,
+        )
+
+    # PR6 prompt guard (flat-baseline only): validate --flat-prompt against the LL
+    # subtask vocab. OOV hard-fails (prints the vocab) unless --allow-oov-prompt. The
+    # validation dict is recorded in the result JSON. The hierarchical path routes
+    # subtasks live so its per-arm prompts are vocab by construction.
+    prompt_validation = None
+    if args.flat_baseline:
+        from robofactory.utils.eval_validity import load_prompt_vocab, validate_prompt
+        _vocab, _vocab_src = load_prompt_vocab(
+            use_subtask_vocab=True, subtask_npz=args.subtask_npz or None,
+        )
+        prompt_validation = validate_prompt(
+            args.flat_prompt, _vocab, allow_oov=args.allow_oov_prompt, vocab_source=_vocab_src
+        )
+
     if args.camera_family not in CAMERA_FAMILIES:
         raise ValueError(f"--camera-family must be one of {sorted(CAMERA_FAMILIES)}, got {args.camera_family!r}")
     cam_map = dict(CAMERA_FAMILIES[args.camera_family])      # LL helpers' cameras
@@ -627,7 +681,51 @@ def main(args: Args):
     env = gym.make(args.task, **gym_make_kwargs)
     action_prefix = list(env.action_space.spaces.keys())[0].rsplit("-", 1)[0]
 
+    # PR9: optional self-training trajectory capture. The LL clients decode delta->absolute
+    # BEFORE env.step, so RecordEpisodeMA buffers ABSOLUTE joint targets (no converter-side
+    # fix). RGB dropped (re-renderable); qpos rides along via obs. Wrap before the rollout
+    # loop so each env.reset() flushes the prior episode in order.
+    traj_h5_path = None
+    if args.save_trajectory:
+        from robofactory.utils.eval_trajectory import trajectory_output_dir, wrap_record_trajectory
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _traj_label = f"eval_hier_{args.task}_{_ts}"
+        _traj_dir = trajectory_output_dir(args.trajectory_root or None, _traj_label)
+        env, traj_h5_path = wrap_record_trajectory(env, _traj_dir, trajectory_name="trajectory")
+        print(f"[eval_hier] PR9 --save-trajectory -> {traj_h5_path}", flush=True)
+
     ll_policies = _make_ll_policies(args)
+
+    # PR2 server-identity handshake for the LL pi0.5 servers (skipped under --mock-ll,
+    # which has no real metadata). Per-arm decent dim is 8. A wrong served config or
+    # action dim hard-fails before episode 1 instead of silently rolling out.
+    ll_server_metadata: list[dict] = []
+    for i, p in enumerate(ll_policies):
+        meta = dict(p.get_server_metadata() or {}) if hasattr(p, "get_server_metadata") else {}
+        ll_server_metadata.append(meta)
+        print(f"[arm{i}] server metadata: {meta}")
+    if args.expect_config and not args.mock_ll:
+        expect_configs = [c.strip() for c in args.expect_config.split(",")]
+        if len(expect_configs) == 1:
+            expect_configs = expect_configs * args.num_arms  # broadcast single name
+        if len(expect_configs) != args.num_arms:
+            print(
+                f"SERVER IDENTITY MISMATCH: --expect-config has {len(expect_configs)} entries "
+                f"but --num-arms={args.num_arms} (single name or one per arm); refusing to run",
+                file=_sys.stderr, flush=True,
+            )
+            _sys.exit(3)
+        from robofactory.utils.server_identity import assert_server_identity_or_exit
+        for i in range(args.num_arms):
+            assert_server_identity_or_exit(
+                ll_server_metadata[i],
+                expect_configs[i],
+                # action_dim from serve_policy is the padded model dim (32), not task-specific;
+                # config_name is the real guard (server reports a fixed real_action_dim too) —
+                # PR2 dim-arm disabled, see E10 false-reject 2026-06-11.
+                expect_action_dim=None,
+                label=f"arm{i}",
+            )
 
     hl_client = None
     if not args.flat_baseline:
@@ -648,7 +746,7 @@ def main(args: Args):
             "status": status,
             "camera_family": args.camera_family,
             "checkpoints": {"hl": args.hl_ckpt, "arm0": args.arm0_ckpt, "arm1": args.arm1_ckpt},
-            "seeds_total": int(args.max_episodes),
+            "seeds_total": len(episode_seeds),  # PR4: actual resolved episode count
             "episodes": [
                 {
                     "seed": e["seed"],
@@ -667,17 +765,38 @@ def main(args: Args):
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(p)
 
+    # PR4: build the (recorded_seed, env_seed) episode list.
+    if resolved_env_seeds is not None:
+        # Pool / ad-hoc path: each resolved value IS the FINAL env seed. The recorded
+        # seed equals the env seed (no base/stride distinction remains).
+        episode_seeds = [(int(s), int(s)) for s in resolved_env_seeds]
+    else:
+        # Legacy --seed path (no pool given). PR4: the recorded seed IS the FINAL env
+        # seed (base + ep) — the *seed_stride multiply is DELETED. Retained for backward
+        # compat; deprecated by --seed-pool.
+        episode_seeds = [
+            (args.seed + ep, args.seed + ep)
+            for ep in range(args.max_episodes)
+        ]
+
     episodes = []
     _write_live("running", episodes)  # seed an empty live file so a reader sees us start
-    for ep in range(args.max_episodes):
-        base = args.seed + ep                 # recorded/live seed (e.g. 100..159)
-        env_seed = base * args.seed_stride     # actual env reset seed (project convention)
+    for ep, (base, env_seed) in enumerate(episode_seeds):
         video_path = str(Path(args.video_dir) / f"ep{ep:03d}_seed{base}.mp4")
         rec = run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, base,
                           video_path, view_sensors, env_seed=env_seed, record_seed=base)
+        if traj_h5_path is not None:
+            # PR9: episodes flush in order; episode idx `ep` -> traj_{ep} in the h5.
+            rec["trajectory_path"] = traj_h5_path
+            rec["trajectory_group"] = f"traj_{ep}"
         episodes.append(rec)
         print(f"[episode {ep}] {rec}")
         _write_live("running", episodes)
+
+    # PR9: flush the final episode's trajectory + close the h5 (TERM-before-KILL discipline
+    # for launchers; memory project_h5_cancel_corruption). No-op when not recording.
+    if traj_h5_path is not None:
+        env.close()
 
     n = len(episodes)
     n_success = sum(1 for e in episodes if e["success"])
@@ -685,12 +804,18 @@ def main(args: Args):
 
     results = {
         "task": args.task,
+        "args": dataclasses.asdict(args),
+        "seed_provenance": seed_provenance,  # PR4: pool name + sha + allow_train (None on legacy --seed path)
+        "prompt_validation": prompt_validation,  # PR6: flat-baseline prompt OOV check (None in hierarchical mode)
+        "server_metadata": {f"arm{i}": ll_server_metadata[i] for i in range(len(ll_server_metadata))},
         "mode": "flat-baseline" if args.flat_baseline else "hierarchical",
         "mock_ll": args.mock_ll,
         "hl_query_interval": args.hl_query_interval,
         "num_episodes": n,
         "num_success": n_success,
         "success_rate": success_rate,
+        "save_trajectory": args.save_trajectory,  # PR9
+        "trajectory_h5": traj_h5_path,            # PR9
         "episodes": episodes,
     }
 

@@ -30,11 +30,20 @@ launchers:
       max_steps: 400
       replan_after: 8
     seeds:
-      file: /iris/u/mikulrai/runs/eval_seeds_60_dp.txt
-      sha256_file: /iris/u/mikulrai/runs/eval_seeds_60_dp.sha256
+      # PR4 FIX: was eval_seeds_60_dp.txt (raw 10000s/1000s). run_eval.py fed those raw
+      # seeds to eval_pi05.py, which multiplied by 100_000 -> the pi0.5 run never touched
+      # the same env seeds DP did, so this "paired" entry was silently UN-paired (A3 §2).
+      # eval_pi05.py now consumes FINAL env seeds directly (no x100_000), and this file is
+      # the resolved canonical_env_60 pool. DP launchers pointed at the SAME file (or
+      # --seed-pool canonical_env_60) now produce truly seed-paired numbers.
+      file: /iris/u/mikulrai/runs/eval_seeds_env_60.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_env_60.txt.sha256
       delim: ","
     server:
-      ports: [8000]
+      # NOTE: `ports` are now LOGICAL ARM INDICES, not real TCP ports. run_eval.py
+      # allocates job-unique real ports at runtime via free_ports() and maps each
+      # index -> a real port. This kills the hardcoded-port collision class (PR1).
+      ports: [0]
       gpu_indices: [0]
       xla_mem_fraction: 0.40
     wandb:
@@ -74,7 +83,9 @@ launchers:
       sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
       delim: ","
     server:
-      ports: [8000, 8001, 8002]
+      # `ports` are LOGICAL ARM INDICES (see PR1 note above) — run_eval.py maps
+      # each index to a job-unique real port allocated at runtime.
+      ports: [0, 1, 2]
       gpu_indices: [0, 1, 2]
       xla_mem_fraction: 0.30
       arm_configs:
@@ -547,7 +558,8 @@ launchers:
   # pi05_decent — 2SC wristcam decentralised Pi0.5 eval (2 servers, 2 GPUs).
   #
   # Migrated from eval_pi05_2sc_wc_decent_60seeds.sh. Two per-arm LoRA servers
-  # (step 19999) on ports 8000/8001, routed by eval_decent_pi05.py. TABLE scene.
+  # (step 19999) on job-unique runtime-allocated ports, routed by
+  # eval_decent_pi05.py. TABLE scene.
   #
   # Correctness invariants (do NOT tidy):
   #   - seed set = eval_seeds_60.txt (100-159), comma-delim for the pi05 driver.
@@ -582,7 +594,9 @@ launchers:
       sha256_file: /iris/u/mikulrai/runs/eval_seeds.sha256
       delim: ","
     server:
-      ports: [8000, 8001]
+      # `ports` are LOGICAL ARM INDICES (see PR1 note above) — run_eval.py maps
+      # each index to a job-unique real port allocated at runtime.
+      ports: [0, 1]
       gpu_indices: [0, 1]
       xla_mem_fraction: 0.30
       arm_configs:
