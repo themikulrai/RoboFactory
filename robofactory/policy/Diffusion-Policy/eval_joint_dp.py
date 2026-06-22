@@ -342,6 +342,7 @@ def main(args: Args):
                 seed=int(seed), success=int(result['success']),
                 steps=int(result['length']), vram_peak_mb=vram_mb, episode_idx=idx,
             )
+            metrics.update(result.get('partial', {}))  # CL3 partial-credit stage flags
             if traj_h5_path is not None:
                 # PR9: episodes flush in order; episode idx -> traj_{idx} in the h5.
                 metrics['trajectory_path'] = traj_h5_path

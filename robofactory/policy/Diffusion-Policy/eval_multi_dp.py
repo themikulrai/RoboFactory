@@ -504,6 +504,26 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
     wallclock = _t.perf_counter() - t_ep
     vram_peak_mb = torch.cuda.max_memory_allocated() / 1e6
     infer_ms_mean = [float(np.mean(v)) if v else 0.0 for v in infer_times_ms]
+
+    # CL3 partial-credit: 0/60 binary floors are uninformative, so log the per-stage
+    # flags the env's evaluate() already returns (final-step info). For TSC these are
+    # is_cubeA_on_cubeB / is_cubeC_on_cubeA / cubeB_placed / grasp flags; for other
+    # tasks they are whatever that env exposes. Read-only on `info` (last env.step),
+    # never alters the binary `success` headline above.
+    def _scalar(v):
+        if hasattr(v, "item"):
+            try:
+                return bool(v.reshape(-1)[0].item()) if hasattr(v, "reshape") else bool(v.item())
+            except Exception:
+                return None
+        if isinstance(v, (bool, int, float)):
+            return bool(v)
+        try:
+            return bool(np.asarray(v).reshape(-1)[0])
+        except Exception:
+            return None
+    partial = {f"stage_{k}": _scalar(v) for k, v in (info or {}).items() if k != "success"}
+
     out = dict(
         seed=int(seed),
         success=int(success),
@@ -513,6 +533,7 @@ def run_episode(env, planner, dp_models, agent_num, seed, args, verbose, agent_p
         infer_ms_mean_per_arm=[round(x, 2) for x in infer_ms_mean],
         vram_peak_mb=round(vram_peak_mb, 1),
     )
+    out.update(partial)  # CL3 partial-credit per-stage flags
     if sustained_info is not None:
         out["success_sustained_10"] = bool(sustained_info["sustained"])
         out["sustained_info"] = sustained_info

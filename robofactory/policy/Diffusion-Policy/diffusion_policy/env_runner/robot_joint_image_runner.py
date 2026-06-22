@@ -276,7 +276,17 @@ class RobotJointImageRunner:
             if success:
                 break
 
-        return dict(success=bool(success), length=steps, frames=frames)
+        # CL3 partial-credit: surface the per-stage flags the env's evaluate() returns
+        # (final-step info) so the cent eval can log them. Never alters `success`.
+        def _scalar(v):
+            try:
+                if hasattr(v, "item"):
+                    return bool(np.asarray(v.detach().cpu() if hasattr(v, "detach") else v).reshape(-1)[0])
+                return bool(np.asarray(v).reshape(-1)[0])
+            except Exception:
+                return None
+        partial = {f"stage_{k}": _scalar(v) for k, v in (info or {}).items() if k != "success"}
+        return dict(success=bool(success), length=steps, frames=frames, partial=partial)
 
     def run(self, policy) -> dict:
         try:
