@@ -122,8 +122,9 @@ cameras:
     - 
       uid: head_camera_agent0
       pose:
+        # FLAG-FOR-REVIEW: distinct per-agent view for panda-0 (base [0,-0.8,0], -Y side, cubeA@[-0.025,-0.115]).
         type: look_at
-        params: [[-0.5, 0, 0.4], [0, -0, 0.1]]
+        params: [[-0.45, -0.35, 0.4], [-0.025, -0.115, 0.05]]
       width: 320
       height: 240
       fov: 1.5707963268
@@ -132,8 +133,9 @@ cameras:
     - 
       uid: head_camera_agent1
       pose:
+        # FLAG-FOR-REVIEW: distinct per-agent view for panda-1 (base [0,0.8,0], +Y side, cubeB@[-0.025,0.115]).
         type: look_at
-        params: [[-0.5, 0, 0.4], [0, -0, 0.1]]
+        params: [[-0.45, 0.35, 0.4], [-0.025, 0.115, 0.05]]
       width: 320
       height: 240
       fov: 1.5707963268
@@ -142,8 +144,9 @@ cameras:
     - 
       uid: head_camera_agent2
       pose:
+        # FLAG-FOR-REVIEW: distinct per-agent view for panda-2 (base [0.8,0,0], +X side, cubeC@[0.185,-0.05]).
         type: look_at
-        params: [[-0.5, 0, 0.4], [0, -0, 0.1]]
+        params: [[0.55, -0.05, 0.4], [0.185, -0.05, 0.05]]
       width: 320
       height: 240
       fov: 1.5707963268
