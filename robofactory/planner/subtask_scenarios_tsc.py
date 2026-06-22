@@ -1,90 +1,75 @@
-"""ThreeRobotsStackCube (TSC) subtask scenario + CONTRASTIVE program sampler.
+"""ThreeRobotsStackCube (TSC) subtask scenario + COLLISION-FREE contrastive sampler.
 
 Mirror of ``subtask_scenarios`` (the LiftBarrier sampler) for the 3-arm
-ThreeRobotsStackCube task. A "scenario" turns a random seed into a list of
-:class:`~.subtask_scenarios.ProgramSpec` objects; each spec is a *builder* that,
-given a live ``(planner, env)``, returns a per-arm program ``{arm: [QueuedRecipe]}``
-for ``subtask_interpreter.run_program``. Same two levels of laziness as the LB
-sampler (structure now, JIT per-primitive planning later) and the same SIM-FREE
-contract (the sampler only decides STRUCTURE — gating — with its own RNG; all
-planning happens inside the recipes at run time).
+ThreeRobotsStackCube task, REBUILT to reproduce the proven collision-free
+choreography of ``solutions/three_robots_stack_cube.py`` (the original solver).
+A "scenario" turns a random seed into a list of
+:class:`~.subtask_scenarios.ProgramSpec` builders; each builder, given a live
+``(planner, env)``, returns a per-arm program ``{arm: [QueuedRecipe]}`` for
+``subtask_interpreter.run_program``. Same two levels of laziness as the LB sampler
+(structure now, JIT per-primitive planning later) and the same SIM-FREE contract.
 
-We REUSE the LB module's shared machinery directly (``ProgramSpec``, ``QueuedRecipe``,
-the deterministic program-progress gate ``_gate_other_reached``, and the structural
-guards ``gate_graph`` / ``assert_no_deadlock`` / ``group_specs`` / ``filter_variants``)
-so there is one source of truth for those.
+WHY THIS REWRITE: the previous TSC sampler dropped the original solver's
+collision-free structure — it lifted only +0.2 and let all three arms descend into
+the SAME stacking region, so episodes COLLIDED. We now mirror the original exactly.
 
-EVERY VARIANT IS A COMPLETE TASK ROLLOUT (the cubes actually stack)
-==================================================================
-TSC env success = cubeB on cubeA, cubeC on cubeB, cubeB over goal_region, and all
-three grippers released (see ThreeRobotsStackCubeEnv.evaluate). The canonical
-solver stacks bottom-up: goal_region <- cubeA <- cubeB <- cubeC (A into the goal,
-B on A, C on B). So in EVERY variant all three arms ULTIMATELY PLACE their cube
-(end with a PLACE) and the env reaches its stack success. Holds/waits are
-TRANSIENT (coordination), never permanent.
+THE ORIGINAL SOLVER's COLLISION-FREE STRUCTURE (solutions/three_robots_stack_cube.py):
+  (1) all 3 grasp SIMULTANEOUSLY at their SEPARATE cubes (arm0->cubeA, arm1->cubeB,
+      arm2->cubeC);
+  (2) all 3 lift +0.5 SIMULTANEOUSLY (HIGH, well out of the stacking region);
+  (3) PLACE STRICTLY SERIALLY: arm0 -> goal_region, then arm0 RETREATS back UP to
+      grasp_poseA+0.5; THEN arm1 -> onto cubeA, retreats UP; THEN arm2 -> onto
+      cubeB. Only ONE arm is ever in the stacking region at a time; the others
+      stay parked HIGH (+0.5) and the placer RETREATS UP before the next descends.
 
-THE TASK TRUTH (read from tasks/three_robots_stack_cube.py + the solver):
-  * 3 arms: panda-0 (left, y=-0.8), panda-1 (right, y=+0.8), panda-2 (middle, x=+0.8).
-  * 3 cubes: cubeA=blue, cubeB=green, cubeC=red (see TSC_CUBE_COLOR).
-  * Solver assignment + place destinations (solutions/three_robots_stack_cube.py):
-      - arm0 -> cubeA (blue), placed onto ``goal_region``  (BOTTOM of the stack)
-      - arm1 -> cubeB (green), placed onto ``cubeA``       (middle)
-      - arm2 -> cubeC (red),  placed onto ``cubeB``        (top)
-    i.e. dest actor names goal_region / cubeA / cubeB respectively.
+COLLISION-FREE INVARIANTS (enforced in EVERY variant):
+  A. Pick (approach+close) and the +0.5 lift MAY be simultaneous (separate cubes)
+     OR staggered. TSC lift dz = 0.5 (NOT 0.2) so an idle/parked arm is HIGH.
+  B. A grasped arm that is not the one currently placing is PARKED HIGH at +0.5 and
+     WAITs there. This happens AUTOMATICALLY: after lift(0.5), the arm's PLACE is
+     gated; while blocked the interpreter holds the frozen +0.5 qpos (gripper
+     closed) labelled ``wait`` = "wait at top".
+  C. PLACE IS STRICTLY SERIAL: the arm at stack-rank k may begin its place ONLY
+     after the arm at rank k-1 has PLACED **AND RETREATED** (region clear). The
+     gate is a deterministic program-progress predicate on the previous placer's
+     qi reaching its RETREAT-done index, NOT just its place-done index. Stack
+     order: cubeA(goal, rank0) -> cubeB(on A, rank1) -> cubeC(on B, rank2).
+  D. Every place is followed by a RETREAT-UP out of the region (straight up ~+0.5,
+     gripper open), mirroring the original's move-back-to-grasp_pose+0.5.
 
-STACK DEPENDENCY (the new gate axis vs LB's coordination gate):
-Placement MUST be bottom-up: cubeA placed into the goal FIRST, then cubeB onto A,
-then cubeC onto B. We enforce this with a DETERMINISTIC program-progress gate on
-the PLACE primitive of each non-bottom cube: cubeB's place waits for cubeA's
-placer to have FINISHED its place; cubeC's place waits for cubeB's placer. This is
-the same ``_gate_other_reached`` mechanism the LB stagger gate uses, just pointed
-at the PLACE-done program index instead of the grasp-done index.
+PER-ARM PROGRAM (base, stack-rank order arm0=A rank0, arm1=B rank1, arm2=C rank2):
+  rank0 (arm0): approach(blue)  -> close -> lift(0.5) -> place(goal_region) -> open -> retreat_up
+  rank1 (arm1): approach(green) -> close -> lift(0.5) -> place(on cubeA, gated) -> open -> retreat_up
+  rank2 (arm2): approach(red)   -> close -> lift(0.5) -> place(on cubeB, gated) -> open -> retreat_up
+The full program is [approach(0), close(1), lift(2), place(3), open(4), retreat_up(5)].
+``_ArmState.qi`` increments AFTER a primitive completes, so:
+  * GRASP_IDX       = 2 : finished approach+close (grasped), now on the lift.
+  * an arm has FINISHED its retreat (region clear) once qi >= 6 (the program has 6
+    primitives, retreat_up at index 5, qi==6 means it completed). We COMPUTE this
+    per-arm via ``_retreat_done_idx`` (== len(program)) because the
+    ``direct_place`` variant DROPS arm0's lift, shortening its program to 5 (retreat
+    at index 4, retreat-done at qi >= 5) — the gate index must track the ACTUAL
+    previous-arm program length, never a hardcoded 6.
 
-PER-ARM PROGRAM (the cube X handler):
-    [approach(color_of_X), close, lift, place(onto dest_of_X), open]
-Program indices: approach=0, close=1, lift=2, place=3, open=4. ``_ArmState.qi``
-increments AFTER a primitive completes, so:
-  * GRASP_IDX = 2  : the arm has FINISHED approach+close and is on its lift (grasped).
-  * PLACE_DONE_IDX = 4 : the arm has FINISHED its place and is on its open (placed).
+CONTRAST FAMILIES (matched pairs, SAME seed; placing serial in BOTH members):
+  1. ``pickcoord``: simultaneous_pick (all 3 approach+close+lift UNGATED together)
+     VS staggered_pick (arm0 leads ungated; arm1 & arm2's approach gated on arm0
+     GRASPED (qi >= GRASP_IDX) -> they WAIT at home at frame 0). Both then place
+     serially A->B->C with retreats. Frame-0 counterfactual: arm1/arm2 WAIT vs
+     APPROACH.
+  2. ``raisedirect``: for the FIRST placer (arm0, rank0): raise_and_wait (arm0 does
+     lift(0.5) then place — it raises HIGH first) VS direct_place (arm0 SKIPS the
+     lift(0.5) and places directly from the grasp, since the region is clear and it
+     is FIRST). The others ALWAYS raise. Counterfactual: arm0 after grasp -> LIFT
+     (raise/wait-at-top) vs PLACE (descend directly). Both stay collision-free (arm0
+     places first into the empty region; the others wait HIGH).
 
-VARIANTS (matched pairs; each vs the simultaneous baseline, SAME seed):
-  1. ``simultaneous`` (baseline): all 3 arms approach+close+lift UNGATED together;
-     PLACES gated ONLY by stack order (B-place waits A placed; C-place waits B
-     placed). The bottom placer (cubeA->goal) is fully ungated. Frame-0: all 3
-     arms ``approach``.
-  2. ``stagger_grasp`` (coordination contrast, parallels LB's stagger): arm0 (the
-     cubeA/bottom handler) LEADS grasp UNGATED; the other two arms WAIT (labelled
-     ``wait``, gripper open) until arm0 has GRASPED (qi >= GRASP_IDX), then they
-     grasp; PLACES still gated by stack order. Counterfactual vs simultaneous: at
-     frame 0 arm1/arm2 are ``wait`` here vs ``approach`` there.
-  3. ``target_swap`` (color counterfactual — ATTEMPT, may be infeasible, kept
-     FILTERABLE): a DIFFERENT arm<->cube assignment from the SAME start —
-     arm0 -> cubeC (red), arm1 -> cubeB (green), arm2 -> cubeA (blue) — but the
-     STACK ORDER stays valid: whoever holds cubeA places into the goal FIRST (here
-     arm2), then the cubeB holder onto cubeA (arm1), then the cubeC holder onto
-     cubeB (arm0). The PROMPT reflects the cube COLOR, so arm0 reads "approach the
-     red cube" here vs "approach the blue cube" in simultaneous -> a color-grounding
-     counterfactual. CONCERN: cross-assignment can be infeasible on a 3-arm table
-     (reachability: arm0 is left, cubeC may sit far right; and the stack point is
-     fixed at the goal so the placer reach is unchanged but the GRASP reach changes).
-     Implemented anyway and tagged so it can be dropped after sim validation.
-
-GATE MECHANISM / DEADLOCK GUARD (inherited from the LB module, unchanged):
-The gates are DETERMINISTIC predicates on another arm's ``_ArmState.qi`` (program
-progress), never a physics probe. DEADLOCK GUARD: every variant has >= 1 arm with
-an UNGATED first primitive (the bottom-cube handler always starts ungated) and the
-gate graph is acyclic (B waits A, C waits B — a chain, never a cycle). EVERY arm
-ends with a PLACE (the stack-complete guard ``assert_all_arms_place``).
-
-PER-PRIMITIVE CHECKS:
-  * approach -> check_tcp_near (reads the primitive's stored target_pose).
-  * close    -> none (a non-grasp is caught downstream: no grasp -> no stack ->
-    env never reaches success -> group dropped).
-  * lift     -> none (env stack-success is the real gate; a height check would need
-    the per-cube base z which the sampler does not know off-GPU).
-  * place    -> none (rely on env stack-success).
-Episode kept via env_success (proper stack) OR completed (see the runner's
-``_member_passes``).
+GATE MECHANISM / GUARDS (inherited from the LB module):
+gates are DETERMINISTIC predicates on another arm's ``_ArmState.qi``, never a
+physics probe. DEADLOCK GUARD: >= 1 arm has an UNGATED first primitive (the bottom
+placer always grasps ungated) and the gate graph is acyclic (B waits A retreated, C
+waits B retreated — a chain). The serial-place guard ``assert_serial_place_gated``
+checks every place above rank 0 is gated on the PREVIOUS rank's RETREAT-done.
 
 IMPORT-CLEAN-ish: imports numpy + the (numpy-only) primitive/interpreter modules
 and the LB scenario module; NO sapien / gym / robofactory.tasks at module top, so
@@ -116,13 +101,21 @@ TSC = "ThreeRobotsStackCube"
 # ThreeRobotsStackCube has exactly 3 arms.
 TSC_NUM_ARMS = 3
 
+# TSC lift / retreat raise height. 0.5 (NOT 0.2) so a parked/idle arm clears the
+# stacking region entirely — matches the original solver's grasp_pose[2] += 0.5.
+TSC_LIFT_DZ = 0.5
+
 # A builder takes the live (planner, env) and returns {arm: [QueuedRecipe]}.
 ProgramBuilder = Callable[[object, object], Dict[int, List[QueuedRecipe]]]
 
-# Program-position index at which an arm has FINISHED its PLACE and is on its open.
-# Per-arm program is [approach(0), close(1), lift(2), place(3), open(4)]; qi
-# increments AFTER a primitive completes, so qi >= 4 means the place is DONE.
-PLACE_DONE_IDX = 4
+# Program-position indices for the FULL 6-primitive per-arm program
+# [approach(0), close(1), lift(2), place(3), open(4), retreat_up(5)].
+# qi increments AFTER a primitive completes, so:
+PLACE_IDX = 3        # the place primitive sits at index 3 (full program)
+PLACE_DONE_IDX = 4   # qi >= 4 means the place is DONE (now on its open)
+# RETREAT-done index is COMPUTED per-arm (== len(program)) because the
+# ``direct_place`` variant shortens arm0's program by dropping its lift. See
+# ``_retreat_done_idx``.
 
 # --------------------------------------------------------------------------- target/dest tables
 # color -> TSC target id for the cube (the approach/lift target).
@@ -173,7 +166,7 @@ def _close_qp(*, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _lift_qp(color: str, *, dz: float = 0.2, wait_for=None) -> QueuedRecipe:
+def _lift_qp(color: str, *, dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
     # NO success_check: env stack-success is the real gate, and a per-cube height
     # check would need the cube's base z which the sampler does not know off-GPU.
     tid = _COLOR_TID[color]
@@ -208,17 +201,28 @@ def _open_qp(*, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
+def _retreat_qp(*, dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
+    """retreat the arm STRAIGHT UP out of the stacking region after a place+open.
+
+    Mirrors the original solver's move-back-to-grasp_pose+0.5. Gripper OPEN (the
+    cube was just released). Plans from the LIVE tcp pose (no grasp re-resolve)."""
+    def recipe(planner, env, arm: int) -> P.Primitive:
+        return P.retreat_up(planner, env, arm=arm, task=TSC, dz=dz,
+                            grip=P.OPEN, success_check=None)
+    return QueuedRecipe(recipe, wait_for=wait_for)
+
+
 # --------------------------------------------------------------------------- assignment helper
 # An "assignment" maps each arm -> (cube, dest_actor_name) and records the stack
-# ORDER (which arm places first/second/third). The builders below turn an
-# assignment + a grasp-gating policy into a {arm:[QueuedRecipe]} program.
+# ORDER (which arm places first/second/third).
 
 @dataclass(frozen=True)
 class _Assign:
     """One arm's role: the cube it handles + where it places it + its stack rank.
 
     stack_rank 0 = bottom (placed into goal first); 1 = middle (onto bottom cube);
-    2 = top (onto middle cube). The PLACE gate chains on the arm one rank below.
+    2 = top (onto middle cube). The PLACE gate chains on the arm one rank below
+    having RETREATED (region clear), not merely placed.
     """
     cube: str
     dest_actor_name: str
@@ -235,18 +239,6 @@ _BASE_ASSIGN: Dict[int, _Assign] = {
     2: _Assign(cube="cubeC", dest_actor_name="cubeB", stack_rank=2),
 }
 
-# target_swap assignment: SAME cubes/dests but a DIFFERENT arm holds each cube.
-#   arm0 -> cubeC(red)  onto cubeB   (top, rank 2)
-#   arm1 -> cubeB(green) onto cubeA   (middle, rank 1)   [unchanged arm for cubeB]
-#   arm2 -> cubeA(blue) onto goal_region (bottom, rank 0)
-# Stack order stays valid: the cubeA holder (arm2) places into the goal FIRST,
-# then the cubeB holder (arm1) onto cubeA, then the cubeC holder (arm0) onto cubeB.
-_SWAP_ASSIGN: Dict[int, _Assign] = {
-    0: _Assign(cube="cubeC", dest_actor_name="cubeB", stack_rank=2),
-    1: _Assign(cube="cubeB", dest_actor_name="cubeA", stack_rank=1),
-    2: _Assign(cube="cubeA", dest_actor_name="goal_region", stack_rank=0),
-}
-
 
 def _arm_at_rank(assign: Dict[int, _Assign], rank: int) -> int:
     """Return the arm whose stack_rank == ``rank`` (unique per assignment)."""
@@ -256,100 +248,206 @@ def _arm_at_rank(assign: Dict[int, _Assign], rank: int) -> int:
     raise KeyError(f"no arm at stack_rank {rank} in assignment {assign}")
 
 
-def _place_gate(assign: Dict[int, _Assign], arm: int):
-    """Stack-order gate for ``arm``'s PLACE: wait until the arm one rank BELOW has
-    FINISHED its place (qi >= PLACE_DONE_IDX). The bottom arm (rank 0) is UNGATED."""
-    rank = assign[arm].stack_rank
-    if rank == 0:
-        return None  # bottom cube places first, ungated
-    below_arm = _arm_at_rank(assign, rank - 1)
-    return _gate_other_reached(below_arm, PLACE_DONE_IDX)
+def _retreat_done_idx(prog_len: int) -> int:
+    """The qi at which an arm whose program has ``prog_len`` primitives has FINISHED
+    its retreat. qi increments AFTER each primitive completes and the retreat is the
+    LAST primitive, so the arm reaches qi == prog_len exactly when it finishes its
+    retreat (region clear). This is COMPUTED (not hardcoded 6) so the
+    ``direct_place`` variant's shorter (5-primitive) arm0 gates correctly."""
+    return int(prog_len)
 
 
-# --------------------------------------------------------------------------- family builders
+# --------------------------------------------------------------------------- per-arm program builder
 
 
-def _build_program(assign: Dict[int, _Assign],
-                   grasp_lead_arm: Optional[int]) -> ProgramBuilder:
-    """Build a TSC program from an assignment + a grasp-gating policy.
+def _arm_program(color: str, dest: str, *, grasp_gate, place_gate,
+                 raise_first: bool) -> List[QueuedRecipe]:
+    """Build ONE arm's full program.
+
+    approach -> close -> [lift(0.5) if raise_first] -> place -> open -> retreat_up.
+
+    ``raise_first`` False DROPS the lift (the ``direct_place`` arm0): it places
+    directly from the grasp. ``grasp_gate`` gates the FIRST primitive (approach);
+    ``place_gate`` gates the PLACE (serial-place stack-order gate)."""
+    queue: List[QueuedRecipe] = [
+        _approach_qp(color, wait_for=grasp_gate),
+        _close_qp(),
+    ]
+    if raise_first:
+        queue.append(_lift_qp(color))
+    queue.append(_place_qp(color, dest, wait_for=place_gate))
+    queue.append(_open_qp())
+    queue.append(_retreat_qp())
+    return queue
+
+
+def _build_program(assign: Dict[int, _Assign], *,
+                   grasp_lead_arm: Optional[int] = None,
+                   direct_place_arm: Optional[int] = None) -> ProgramBuilder:
+    """Build a TSC program (the collision-free serial-place choreography).
 
     ``grasp_lead_arm``:
-      * None -> SIMULTANEOUS grasp: every arm approaches+closes+lifts UNGATED.
-      * an arm id -> STAGGER grasp: that arm's grasp chain is UNGATED (it leads);
-        EVERY OTHER arm's approach (and close+lift, redundantly) waits until the
-        lead arm has GRASPED (qi >= GRASP_IDX). So at frame 0 the followers ``wait``.
+      * None -> SIMULTANEOUS pick: every arm approaches+closes+lifts UNGATED.
+      * an arm id -> STAGGERED pick: that arm's grasp chain is UNGATED (it leads);
+        EVERY OTHER arm's approach waits until the lead arm has GRASPED
+        (qi >= GRASP_IDX). So at frame 0 the followers ``wait`` at home.
 
-    PLACES are ALWAYS gated by stack order (``_place_gate``) in both policies, so
-    the cubes stack bottom-up regardless of the grasp timing.
+    ``direct_place_arm``: if set, that arm SKIPS its lift (places directly from the
+    grasp). Only valid for the rank-0 (first) placer — the region is clear and it
+    places first, so the descend is safe. The others always raise.
+
+    PLACES are ALWAYS serial: the arm at rank k waits until the arm at rank k-1 has
+    PLACED AND RETREATED (qi >= that arm's retreat-done index). The retreat-done
+    index is computed from the PREVIOUS arm's actual program length (so a shortened
+    direct-place arm gates at the right index).
     """
 
     def build(planner, env):
+        # First pass: determine each arm's program length (depends on raise_first)
+        # so place gates can target the previous arm's RETREAT-done index.
+        prog_len: Dict[int, int] = {}
+        for arm in assign:
+            raise_first = (direct_place_arm is None) or (arm != direct_place_arm)
+            # approach, close, [lift], place, open, retreat_up
+            prog_len[arm] = 6 if raise_first else 5
+
         prog: Dict[int, List[QueuedRecipe]] = {}
         for arm, a in assign.items():
             color = _color_of_cube(a.cube)
+
             # grasp-phase gate: None for simultaneous OR the lead arm; followers
             # wait on the lead arm's grasp completion.
             if grasp_lead_arm is None or arm == grasp_lead_arm:
                 grasp_gate = None
             else:
                 grasp_gate = _gate_other_reached(grasp_lead_arm, GRASP_IDX)
-            prog[arm] = [
-                _approach_qp(color, wait_for=grasp_gate),
-                _close_qp(),
-                _lift_qp(color),
-                _place_qp(color, a.dest_actor_name, wait_for=_place_gate(assign, arm)),
-                _open_qp(),
-            ]
+
+            # serial-place gate: wait until the rank-below arm has RETREATED.
+            rank = a.stack_rank
+            if rank == 0:
+                place_gate = None  # bottom cube places first, ungated
+            else:
+                below_arm = _arm_at_rank(assign, rank - 1)
+                place_gate = _gate_other_reached(
+                    below_arm, _retreat_done_idx(prog_len[below_arm]))
+
+            raise_first = (direct_place_arm is None) or (arm != direct_place_arm)
+            prog[arm] = _arm_program(
+                color, a.dest_actor_name,
+                grasp_gate=grasp_gate, place_gate=place_gate,
+                raise_first=raise_first,
+            )
         return prog
 
     return build
 
 
-# --------------------------------------------------------------------------- stack-complete guard
-# Pure, sim-free structural check: EVERY arm must end with a PLACE (no truncated /
-# permanent-hold variant). The TSC analogue of LB's assert_both_arms_lift.
+# --------------------------------------------------------------------------- structural guards
+# Pure, sim-free checks on a built program (the {arm:[QueuedRecipe]}).
 
 
-def assert_all_arms_place(program: Dict[int, List[QueuedRecipe]], planner, env) -> None:
-    """Raise unless EVERY arm's program CONTAINS a PLACE whose next primitive is the
-    final open (i.e. the arm places then releases). We assert the PLACE sits at
-    index PLACE_DONE_IDX-1 (== 3) and the last primitive is an open_gripper, so the
-    stack actually completes and the gripper releases (env success needs release)."""
+def assert_all_arms_retreat(program: Dict[int, List[QueuedRecipe]], planner, env) -> None:
+    """Raise unless EVERY arm: (a) PLACEs its cube, then (b) OPENs, then (c) ends
+    with a RETREAT-UP. The retreat-up is the collision-clearing motion the original
+    solver performs after each serial place; without it the next arm would descend
+    into an occupied region.
+
+    Layout: the LAST primitive is the retreat (verb LIFT, name starts 'retreat_up'),
+    the second-to-last is the open, and the third-to-last is the place. (The
+    direct_place arm0 has no lift, so we identify by walking from the END, which is
+    layout-independent.)"""
     for arm, queue in program.items():
-        assert queue, f"arm {arm} has an EMPTY queue (must place then open)"
-        # the PLACE must be the second-to-last primitive (place -> open).
-        place_qr = queue[PLACE_DONE_IDX - 1]
-        place_prim = place_qr.recipe(planner, env, arm)
-        if place_prim.verb_id != vocab.PLACE:
+        assert len(queue) >= 4, (
+            f"arm {arm} program too short ({len(queue)}); need at least "
+            f"approach,close,place,open,retreat_up")
+        retreat = queue[-1].recipe(planner, env, arm)
+        if not (retreat.verb_id == vocab.LIFT and retreat.name.startswith("retreat_up")):
             raise AssertionError(
-                f"arm {arm}'s primitive at index {PLACE_DONE_IDX - 1} is "
-                f"{place_prim.name!r} (verb={place_prim.verb_id}), not a PLACE. "
-                f"Every TSC variant must have each arm PLACE its cube."
-            )
-        last = queue[-1].recipe(planner, env, arm)
-        if last.verb_id != vocab.OPEN_GRIPPER:
+                f"arm {arm}'s LAST primitive is {retreat.name!r} (verb="
+                f"{retreat.verb_id}), not a retreat_up. Every TSC variant must end "
+                f"each arm with a RETREAT-UP out of the stacking region.")
+        opn = queue[-2].recipe(planner, env, arm)
+        if opn.verb_id != vocab.OPEN_GRIPPER:
             raise AssertionError(
-                f"arm {arm}'s last primitive is {last.name!r} (verb={last.verb_id}), "
-                f"not an open_gripper. Each arm must release after placing (env "
-                f"success requires all grippers released)."
-            )
+                f"arm {arm}'s second-to-last primitive is {opn.name!r} (verb="
+                f"{opn.verb_id}), not an open_gripper. Each arm must release before "
+                f"retreating (env success requires all grippers released).")
+        place = queue[-3].recipe(planner, env, arm)
+        if place.verb_id != vocab.PLACE:
+            raise AssertionError(
+                f"arm {arm}'s third-to-last primitive is {place.name!r} (verb="
+                f"{place.verb_id}), not a PLACE. Each arm must PLACE its cube before "
+                f"the open+retreat.")
+
+
+def assert_serial_place_gated(program: Dict[int, List[QueuedRecipe]],
+                              assign: Dict[int, _Assign]) -> None:
+    """Raise unless every PLACE above stack-rank 0 is gated on the PREVIOUS rank's
+    arm having RETREATED (region clear). rank-0's place must be UNGATED (it is
+    first). This is the collision-free serial-place guard.
+
+    The PLACE QueuedRecipe is located by walking from the END (it is the
+    third-to-last primitive: place, open, retreat_up), which is robust to the
+    direct_place arm dropping its lift."""
+    # map each arm -> its program length so we can check the gate target index.
+    plen = {arm: len(q) for arm, q in program.items()}
+    for arm, a in assign.items():
+        place_qr = program[arm][-3]  # place, open, retreat_up
+        rank = a.stack_rank
+        if rank == 0:
+            if place_qr.wait_for is not None:
+                raise AssertionError(
+                    f"rank-0 arm {arm}'s place is GATED ({place_qr.wait_for}); the "
+                    f"first placer must be UNGATED.")
+            continue
+        below_arm = _arm_at_rank(assign, rank - 1)
+        wf = place_qr.wait_for
+        if wf is None or int(wf[0]) != below_arm:
+            raise AssertionError(
+                f"arm {arm} (rank {rank}) place must be gated on the rank-{rank-1} "
+                f"arm {below_arm} having retreated; got gate {wf}.")
+        # the gate must open at the below-arm's RETREAT-done index (== its prog len),
+        # i.e. NOT merely at its place-done. Probe the predicate at boundary qis.
+        _, predicate = wf
+        below_retreat_done = plen[below_arm]
+
+        class _S:
+            def __init__(self, qi):
+                self.qi = qi
+
+        def _state(qi):
+            return {"arms": {below_arm: _S(qi)}}
+
+        # below arm only PLACED (not retreated) -> gate still CLOSED.
+        if predicate(None, _state(PLACE_DONE_IDX)) is not False:
+            raise AssertionError(
+                f"arm {arm}'s place gate OPENED on the below-arm merely PLACING "
+                f"(qi={PLACE_DONE_IDX}); it must wait for the below-arm to RETREAT "
+                f"(qi>={below_retreat_done}).")
+        # below arm RETREATED -> gate OPENS.
+        if predicate(None, _state(below_retreat_done)) is not True:
+            raise AssertionError(
+                f"arm {arm}'s place gate did NOT open after the below-arm retreated "
+                f"(qi={below_retreat_done}).")
 
 
 # --------------------------------------------------------------------------- sampler
 
 
 def sample(seed: int) -> List[ProgramSpec]:
-    """Sample the contrastive set of ThreeRobotsStackCube program specs for ``seed``.
+    """Sample the collision-free contrastive set of TSC program specs for ``seed``.
 
     All randomness comes from a DEDICATED ``np.random.default_rng(seed)`` so the
     sampler is reproducible AND never touches the env reset RNG (frame-0 stays
-    identical across variants). As in the LB sampler, the structure is fixed
-    (gating only), so the RNG draw is reserved for forward-compat / reproducibility.
+    identical across variants). Structure is fixed (gating only), so the RNG draw is
+    reserved for forward-compat / reproducibility.
 
-    Returns a flat list of ProgramSpec. Each matched contrastive pair
-    ``{simultaneous, <variant>}`` shares a ``contrast_group_id`` (bucket with
-    ``group_specs``). The ``simultaneous`` baseline is RE-EMITTED in each pair so
-    every contrast is a clean A/B from the same reset.
+    Returns a flat list of ProgramSpec, two matched contrastive PAIRS:
+      * ``pickcoord``  : simultaneous_pick  vs  staggered_pick
+      * ``raisedirect``: raise_and_wait     vs  direct_place
+    Both members of each pair place STRICTLY SERIALLY (A->B->C) with retreats and so
+    are collision-free; they differ only at the contrast axis (frame-0 pick timing
+    for pickcoord; arm0's raise-vs-descend for raisedirect).
     """
     rng = np.random.default_rng(int(seed))
     _reserved = int(rng.integers(2, 5))  # reserved structural draw (forward-compat)
@@ -366,36 +464,32 @@ def sample(seed: int) -> List[ProgramSpec]:
         ))
         vid += 1
 
-    # The simultaneous baseline (re-built per pair so each contrast is a clean A/B
-    # from the same seed). Builder is deterministic, so re-building is free.
-    def _sim_builder():
-        return _build_program(_BASE_ASSIGN, grasp_lead_arm=None)
-
-    # (0) simultaneous  vs  stagger_grasp (arm0/bottom leads the grasp)
-    emit("simultaneous", "stagger", gid, _sim_builder(),
-         {"lead_arm": None, "grasp_gated": False, "complete": True,
+    # (0) pickcoord: simultaneous_pick  vs  staggered_pick
+    #   simultaneous_pick: all 3 grasp+lift ungated together; serial place A->B->C.
+    #   staggered_pick:    arm0 leads grasp ungated; arm1,arm2 wait for arm0 grasped.
+    emit("simultaneous_pick", "pickcoord", gid,
+         _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
+         {"pick": "simultaneous", "lead_arm": None, "complete": True,
           "assignment": "base"})
-    emit("stagger_grasp", "stagger", gid,
+    emit("staggered_pick", "pickcoord", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=0),
-         {"lead_arm": 0, "follow_arms": [1, 2], "complete": True,
-          "assignment": "base"})
+         {"pick": "staggered", "lead_arm": 0, "follow_arms": [1, 2],
+          "complete": True, "assignment": "base"})
     gid += 1
 
-    # (1) simultaneous  vs  target_swap (color counterfactual; ATTEMPT, filterable).
-    # Same simultaneous baseline (base assignment); target_swap uses the swapped
-    # arm<->cube assignment with a SIMULTANEOUS grasp (so the ONLY contrast vs the
-    # baseline is WHICH cube/color each arm grasps -> a color-grounding counterfactual).
-    emit("simultaneous", "target_swap", gid, _sim_builder(),
-         {"lead_arm": None, "grasp_gated": False, "complete": True,
+    # (1) raisedirect: raise_and_wait  vs  direct_place (FIRST placer arm0 only)
+    #   raise_and_wait: arm0 lifts(0.5) then places (raises high first).
+    #   direct_place:   arm0 SKIPS the lift, places directly from the grasp (region
+    #                   clear, it is first). The others ALWAYS raise.
+    #   Both use a SIMULTANEOUS pick so the ONLY contrast is arm0's raise-vs-descend.
+    emit("raise_and_wait", "raisedirect", gid,
+         _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
+         {"first_placer": 0, "arm0": "raise_then_place", "complete": True,
           "assignment": "base"})
-    emit("target_swap", "target_swap", gid,
-         _build_program(_SWAP_ASSIGN, grasp_lead_arm=None),
-         {"lead_arm": None, "grasp_gated": False, "complete": True,
-          "assignment": "swap",
-          # CONCERN: cross-assignment may be infeasible (reachability/stack). Kept
-          # filterable so it can be dropped after sim validation (filter by name or
-          # family 'target_swap').
-          "feasibility": "ATTEMPT_may_be_infeasible"})
+    emit("direct_place", "raisedirect", gid,
+         _build_program(_BASE_ASSIGN, grasp_lead_arm=None, direct_place_arm=0),
+         {"first_placer": 0, "arm0": "direct_place_no_lift", "complete": True,
+          "assignment": "base"})
     gid += 1
 
     return specs
@@ -413,10 +507,11 @@ if __name__ == "__main__":
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
         assert len(members) == 2, (gid_, names)
-        assert "simultaneous" in names, (gid_, names)
         print(f"  group {gid_} [{members[0].family}]: {names}")
     assert len(s) == 4 and len(by_group) == 2, (len(s), len(by_group))
-    assert {m.family for m in s} == {"stagger", "target_swap"}
+    assert {m.family for m in s} == {"pickcoord", "raisedirect"}
+    assert {m.name for m in s} == {
+        "simultaneous_pick", "staggered_pick", "raise_and_wait", "direct_place"}
     assert len({m.variant_id for m in s}) == len(s)
     assert [m.name for m in sample(7)] == [m.name for m in s]
     print("subtask_scenarios_tsc inline OK")

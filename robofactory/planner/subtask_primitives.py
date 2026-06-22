@@ -322,6 +322,57 @@ def place(
     )
 
 
+def _tcp_world_xyz(env, arm: int) -> np.ndarray:
+    """Read the arm's CURRENT tcp world position (xyz) from the live env.
+
+    Reads ``env.unwrapped.agent.agents[arm].tcp.pose.p`` and returns a length-3
+    float32 xyz. Off-GPU fakes may expose a plain numpy ``.p``; GPU tensors are
+    moved to numpy. Used by ``retreat_up`` to plan a straight-up move from where
+    the tcp ACTUALLY is right now (the cube was just released, so we do NOT
+    re-resolve a grasp pose).
+    """
+    u = env.unwrapped if hasattr(env, "unwrapped") else env
+    p = u.agent.agents[arm].tcp.pose.p
+    p = p.detach().cpu().numpy() if hasattr(p, "detach") else np.asarray(p)
+    return np.asarray(p).reshape(-1)[:3].astype(np.float32)
+
+
+def retreat_up(
+    planner, env, arm: int, task: str, dz: float = 0.5,
+    grip: float = OPEN, success_check: Optional[Callable] = None,
+) -> Primitive:
+    """Retreat: plan a STRAIGHT-UP move from the arm's CURRENT tcp pose by ``dz``.
+
+    Mirrors the canonical solver's "move back up to grasp_pose+0.5" after a place:
+    the arm has just OPENED its gripper and released the cube, so we do NOT
+    re-resolve a cube grasp pose. Instead we read the LIVE tcp world pose
+    (``env.unwrapped.agent.agents[arm].tcp.pose``), build a target = current xyz +
+    [0, 0, dz] (keeping the current orientation, identity-quat for the screw plan),
+    and per-arm ``dry_run`` plan to it. ``grip`` defaults OPEN (gripper stays
+    released as the arm clears the stacking region). Labelled ``LIFT`` (it is a
+    raise/clear motion) with target_id 0; ``target_pose`` stores the raised xyz so
+    an optional check can confirm the arm rose (target z > start z).
+    """
+    start_xyz = _tcp_world_xyz(env, arm)
+    target_xyz = start_xyz.copy()
+    target_xyz[2] += float(dz)
+    # Pose = xyz + identity quat (wxyz). The screw planner solves IK to the xyz;
+    # we keep a neutral orientation since the arm just released and is clearing up.
+    pose = np.array(
+        [target_xyz[0], target_xyz[1], target_xyz[2], 1.0, 0.0, 0.0, 0.0],
+        dtype=np.float32,
+    )
+    waypoints = _plan_to_pose(planner, arm, pose)
+    ticks = _ticks_from_waypoints(waypoints, grip)
+    text = vocab.render(vocab.LIFT, 0, task)
+    return Primitive(
+        verb_id=vocab.LIFT, target_id=0, text=text, ticks=ticks,
+        task=task, success_check=success_check,
+        name=f"retreat_up(arm{arm})",
+        target_pose=target_xyz.reshape(-1)[:3].copy(),
+    )
+
+
 def hold(
     planner, env, arm: int, n: int, task: str,
     qpos: Optional[np.ndarray] = None, grip: float = OPEN,

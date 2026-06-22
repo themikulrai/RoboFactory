@@ -1,17 +1,26 @@
 """PURE + SIM-gated tests for the ThreeRobotsStackCube (TSC) subtask scenarios.
 
-PURE tests (no sim, always run): the TSC sampler emits the matched pairs; names /
-families; deadlock-acyclic; all-arms-end-in-place; stack-order gates present
-(B-place waits A placed, C-place waits B placed); grasp-stagger gate; RNG
-reproducibility + independence from the global numpy RNG; group filtering keeps
-pairs intact; render() produces the TSC color/dest/wait strings; the runner's
-TASK_MAP wires the TSC sampler.
+The TSC sampler reproduces the proven COLLISION-FREE choreography of the original
+solver (solutions/three_robots_stack_cube.py): all 3 grasp at separate cubes, all
+lift HIGH (+0.5), then place STRICTLY SERIALLY (A->goal, retreat; B->A, retreat;
+C->B). Only ONE arm descends into the stacking region at a time; the others wait
+parked HIGH; each placer RETREATS UP before the next descends.
+
+PURE tests (no sim, always run): the sampler emits the two matched contrast pairs
+(``pickcoord`` simultaneous_pick/staggered_pick; ``raisedirect``
+raise_and_wait/direct_place); names/families; deadlock-acyclic; every arm ends with
+a retreat_up after place+open; the SERIAL-place gates chain on the PREVIOUS rank's
+RETREAT-done (rank1 waits rank0 retreated, rank2 waits rank1 retreated) — NOT merely
+on place-done; staggered_pick followers WAIT at frame 0; direct_place arm0 has NO
+lift primitive; the retreat_up primitive plans straight UP (target z > start z); RNG
+reproducibility + independence from global numpy RNG; group filtering keeps pairs
+intact; render() strings; the runner's TASK_MAP wires the TSC sampler.
 
 SIM tests (@pytest.mark.sim, skipped unless DART_RUN_SIM=1; DO NOT RUN on the login
 node — SAPIEN renders dark; needs a GPU compute node): drive a real 3-arm TSC
-rollout through subtask_interpreter.run_program and verify the aligned stream
-(len==T per arm), the stagger follower waiting at frame 0, and a full simultaneous
-run reaching env stack-success.
+rollout, verify the aligned stream, the staggered-pick follower waiting at frame 0,
+the serial-place ordering, and a simultaneous_pick run reaching env stack-success
+collision-free.
 
 Run PURE:   /iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python -m pytest \
                 scripts/dart/tests/test_subtask_tsc.py -k "not sim" -q
@@ -59,6 +68,28 @@ class FakeActor:
         self.z = z
 
 
+class _FakePose:
+    def __init__(self, xyz):
+        self.p = np.asarray(xyz, np.float32)
+
+
+class _FakeTcp:
+    def __init__(self, xyz):
+        self.pose = _FakePose(xyz)
+
+
+class _FakeAgent:
+    """Per-arm agent exposing tcp.pose.p (read by retreat_up)."""
+    def __init__(self, arm):
+        # distinct tcp z per arm so retreat target z = start z + dz is checkable.
+        self.tcp = _FakeTcp([0.1 * arm, 0.0, 0.4 + 0.05 * arm])
+
+
+class _FakeAgentBundle:
+    def __init__(self, num_arms):
+        self.agents = [_FakeAgent(i) for i in range(num_arms)]
+
+
 class FakePlanner:
     """Canned-waypoint 3-arm planner; a pose LIST under dry_run is REJECTED."""
 
@@ -87,11 +118,12 @@ class FakePlanner:
 
 
 class FakeEnv:
-    def __init__(self):
+    def __init__(self, num_arms=3):
         self.goal_region = FakeActor(z=0.0)
         self.cubeA = FakeActor(z=0.05)
         self.cubeB = FakeActor(z=0.1)
         self.cubeC = FakeActor(z=0.15)
+        self.agent = _FakeAgentBundle(num_arms)
         self.unwrapped = self
         self.n_steps = 0
         self.step_log = []
@@ -103,7 +135,11 @@ class FakeEnv:
 
 
 def _fakes():
-    return FakePlanner(num_arms=3), FakeEnv()
+    return FakePlanner(num_arms=3), FakeEnv(num_arms=3)
+
+
+# Canonical names for convenience.
+_NAMES = {"simultaneous_pick", "staggered_pick", "raise_and_wait", "direct_place"}
 
 
 # ===========================================================================
@@ -126,6 +162,29 @@ def test_render_tsc_strings():
 
 
 # ===========================================================================
+# PURE: the retreat_up primitive plans STRAIGHT UP from the live tcp pose
+# ===========================================================================
+def test_retreat_up_plans_straight_up():
+    pl, env = _fakes()
+    for arm in (0, 1, 2):
+        start_z = float(env.agent.agents[arm].tcp.pose.p[2])
+        prim = P.retreat_up(pl, env, arm=arm, task="ThreeRobotsStackCube", dz=0.5,
+                            grip=OPEN)
+        # labelled LIFT (a raise/clear motion), target_id 0, named retreat_up
+        assert prim.verb_id == vocab.LIFT
+        assert prim.target_id == 0
+        assert prim.name.startswith("retreat_up")
+        # planned pose z = tcp z + dz, and the stored target_pose z > start z
+        assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == start_z + 0.5
+        assert float(prim.target_pose[2]) > start_z
+        # xy held (straight up): planned xy == start xy
+        assert pytest.approx(pl.last_dry_run_pose[0], abs=1e-5) == \
+            float(env.agent.agents[arm].tcp.pose.p[0])
+        # gripper OPEN (cube released)
+        assert all(g == OPEN for _, g in prim.ticks)
+
+
+# ===========================================================================
 # PURE: the sampler emits the matched pairs
 # ===========================================================================
 def test_sampler_emits_two_matched_pairs():
@@ -137,11 +196,10 @@ def test_sampler_emits_two_matched_pairs():
         assert len(members) == 2, (gid, [m.name for m in members])
         assert members[0].family == members[1].family
         assert members[0].contrast_group_id == members[1].contrast_group_id == gid
-        assert "simultaneous" in {m.name for m in members}, [m.name for m in members]
         for m in members:
             assert m.num_arms == 3
-    assert {m.family for m in specs} == {"stagger", "target_swap"}
-    assert {m.name for m in specs} == {"simultaneous", "stagger_grasp", "target_swap"}
+    assert {m.family for m in specs} == {"pickcoord", "raisedirect"}
+    assert {m.name for m in specs} == _NAMES
 
 
 def test_sampler_variant_ids_unique_and_reproducible():
@@ -161,34 +219,43 @@ def test_sampler_rng_independent_of_global_numpy():
 
 
 # ===========================================================================
-# PURE: every variant has all 3 arms end in PLACE (then open) — complete rollout
+# PURE: every variant — all 3 arms place->open->retreat_up (complete + clearing)
 # ===========================================================================
-def test_every_variant_all_arms_place():
+def test_every_variant_all_arms_place_open_retreat():
     specs = STSC.sample(7)
     for spec in specs:
         pl, env = _fakes()
         prog = spec.build(pl, env)
         assert set(prog.keys()) == {0, 1, 2}, spec.name
-        # the structural guard raises if any arm doesn't place->open
-        STSC.assert_all_arms_place(prog, pl, env)
+        # the structural guard raises if any arm doesn't place->open->retreat_up
+        STSC.assert_all_arms_retreat(prog, pl, env)
         for arm in (0, 1, 2):
-            place_prim = prog[arm][STSC.PLACE_DONE_IDX - 1].recipe(pl, env, arm)
-            assert place_prim.verb_id == vocab.PLACE, (spec.name, arm)
-            last = prog[arm][-1].recipe(pl, env, arm)
-            assert last.verb_id == vocab.OPEN_GRIPPER, (spec.name, arm)
+            retreat = prog[arm][-1].recipe(pl, env, arm)
+            assert retreat.verb_id == vocab.LIFT and retreat.name.startswith("retreat_up"), \
+                (spec.name, arm)
+            opn = prog[arm][-2].recipe(pl, env, arm)
+            assert opn.verb_id == vocab.OPEN_GRIPPER, (spec.name, arm)
+            place = prog[arm][-3].recipe(pl, env, arm)
+            assert place.verb_id == vocab.PLACE, (spec.name, arm)
 
 
-def test_every_arm_program_is_approach_close_lift_place_open():
-    """Each arm's 5-primitive program is exactly approach,close,lift,place,open."""
+def test_full_arm_program_layout():
+    """A FULL arm program (raising) is approach,close,lift,place,open,retreat_up.
+    The direct_place arm0 DROPS the lift -> approach,close,place,open,retreat_up."""
     specs = STSC.sample(7)
-    expected = [vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT, vocab.PLACE,
-                vocab.OPEN_GRIPPER]
+    full = [vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT, vocab.PLACE,
+            vocab.OPEN_GRIPPER, vocab.LIFT]  # last LIFT is the retreat_up
+    direct = [vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.PLACE,
+              vocab.OPEN_GRIPPER, vocab.LIFT]
     for spec in specs:
         pl, env = _fakes()
         prog = spec.build(pl, env)
         for arm in (0, 1, 2):
             verbs = [qr.recipe(pl, env, arm).verb_id for qr in prog[arm]]
-            assert verbs == expected, (spec.name, arm, verbs)
+            if spec.name == "direct_place" and arm == 0:
+                assert verbs == direct, (spec.name, arm, verbs)
+            else:
+                assert verbs == full, (spec.name, arm, verbs)
 
 
 # ===========================================================================
@@ -204,124 +271,129 @@ def test_no_deadlock_one_arm_ungated_first():
         assert any(g is None for g in first_gates.values()), (spec.name, first_gates)
 
 
-def test_simultaneous_first_primitives_all_ungated():
-    """simultaneous: all 3 arms approach UNGATED at frame 0 (no grasp gate)."""
-    specs = STSC.sample(7)
-    spec = next(m for m in specs if m.name == "simultaneous")
+def test_simultaneous_pick_first_primitives_all_ungated():
+    """simultaneous_pick: all 3 arms approach UNGATED at frame 0 (no grasp gate)."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
     pl, env = _fakes()
     prog = spec.build(pl, env)
-    first_gates = STSC.gate_graph(prog)
-    assert first_gates == {0: None, 1: None, 2: None}, first_gates
+    assert STSC.gate_graph(prog) == {0: None, 1: None, 2: None}
 
 
 # ===========================================================================
-# PURE: stack-order PLACE gates present (B-place waits A placed, C-place waits B)
+# PURE: SERIAL-place gates chain on the PREVIOUS rank's RETREAT-done
 # ===========================================================================
-def _place_qr(prog, arm):
-    """The PLACE QueuedRecipe of an arm (index PLACE_DONE_IDX-1 == 3)."""
-    return prog[arm][STSC.PLACE_DONE_IDX - 1]
-
-
-def test_stack_order_place_gates_base_assignment():
-    """In the BASE assignment (arm0=cubeA bottom, arm1=cubeB mid, arm2=cubeC top):
-    arm0's place is UNGATED (bottom places first); arm1's place waits on arm0;
-    arm2's place waits on arm1. The gate opens at PLACE_DONE_IDX (place finished)."""
-    specs = STSC.sample(7)
-    for name in ("simultaneous", "stagger_grasp"):
-        spec = next(m for m in specs if m.name == name)
-        pl, env = _fakes()
-        prog = spec.build(pl, env)
-        # arm0 (bottom): place ungated
-        assert _place_qr(prog, 0).wait_for is None, name
-        # arm1 (middle): place waits on arm0 reaching PLACE_DONE_IDX
-        g1 = _place_qr(prog, 1).wait_for
-        assert g1 is not None and g1[0] == 0, (name, g1)
-        # arm2 (top): place waits on arm1
-        g2 = _place_qr(prog, 2).wait_for
-        assert g2 is not None and g2[0] == 1, (name, g2)
-        # gate predicates: closed until the below-arm has FINISHED its place.
-        _assert_place_gate_semantics(env, g1, below_arm=0)
-        _assert_place_gate_semantics(env, g2, below_arm=1)
-
-
 class _FakeArmState:
     def __init__(self, qi):
         self.qi = int(qi)
 
 
-def _assert_place_gate_semantics(env, gate, below_arm):
-    """The place gate opens iff the below-arm's qi >= PLACE_DONE_IDX (place done)."""
-    other_arm, predicate = gate
-    assert other_arm == below_arm
-    def _state(below_qi):
-        return {"arms": {below_arm: _FakeArmState(below_qi)}}
-    # below arm still placing / not done -> gate CLOSED
-    assert predicate(env, _state(0)) is False
-    assert predicate(env, _state(STSC.PLACE_DONE_IDX - 1)) is False  # on its place
-    # below arm FINISHED its place (qi >= PLACE_DONE_IDX) -> gate OPENS
-    assert predicate(env, _state(STSC.PLACE_DONE_IDX)) is True
-    assert predicate(env, _state(STSC.PLACE_DONE_IDX + 1)) is True
-    # robust to missing arms map
-    assert predicate(env, {}) is False
-    assert predicate(env, {"arms": {}}) is False
+def _place_qr(prog, arm):
+    """The PLACE QueuedRecipe of an arm: third-to-last (place, open, retreat_up)."""
+    return prog[arm][-3]
 
 
-def test_target_swap_keeps_stack_order_valid():
-    """target_swap: arm2 holds cubeA (bottom, ungated place), arm1 holds cubeB
-    (waits on arm2), arm0 holds cubeC (waits on arm1). Stack stays bottom-up."""
-    specs = STSC.sample(7)
-    spec = next(m for m in specs if m.name == "target_swap")
+def test_serial_place_gates_chain_on_retreat_done():
+    """rank0 (arm0) place UNGATED; rank1 (arm1) place waits arm0 RETREATED; rank2
+    (arm2) place waits arm1 RETREATED. The gate must NOT open on mere place-done."""
+    for name in _NAMES:
+        spec = next(m for m in STSC.sample(7) if m.name == name)
+        pl, env = _fakes()
+        prog = spec.build(pl, env)
+        # the dedicated structural guard does the full check (gate target + index).
+        STSC.assert_serial_place_gated(prog, STSC._BASE_ASSIGN)
+        # arm0 (bottom): place ungated
+        assert _place_qr(prog, 0).wait_for is None, name
+        # arm1 waits on arm0; arm2 waits on arm1
+        g1 = _place_qr(prog, 1).wait_for
+        g2 = _place_qr(prog, 2).wait_for
+        assert g1 is not None and g1[0] == 0, (name, g1)
+        assert g2 is not None and g2[0] == 1, (name, g2)
+        # arm1's gate opens at arm0's RETREAT-done (== arm0 prog len), not place-done.
+        plen0 = len(prog[0])
+        _, pred1 = g1
+        assert pred1(None, {"arms": {0: _FakeArmState(STSC.PLACE_DONE_IDX)}}) is False, name
+        assert pred1(None, {"arms": {0: _FakeArmState(plen0)}}) is True, name
+        # arm2's gate opens at arm1's RETREAT-done (== arm1 prog len == 6).
+        plen1 = len(prog[1])
+        _, pred2 = g2
+        assert pred2(None, {"arms": {1: _FakeArmState(STSC.PLACE_DONE_IDX)}}) is False, name
+        assert pred2(None, {"arms": {1: _FakeArmState(plen1)}}) is True, name
+
+
+def test_direct_place_arm0_gate_index_is_shorter():
+    """direct_place: arm0 has 5 primitives (no lift) so its retreat-done qi is 5, and
+    arm1's place gate must target 5 (NOT 6). Confirms the gate tracks the SHORTENED
+    program length, not a hardcoded 6."""
+    spec = next(m for m in STSC.sample(7) if m.name == "direct_place")
     pl, env = _fakes()
     prog = spec.build(pl, env)
-    # arm2 (cubeA, bottom): place ungated
-    assert _place_qr(prog, 2).wait_for is None
-    # arm1 (cubeB, middle): place waits on arm2 (the cubeA holder)
-    g1 = _place_qr(prog, 1).wait_for
-    assert g1 is not None and g1[0] == 2, g1
-    # arm0 (cubeC, top): place waits on arm1 (the cubeB holder)
-    g0 = _place_qr(prog, 0).wait_for
-    assert g0 is not None and g0[0] == 1, g0
+    assert len(prog[0]) == 5, len(prog[0])  # approach,close,place,open,retreat_up
+    _, pred1 = _place_qr(prog, 1).wait_for
+    # gate closed at qi=4 (arm0 placed+opened but not retreated), open at qi=5.
+    assert pred1(None, {"arms": {0: _FakeArmState(4)}}) is False
+    assert pred1(None, {"arms": {0: _FakeArmState(5)}}) is True
 
 
 # ===========================================================================
-# PURE: the COLOR / coordination counterfactuals
+# PURE: pickcoord staggered followers WAIT at frame 0
 # ===========================================================================
-def test_color_counterfactual_arm0_blue_vs_red():
-    """simultaneous -> arm0 approaches the BLUE cube (cubeA); target_swap -> arm0
-    approaches the RED cube (cubeC). The PROMPT color flips for the same arm."""
-    specs = STSC.sample(7)
-    sim_ = next(m for m in specs if m.name == "simultaneous")
-    swap = next(m for m in specs if m.name == "target_swap")
-    pl, env = _fakes()
-    a0_sim = sim_.build(pl, env)[0][0].recipe(pl, env, 0)
-    a0_swap = swap.build(pl, env)[0][0].recipe(pl, env, 0)
-    assert a0_sim.text == "approach the blue cube", a0_sim.text
-    assert a0_swap.text == "approach the red cube", a0_swap.text
-    assert a0_sim.target_id == vocab.TSC_TARGETS["blue"]
-    assert a0_swap.target_id == vocab.TSC_TARGETS["red"]
-
-
-def test_stagger_grasp_followers_wait_at_frame0():
-    """stagger_grasp: arm0 (bottom) leads grasp UNGATED; arm1 & arm2 first primitive
-    is GATED on arm0 grasping -> they WAIT at frame 0 vs approach in simultaneous."""
-    specs = STSC.sample(7)
-    spec = next(m for m in specs if m.name == "stagger_grasp")
+def test_staggered_pick_followers_wait_at_frame0():
+    """staggered_pick: arm0 leads grasp UNGATED; arm1 & arm2 first primitive GATED on
+    arm0 grasped -> they WAIT at frame 0 vs APPROACH in simultaneous_pick."""
+    spec = next(m for m in STSC.sample(7) if m.name == "staggered_pick")
     pl, env = _fakes()
     prog = spec.build(pl, env)
     first_gates = STSC.gate_graph(prog)
-    assert first_gates[0] is None         # leader ungated first
-    assert first_gates[1] == 0            # follower waits on arm0
-    assert first_gates[2] == 0            # follower waits on arm0
-    # the followers' approach gate opens at GRASP_IDX (lead finished approach+close)
+    assert first_gates[0] is None        # leader ungated first
+    assert first_gates[1] == 0           # follower waits on arm0
+    assert first_gates[2] == 0           # follower waits on arm0
     for follow in (1, 2):
         other_arm, predicate = prog[follow][0].wait_for
         assert other_arm == 0
-        def _state(lead_qi):
-            return {"arms": {0: _FakeArmState(lead_qi)}}
-        assert predicate(env, _state(0)) is False
-        assert predicate(env, _state(1)) is False               # only approach done
-        assert predicate(env, _state(STSC.GRASP_IDX)) is True   # grasped
-        assert predicate(env, _state(STSC.GRASP_IDX + 1)) is True
+        assert predicate(None, {"arms": {0: _FakeArmState(0)}}) is False
+        assert predicate(None, {"arms": {0: _FakeArmState(1)}}) is False  # only approach
+        assert predicate(None, {"arms": {0: _FakeArmState(STSC.GRASP_IDX)}}) is True
+        assert predicate(None, {"arms": {0: _FakeArmState(STSC.GRASP_IDX + 1)}}) is True
+
+
+def test_simultaneous_pick_followers_approach_at_frame0():
+    """Contrast partner: simultaneous_pick arm1/arm2 first primitive is UNGATED
+    approach (the frame-0 counterfactual to staggered_pick's wait)."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
+    pl, env = _fakes()
+    prog = spec.build(pl, env)
+    for arm in (1, 2):
+        assert prog[arm][0].wait_for is None
+        assert prog[arm][0].recipe(pl, env, arm).verb_id == vocab.APPROACH
+
+
+# ===========================================================================
+# PURE: raisedirect — direct_place arm0 has NO lift; raise_and_wait does
+# ===========================================================================
+def test_raise_and_wait_arm0_has_lift():
+    spec = next(m for m in STSC.sample(7) if m.name == "raise_and_wait")
+    pl, env = _fakes()
+    prog = spec.build(pl, env)
+    verbs = [qr.recipe(pl, env, 0).verb_id for qr in prog[0]]
+    assert vocab.LIFT in verbs[:3]  # the lift sits at index 2 (before place)
+    assert verbs[2] == vocab.LIFT
+    assert len(prog[0]) == 6
+
+
+def test_direct_place_arm0_has_no_lift():
+    """direct_place: arm0 SKIPS the lift -> NO lift primitive BEFORE the place. (The
+    last primitive is still a retreat_up, also labelled LIFT, so we check the
+    pre-place segment specifically.)"""
+    spec = next(m for m in STSC.sample(7) if m.name == "direct_place")
+    pl, env = _fakes()
+    prog = spec.build(pl, env)
+    # arm0 program: approach, close, place, open, retreat_up — no lift before place
+    pre_place = [qr.recipe(pl, env, 0).verb_id for qr in prog[0][:2]]
+    assert pre_place == [vocab.APPROACH, vocab.CLOSE_GRIPPER]
+    assert prog[0][2].recipe(pl, env, 0).verb_id == vocab.PLACE  # straight to place
+    # the OTHER arms still raise (lift at index 2).
+    for arm in (1, 2):
+        assert prog[arm][2].recipe(pl, env, arm).verb_id == vocab.LIFT
 
 
 # ===========================================================================
@@ -329,10 +401,13 @@ def test_stagger_grasp_followers_wait_at_frame0():
 # ===========================================================================
 def test_filter_variants_keeps_groups_intact():
     specs = STSC.sample(7)
-    out = STSC.filter_variants(specs, ["stagger_grasp"])
-    assert sorted(m.name for m in out) == ["simultaneous", "stagger_grasp"]
-    out2 = STSC.filter_variants(specs, ["target_swap"])
-    assert sorted(m.name for m in out2) == ["simultaneous", "target_swap"]
+    out = STSC.filter_variants(specs, ["staggered_pick"])
+    assert sorted(m.name for m in out) == ["simultaneous_pick", "staggered_pick"]
+    out2 = STSC.filter_variants(specs, ["direct_place"])
+    assert sorted(m.name for m in out2) == ["direct_place", "raise_and_wait"]
+    # filter by family keeps the whole pair
+    out3 = STSC.filter_variants(specs, ["pickcoord"])
+    assert sorted(m.name for m in out3) == ["simultaneous_pick", "staggered_pick"]
     assert len(STSC.filter_variants(specs, None)) == len(specs)
     assert STSC.filter_variants(specs, ["nope"]) == []
 
@@ -341,20 +416,15 @@ def test_filter_variants_keeps_groups_intact():
 # PURE: place recipe resolves now_pose JIT (carried-cube grasp pose) + dest
 # ===========================================================================
 def test_place_recipe_uses_dest_actor_and_color():
-    """arm0's place (base assignment) targets goal_region with the 'on the goal'
-    prompt; the recipe builds a real PLACE primitive against the fakes."""
-    specs = STSC.sample(7)
-    spec = next(m for m in specs if m.name == "simultaneous")
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
     pl, env = _fakes()
     prog = spec.build(pl, env)
     place0 = _place_qr(prog, 0).recipe(pl, env, 0)
     assert place0.verb_id == vocab.PLACE
     assert place0.text == "place on the goal"
-    # dest goal_region z=0.0 + offset 0.05 -> planned pose z ~0.05
-    assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == 0.05
-    # arm1 places onto cubeA -> "place on the blue cube"
+    assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == 0.05  # goal z 0 + 0.05
     place1 = _place_qr(prog, 1).recipe(pl, env, 1)
-    assert place1.text == "place on the blue cube", place1.text
+    assert place1.text == "place on the blue cube", place1.text  # onto cubeA (blue)
 
 
 # ===========================================================================
@@ -374,28 +444,57 @@ def test_runner_task_map_has_tsc():
 # PURE: interpreter aligns a 3-arm stream off-GPU (fake planner/env)
 # ===========================================================================
 def test_interpreter_runs_3arm_simultaneous_aligned():
-    """Drive the simultaneous TSC program through the interpreter with FAKES and
-    assert the recorded stream is aligned (len==T for all 3 arms) and contiguous."""
-    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous")
+    """Drive the simultaneous_pick TSC program through the interpreter with FAKES and
+    assert the recorded stream is aligned (len==T for all 3 arms), no garbage labels,
+    and each arm's NON-WAIT verb sequence is the full
+    approach,close,lift,place,open,retreat_up program (the trailing retreat_up shows
+    up as a LIFT run after the place/open)."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
     pl, env = _fakes()
     rec = I.SubtaskRecorder(num_arms=3)
     prog = spec.build(pl, env)
-    out = I.run_program(env, pl, prog, rec, max_steps=2000,
+    out = I.run_program(env, pl, prog, rec, max_steps=4000,
                         control_mode=pl.control_mode, check_success_coverage="off")
     T = out["steps"]
     a = rec.to_arrays()
+    import itertools
     for arm in (0, 1, 2):
         assert len(a[f"subtask_arm{arm}_verb"]) == T
         verbs = [int(v) for v in a[f"subtask_arm{arm}_verb"]]
         assert all(v in vocab.VERB_IDS.values() for v in verbs)  # no garbage/None
-        # the program executes; each arm hits all five verbs in order somewhere.
-        import itertools
         runs = [k for k, _ in itertools.groupby(verbs)]
-        # strip idle WAIT runs (arms idle while gated on stack order)
-        core = [r for r in runs if r != vocab.WAIT]
+        core = [r for r in runs if r != vocab.WAIT]  # strip idle waits (gated)
+        # approach, close, lift, place, open, retreat_up(==LIFT)
         assert core == [vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT,
-                        vocab.PLACE, vocab.OPEN_GRIPPER], (arm, runs)
+                        vocab.PLACE, vocab.OPEN_GRIPPER, vocab.LIFT], (arm, runs)
     assert rec.length == T
+    # the program drains completely off-GPU (no env auto-terminate in the fake).
+    assert out["completed"] is True
+
+
+def test_interpreter_serial_place_ordering_off_gpu():
+    """With FAKES (no env auto-terminate), assert the SERIAL-place ordering holds:
+    arm0 finishes its PLACE strictly before arm1 STARTS its place, and arm1 before
+    arm2 — because each place is gated on the previous arm's RETREAT-done."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
+    pl, env = _fakes()
+    rec = I.SubtaskRecorder(num_arms=3)
+    prog = spec.build(pl, env)
+    I.run_program(env, pl, prog, rec, max_steps=4000,
+                  control_mode=pl.control_mode, check_success_coverage="off")
+    a = rec.to_arrays()
+    v = {arm: [int(x) for x in a[f"subtask_arm{arm}_verb"]] for arm in (0, 1, 2)}
+
+    def _place_window(verbs):
+        idx = [i for i, x in enumerate(verbs) if x == vocab.PLACE]
+        return idx[0], idx[-1]
+
+    s0, e0 = _place_window(v[0])
+    s1, e1 = _place_window(v[1])
+    s2, e2 = _place_window(v[2])
+    # arm0 finishes placing before arm1 begins; arm1 before arm2.
+    assert e0 < s1, (e0, s1)
+    assert e1 < s2, (e1, s2)
 
 
 # ===========================================================================
@@ -431,11 +530,11 @@ def _build_sim_planner(env, Solver, seed):
 def test_sim_3arm_stream_len_equals_T():
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in STSC.sample(0) if m.name == "simultaneous")
+        spec = next(m for m in STSC.sample(0) if m.name == "simultaneous_pick")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=3)
         prog = spec.build(planner, env)
-        out = I.run_program(env, planner, prog, rec, max_steps=1200,
+        out = I.run_program(env, planner, prog, rec, max_steps=2000,
                             control_mode=planner.control_mode)
         T = out["steps"]
         assert rec.length == T
@@ -449,21 +548,19 @@ def test_sim_3arm_stream_len_equals_T():
 
 
 @sim
-def test_sim_stagger_followers_wait_at_frame0():
+def test_sim_staggered_pick_followers_wait_at_frame0():
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in STSC.sample(0) if m.name == "stagger_grasp")
+        spec = next(m for m in STSC.sample(0) if m.name == "staggered_pick")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=3)
         prog = spec.build(planner, env)
-        I.run_program(env, planner, prog, rec, max_steps=1500,
+        I.run_program(env, planner, prog, rec, max_steps=2500,
                       control_mode=planner.control_mode)
         a = rec.to_arrays()
-        # arm0 (lead) starts its approach immediately; arm1 & arm2 WAIT at frame 0.
         assert a["subtask_arm0_verb"][0] == vocab.APPROACH
         assert a["subtask_arm1_verb"][0] == vocab.WAIT
         assert a["subtask_arm2_verb"][0] == vocab.WAIT
-        # all three arms ultimately place (complete rollout).
         for arm in (0, 1, 2):
             assert vocab.PLACE in set(a[f"subtask_arm{arm}_verb"]), arm
     finally:
@@ -471,17 +568,42 @@ def test_sim_stagger_followers_wait_at_frame0():
 
 
 @sim
-def test_sim_simultaneous_reaches_stack_success():
+def test_sim_simultaneous_pick_reaches_stack_success_collision_free():
     from run_subtask_rollouts import _env_success
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in STSC.sample(0) if m.name == "simultaneous")
+        spec = next(m for m in STSC.sample(0) if m.name == "simultaneous_pick")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=3)
         prog = spec.build(planner, env)
-        out = I.run_program(env, planner, prog, rec, max_steps=1500,
+        out = I.run_program(env, planner, prog, rec, max_steps=2500,
                             control_mode=planner.control_mode)
-        # a full simultaneous run reaches the env stack-success OR completes the queues.
+        # the collision-free serial-place run reaches env stack-success OR completes.
         assert _env_success(out["info"]) or out["completed"], out["info"]
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_serial_place_ordering_holds():
+    """A real simultaneous_pick run must place SERIALLY: arm0's place finishes before
+    arm1 starts, arm1 before arm2 (collision-free gate enforcement)."""
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in STSC.sample(0) if m.name == "simultaneous_pick")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=3)
+        prog = spec.build(planner, env)
+        I.run_program(env, planner, prog, rec, max_steps=2500,
+                      control_mode=planner.control_mode)
+        a = rec.to_arrays()
+        v = {arm: [int(x) for x in a[f"subtask_arm{arm}_verb"]] for arm in (0, 1, 2)}
+        placed = {arm: [i for i, x in enumerate(v[arm]) if x == vocab.PLACE]
+                  for arm in (0, 1, 2)}
+        # every arm placed; and the place windows are serially ordered.
+        for arm in (0, 1, 2):
+            assert placed[arm], arm
+        assert placed[0][-1] < placed[1][0]
+        assert placed[1][-1] < placed[2][0]
     finally:
         env.close()
