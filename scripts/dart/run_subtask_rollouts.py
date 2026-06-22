@@ -181,13 +181,15 @@ def _member_passes(out):
     AUTO-TERMINATES the moment the barrier clears z>0.15 (~step 69) — BEFORE the
     per-arm primitive queues empty — so ``completed`` is False even on a successful
     lift. Requiring ``completed`` alone therefore wrongly dropped EVERY success.
-    We accept env-success OR completed instead:
-      * grasp+lift families: the env terminates on the barrier lift -> env_success
-        True (the lift's own check_barrier_lifted may not even have RUN before the
-        early terminate, which is fine — env_success confirms the lift). approach
-        checks always run, so ``all_success`` has len(checked)>0 and reflects them.
-      * approach_stop (no lift, never reaches env-success): kept via completed=True
-        plus its approach checks (check_tcp_near) -> all_success True.
+    We accept env-success OR completed instead. EVERY variant now ends with BOTH
+    arms lifting (simultaneous / stagger_* / sequential_lift — no truncated
+    approach-stop variant), so the normal path is:
+      * the env terminates on the barrier lift -> env_success True (the lift's own
+        check_barrier_lifted may not even have RUN before the early terminate, which
+        is fine — env_success confirms the lift). approach checks always run, so
+        ``all_success`` has len(checked)>0 and reflects them.
+      * if a variant's gating delays the lift past the queue draining without the
+        env terminating, ``completed`` covers it (its approach checks passed).
       * a genuinely FAILED lift: the barrier is not raised, the env never reaches
         success, the program runs to completion, the lift's check_barrier_lifted RAN
         and returned False -> all_success False -> dropped.
@@ -360,7 +362,8 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                     # all_success AND (env-success OR completed). The LiftBarrier env
                     # auto-terminates on the barrier lift BEFORE the queues empty, so
                     # ``completed`` alone would wrongly drop a real success; env_success
-                    # confirms the lift. approach_stop (no lift) is kept via completed.
+                    # confirms the lift. (Every variant lifts; completed is the
+                    # fallback when gating delays the lift past queue-drain.)
                     # A failed lift (no env-success, completed, lift check ran False)
                     # has all_success False -> dropped. See _member_passes.
                     if rec is None or not _member_passes(out):

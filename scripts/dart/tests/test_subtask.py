@@ -323,20 +323,33 @@ def test_dry_run_pose_list_returns_single_plan_stub():
 
 
 # ===========================================================================
-# PURE: contrastive scenario sampler
+# PURE: contrastive scenario sampler (all-complete-rollout coordination contrast)
+#
+# New family set (3 matched pairs, 6 variants). Every pair is {simultaneous, X}
+# from ONE seed; the contrast is COORDINATION (who waits/leads), NOT truncation —
+# every variant ends with BOTH arms lifting (a complete rollout).
 # ===========================================================================
-def test_sampler_emits_four_matched_pairs():
+def test_sampler_emits_three_matched_pairs():
     specs = S.sample(7)
     groups = S.group_specs(specs)
-    assert len(specs) == 8
-    assert len(groups) == 4
+    assert len(specs) == 6
+    assert len(groups) == 3
     for gid, members in groups.items():
         assert len(members) == 2, (gid, [m.name for m in members])
         # both members share family + contrast_group_id
         assert members[0].family == members[1].family
         assert members[0].contrast_group_id == members[1].contrast_group_id == gid
+        # the simultaneous baseline is in EVERY pair (clean A/B)
+        assert "simultaneous" in {m.name for m in members}, [m.name for m in members]
     families = {m.family for m in specs}
-    assert families == {"a_approach", "b_armswap", "c_gate", "d_hold"}
+    assert families == {"stagger_a", "stagger_b", "seq_lift"}
+    names = {m.name for m in specs}
+    assert names == {"simultaneous", "stagger_a_leads", "stagger_b_leads",
+                     "sequential_lift"}
+    # the OLD families/variants are GONE
+    assert not (names & {"approach_stop", "approach_grasp_lift", "arms_LR",
+                         "arms_RL", "grasp_and_hold", "grasp_and_release",
+                         "sequential"})
 
 
 def test_sampler_variant_ids_unique_and_reproducible():
@@ -345,8 +358,7 @@ def test_sampler_variant_ids_unique_and_reproducible():
     # reproducible structural draws (names + meta) for the same seed
     again = S.sample(7)
     assert [m.name for m in specs] == [m.name for m in again]
-    assert [m.meta.get("seam_hold") for m in specs] == \
-           [m.meta.get("seam_hold") for m in again]
+    assert [m.meta for m in specs] == [m.meta for m in again]
 
 
 def test_sampler_rng_independent_of_env_reset():
@@ -360,32 +372,32 @@ def test_sampler_rng_independent_of_env_reset():
     assert np.array_equal(before, after), "sample() perturbed the GLOBAL numpy RNG"
 
 
-def test_sampler_armswap_targets_swapped():
+def test_sampler_arm_assignment_fixed_no_swap():
+    """No arm-swap family: arm0 always takes the LEFT end, arm1 the RIGHT end.
+
+    We inspect every variant's approach target_ids per arm (built off-GPU)."""
     specs = S.sample(7)
-    groups = S.group_specs(specs)
-    armswap = next(m for m in specs if m.family == "b_armswap" and m.name == "arms_LR")
-    armswap_rl = next(m for m in specs if m.family == "b_armswap" and m.name == "arms_RL")
-    assert armswap.meta["arm_left"] == 0 and armswap.meta["arm_right"] == 1
-    assert armswap_rl.meta["arm_left"] == 1 and armswap_rl.meta["arm_right"] == 0
-
-
-def test_sampler_seam_hold_at_least_two():
-    """Seam holds must be >=2 so a training chunk straddling a seam is unambiguous."""
-    for seed in (0, 1, 7, 42, 1000):
-        specs = S.sample(seed)
-        for m in specs:
-            assert m.meta["seam_hold"] >= 2, (seed, m.name, m.meta)
+    for spec in specs:
+        pl, env = FakePlanner(num_arms=2), FakeEnv()
+        prog = spec.build(pl, env)
+        # arm0's first approach targets left_end; arm1's first approach right_end
+        a0 = next(qr.recipe(pl, env, 0) for qr in prog[0]
+                  if qr.recipe(pl, env, 0).verb_id == vocab.APPROACH)
+        a1 = next(qr.recipe(pl, env, 1) for qr in prog[1]
+                  if qr.recipe(pl, env, 1).verb_id == vocab.APPROACH)
+        assert a0.target_id == vocab.LB_TARGETS["left_end"], spec.name
+        assert a1.target_id == vocab.LB_TARGETS["right_end"], spec.name
 
 
 def test_filter_variants_keeps_groups_intact():
     specs = S.sample(7)
     # ask for ONE member by name; the WHOLE matched group must come back
-    out = S.filter_variants(specs, ["approach_stop"])
+    out = S.filter_variants(specs, ["stagger_a_leads"])
     names = sorted(m.name for m in out)
-    assert names == ["approach_grasp_lift", "approach_stop"]
+    assert names == ["simultaneous", "stagger_a_leads"]
     # ask by family
-    out2 = S.filter_variants(specs, ["c_gate"])
-    assert sorted(m.name for m in out2) == ["sequential", "simultaneous"]
+    out2 = S.filter_variants(specs, ["seq_lift"])
+    assert sorted(m.name for m in out2) == ["sequential_lift", "simultaneous"]
     # None -> everything
     assert len(S.filter_variants(specs, None)) == len(specs)
     # unknown -> nothing
@@ -408,8 +420,7 @@ def _prog_verbs(prog, planner, env):
 def test_sampler_builders_callable_against_fakes():
     """The builders must produce a {arm:[QueuedRecipe]} program when given a
     live (planner, env). We drive them (and build their recipes) with the FAKE
-    planner/env (no sim) so the structure (gating, hold-while-other-works) is
-    validated off-GPU."""
+    planner/env (no sim) so the structure (gating) is validated off-GPU."""
     specs = S.sample(7)
     for spec in specs:
         pl, env = FakePlanner(num_arms=2), FakeEnv()
@@ -421,44 +432,91 @@ def test_sampler_builders_callable_against_fakes():
                 assert isinstance(qr, I.QueuedRecipe)
                 assert callable(qr.recipe)
         verbs = _prog_verbs(prog, pl, env)
-        # families that grasp must contain a close_gripper somewhere
-        if spec.name in ("approach_grasp_lift", "arms_LR", "arms_RL",
-                         "sequential", "simultaneous", "grasp_and_hold",
-                         "grasp_and_release"):
-            assert vocab.CLOSE_GRIPPER in verbs, spec.name
-        # approach_stop must NOT close
-        if spec.name == "approach_stop":
-            assert vocab.CLOSE_GRIPPER not in verbs
+        # EVERY variant grasps (approach -> close -> lift on both arms)
+        assert vocab.CLOSE_GRIPPER in verbs, spec.name
+        assert vocab.LIFT in verbs, spec.name
 
 
-def test_sampler_grasp_and_hold_has_long_closed_hold():
-    """The (d) hold variant must end the hold arm on a CLOSED-gripper long hold."""
+def test_sampler_every_variant_both_arms_lift():
+    """EVERY variant must end with BOTH arms on a LIFT (complete rollout; no
+    permanent-hold / truncated variant). Uses the pure structural guard."""
     specs = S.sample(7)
-    spec = next(m for m in specs if m.name == "grasp_and_hold")
-    pl, env = FakePlanner(num_arms=2), FakeEnv()
-    prog = spec.build(pl, env)
-    hold_arm = spec.meta["hold_arm"]
-    # build the last recipe (the long hold) against the fakes to inspect it
-    last = prog[hold_arm][-1].recipe(pl, env, hold_arm)
-    assert last.verb_id == vocab.WAIT
-    assert last.n_ticks == spec.meta["hold_n"]
-    assert all(g == CLOSED for _, g in last.ticks)  # holding closed
+    for spec in specs:
+        pl, env = FakePlanner(num_arms=2), FakeEnv()
+        prog = spec.build(pl, env)
+        # the guard raises if any arm's last primitive is not a LIFT
+        S.assert_both_arms_lift(prog, pl, env)
+        # and explicitly: both arms' last primitive is a lift
+        for arm in (0, 1):
+            last = prog[arm][-1].recipe(pl, env, arm)
+            assert last.verb_id == vocab.LIFT, (spec.name, arm, last.name)
 
 
-def test_sampler_sequential_has_gate_simultaneous_does_not():
+def test_sampler_no_deadlock_one_arm_ungated_first():
+    """DEADLOCK GUARD: in EVERY variant at least one arm's FIRST primitive is
+    ungated (wait_for=None), so the program can always start; never gate both
+    arms' first action on each other."""
     specs = S.sample(7)
-    seq = next(m for m in specs if m.name == "sequential")
+    for spec in specs:
+        pl, env = FakePlanner(num_arms=2), FakeEnv()
+        prog = spec.build(pl, env)
+        # the guard raises on a deadlock; also assert the acyclicity directly
+        S.assert_no_deadlock(prog)
+        first_gates = S.gate_graph(prog)
+        assert any(g is None for g in first_gates.values()), (spec.name, first_gates)
+
+
+def test_sampler_simultaneous_has_no_gates():
+    """The baseline simultaneous variant carries NO wait_for gates anywhere."""
+    specs = S.sample(7)
     sim_ = next(m for m in specs if m.name == "simultaneous")
     pl, env = FakePlanner(num_arms=2), FakeEnv()
-    seq_prog = seq.build(pl, env)
-    pl2, env2 = FakePlanner(num_arms=2), FakeEnv()
-    sim_prog = sim_.build(pl2, env2)
-    # sequential: arm_right's lift carries a wait_for gate
-    seq_gates = [qp.wait_for for q in seq_prog.values() for qp in q if qp.wait_for]
-    assert len(seq_gates) >= 1
-    # simultaneous: no gates
-    sim_gates = [qp.wait_for for q in sim_prog.values() for qp in q if qp.wait_for]
-    assert sim_gates == []
+    prog = sim_.build(pl, env)
+    gates = [qr.wait_for for q in prog.values() for qr in q if qr.wait_for]
+    assert gates == []
+
+
+def test_sampler_stagger_a_follower_waits_at_frame0():
+    """stagger_a_leads: arm0 (lead) starts UNGATED; arm1 (follow) first primitive
+    is GATED on arm0 -> arm1 is wait at frame 0 vs approach in simultaneous."""
+    specs = S.sample(7)
+    spec = next(m for m in specs if m.name == "stagger_a_leads")
+    pl, env = FakePlanner(num_arms=2), FakeEnv()
+    prog = spec.build(pl, env)
+    first_gates = S.gate_graph(prog)
+    assert first_gates[0] is None       # leader (arm0) ungated first
+    assert first_gates[1] == 0          # follower (arm1) waits on arm0
+    # both lifts in the stagger are gated (so ends rise together)
+    lift_gates = [qr.wait_for for arm, q in prog.items() for qr in q
+                  if qr.recipe(pl, env, arm).verb_id == vocab.LIFT and qr.wait_for]
+    assert len(lift_gates) == 2
+
+
+def test_sampler_stagger_b_is_mirror():
+    """stagger_b_leads: arm1 leads ungated, arm0 follows (the mirror of a)."""
+    specs = S.sample(7)
+    spec = next(m for m in specs if m.name == "stagger_b_leads")
+    pl, env = FakePlanner(num_arms=2), FakeEnv()
+    prog = spec.build(pl, env)
+    first_gates = S.gate_graph(prog)
+    assert first_gates[1] is None       # leader (arm1) ungated first
+    assert first_gates[0] == 1          # follower (arm0) waits on arm1
+
+
+def test_sampler_sequential_lift_gates_only_arm1_lift():
+    """sequential_lift: both approach+close ungated; only arm1's LIFT is gated."""
+    specs = S.sample(7)
+    spec = next(m for m in specs if m.name == "sequential_lift")
+    pl, env = FakePlanner(num_arms=2), FakeEnv()
+    prog = spec.build(pl, env)
+    first_gates = S.gate_graph(prog)
+    # both first primitives (approaches) ungated -> simultaneous start
+    assert first_gates[0] is None and first_gates[1] is None
+    # exactly ONE gate in the whole program, on arm1's lift
+    gated = [(arm, qi) for arm, q in prog.items()
+             for qi, qr in enumerate(q) if qr.wait_for]
+    assert gated == [(1, 2)], gated
+    assert prog[1][2].recipe(pl, env, 1).verb_id == vocab.LIFT
 
 
 # ===========================================================================
@@ -514,8 +572,8 @@ def test_member_passes_keep_predicate_matrix():
         {"all_success": False, "info": {"success": True}, "completed": True}) is False
     assert R._member_passes(
         {"all_success": False, "info": {"success": False}, "completed": False}) is False
-    # 3) approach_stop: no lift, never reaches env-success, but queues completed and
-    #    approach checks passed -> KEEP (via completed).
+    # 3) gating delayed the lift past queue-drain without env terminating: queues
+    #    completed and the approach checks passed -> KEEP (via completed).
     assert R._member_passes(
         {"all_success": True, "info": {}, "completed": True}) is True
     # 4) FAILED LIFT: program completed, lift's check_barrier_lifted RAN and was
@@ -580,7 +638,7 @@ def _build_sim_planner(env, Solver, seed):
 def test_sim_label_stream_len_equals_T_and_contiguous_no_none():
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        spec = next(m for m in S.sample(0) if m.name == "simultaneous")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
@@ -589,22 +647,22 @@ def test_sim_label_stream_len_equals_T_and_contiguous_no_none():
         T = out["steps"]
         assert rec.length == T
         a = rec.to_arrays()
-        # the program for approach_grasp_lift (arm0=left): approach -> hold(wait)
-        # -> close -> lift. Collapsing consecutive duplicates must yield exactly
-        # that verb order with no interleaving (contiguous runs, no None).
+        # the simultaneous program (both arms, ungated): approach -> close -> lift.
+        # Collapsing consecutive duplicates yields that verb order, possibly with a
+        # leading/trailing WAIT run (an arm idling while the other catches up). No
+        # None / garbage verbs anywhere.
         import itertools
         for arm in (0, 1):
             verbs = [int(v) for v in a[f"subtask_arm{arm}_verb"]]
             assert len(verbs) == T
             assert all(v in vocab.VERB_IDS.values() for v in verbs)  # no None/garbage
             runs = [k for k, _ in itertools.groupby(verbs)]
-            # strip a trailing idle-WAIT run (the arm that finishes first idles
-            # while the other still works -> a legitimate trailing wait).
+            # strip leading/trailing idle-WAIT runs (legitimate cross-arm idling).
+            if runs and runs[0] == vocab.WAIT:
+                runs = runs[1:]
             if runs and runs[-1] == vocab.WAIT:
                 runs = runs[:-1]
-            # the program is approach -> hold(WAIT) -> close -> lift; the interior
-            # WAIT (the seam hold) is expected and contiguous.
-            assert runs == [vocab.APPROACH, vocab.WAIT, vocab.CLOSE_GRIPPER, vocab.LIFT], runs
+            assert runs == [vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT], runs
     finally:
         env.close()
 
@@ -615,7 +673,7 @@ def test_sim_offbyone_label_drives_action():
     appears on the SAME step the first planned waypoint is sent."""
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        spec = next(m for m in S.sample(0) if m.name == "simultaneous")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
@@ -653,16 +711,17 @@ def test_sim_idle_arm_wait_and_frozen():
 def test_sim_barrier_gating_blocks_until_grasp():
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "sequential")
+        spec = next(m for m in S.sample(0) if m.name == "sequential_lift")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
         I.run_program(env, planner, prog, rec, max_steps=800,
                       control_mode=planner.control_mode)
         a = rec.to_arrays()
-        # arm_right's LIFT is gated on arm_left grasp; arm_right should still
-        # complete its approach+close but the LIFT only starts after the gate.
+        # arm1's LIFT is gated on arm0 grasp; arm1 still completes its approach+close
+        # but the LIFT only starts after the gate. Both arms ultimately lift.
         assert vocab.LIFT in set(a["subtask_arm1_verb"])
+        assert vocab.LIFT in set(a["subtask_arm0_verb"])
     finally:
         env.close()
 
@@ -671,7 +730,7 @@ def test_sim_barrier_gating_blocks_until_grasp():
 def test_sim_success_checks_fire():
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        spec = next(m for m in S.sample(0) if m.name == "simultaneous")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
@@ -686,13 +745,15 @@ def test_sim_success_checks_fire():
 
 
 @sim
-def test_sim_contrastive_frame0_identical_seam_diverge_stop_never_closes():
-    """approach_stop vs approach_grasp_lift from the SAME seed:
-    frame-0 obs identical, labels diverge at the seam, stop never closes."""
+def test_sim_contrastive_frame0_identical_coordination_diverges():
+    """simultaneous vs stagger_a_leads from the SAME seed: frame-0 obs identical,
+    but the COORDINATION diverges — in stagger_a_leads the follower (arm1) is
+    WAITING at frame 0 (gated on arm0's grasp) whereas in simultaneous arm1
+    approaches immediately. BOTH variants still complete (both arms lift)."""
     env, Solver = _make_sim_env()
     try:
         specs = {m.name: m for m in S.sample(0)
-                 if m.name in ("approach_stop", "approach_grasp_lift")}
+                 if m.name in ("simultaneous", "stagger_a_leads")}
         recs = {}
         first_qpos = {}
         for name, spec in specs.items():
@@ -703,16 +764,20 @@ def test_sim_contrastive_frame0_identical_seam_diverge_stop_never_closes():
                                 else np.asarray(q0)).copy()
             rec = I.SubtaskRecorder(num_arms=2)
             prog = spec.build(planner, env)
-            I.run_program(env, planner, prog, rec, max_steps=600,
+            I.run_program(env, planner, prog, rec, max_steps=800,
                           control_mode=planner.control_mode)
             recs[name] = rec.to_arrays()
         # frame-0 identical (same reset seed, sampler RNG independent)
-        assert np.allclose(first_qpos["approach_stop"],
-                           first_qpos["approach_grasp_lift"], atol=1e-5)
-        # stop variant NEVER closes
-        assert vocab.CLOSE_GRIPPER not in set(recs["approach_stop"]["subtask_arm0_verb"])
-        # grasp variant DOES close
-        assert vocab.CLOSE_GRIPPER in set(recs["approach_grasp_lift"]["subtask_arm0_verb"])
+        assert np.allclose(first_qpos["simultaneous"],
+                           first_qpos["stagger_a_leads"], atol=1e-5)
+        # COORDINATION contrast at frame 0: simultaneous -> arm1 approaches; stagger
+        # -> arm1 waits (gated on arm0 grasp).
+        assert recs["simultaneous"]["subtask_arm1_verb"][0] == vocab.APPROACH
+        assert recs["stagger_a_leads"]["subtask_arm1_verb"][0] == vocab.WAIT
+        # BOTH variants complete: both arms lift in each.
+        for name in ("simultaneous", "stagger_a_leads"):
+            assert vocab.LIFT in set(recs[name]["subtask_arm0_verb"]), name
+            assert vocab.LIFT in set(recs[name]["subtask_arm1_verb"]), name
     finally:
         env.close()
 
@@ -732,7 +797,7 @@ def test_sim_matched_pair_atomic_drop_and_liar_label():
     """
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        spec = next(m for m in S.sample(0) if m.name == "simultaneous")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
@@ -774,7 +839,7 @@ def test_sim_dart_object_perturb_compat():
     is NOT recorded as a label/action."""
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        spec = next(m for m in S.sample(0) if m.name == "simultaneous")
         planner = _build_sim_planner(env, Solver, spec.seed)
         u = env.unwrapped
         # jitter the barrier by a small xy offset. With JIT building the first
