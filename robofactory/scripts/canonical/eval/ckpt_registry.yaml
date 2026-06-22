@@ -1,0 +1,345 @@
+# =============================================================================
+# CHECKPOINT REGISTRY — single source of truth for canonical Pi0.5 checkpoints.
+# Week-2 lane L3 (decision-table row #8).
+#
+# WHY THIS EXISTS
+#   One openpi `config_name` (e.g. `pi05_robofactory_lb_ws_cent`) resolves to
+#   MULTIPLE training-run subdirs on disk. An eval that picks "the" checkpoint
+#   by config_name silently grabs whichever run a launcher happened to point at.
+#   That is exactly how the bogus "LB ws 100% -> 20%" reading happened: E10
+#   resolved `lb_ws_cent` to the WORSE of two training runs (the 05-16-fp run,
+#   step 19999) and reported it as a regression.
+#
+#   This file pins, per config_name, the ONE training-run dir + step that is
+#   blessed as canonical, plus its wandb_id / git_sha / norm_stats_md5. The
+#   drift guard (`robofactory/utils/ckpt_registry.py` + the eval hook) hard-fails
+#   if an eval resolves a DIFFERENT dir/step than what is pinned here.
+#
+# SCOPE (deliberate): LiftBarrier (LB) + ThreeRobotsStackCube (TSC) ONLY.
+#   PM / 2SC / LP are intentionally NOT pinned here (out of scope for L3).
+#   A config_name absent from this registry is "unregistered" -> the guard
+#   treats it as un-pinned and (by default) WARNS rather than hard-fails, so
+#   evals of unpinned tasks are not blocked.
+#
+# IDENTITY NOTE
+#   `norm_stats_md5` does NOT discriminate sibling runs of the same task: it is
+#   a function of the training DATA, so ws/wc arms of one task share an md5, and
+#   the two `lb_ws_cent` runs share an md5 too. The DISCRIMINATING identity is
+#   `ckpt_dir` + `step`. The guard's primary keys are dir+step; md5 is recorded
+#   as a secondary cross-check only.
+#
+# `git_sha: null` for most rows is EXPECTED, not missing data: openpi did not
+#   write `openpi_git_sha` into `ckpt_format.json` for these runs (the field is
+#   literally `null` on disk). Recorded as null rather than guessed.
+#
+# Trust tags mirror /iris/u/mikulrai/notes/NUMBER_TRUST_LEDGER.md.
+#   CITE       = canonical, reproducible, safe to pin + cite.
+#   AMBIGUOUS  = multiple real runs under this config; the canonical one is NOT
+#                established by the audit -> pinned to a best-guess + flagged.
+#   UNVERIFIED = canonical ckpt is irreproducible / unknown -> DO NOT auto-eval;
+#                guard set to hard-fail so nobody silently re-runs the wrong one.
+#   MISSING    = config_name has NO resolvable full checkpoint on disk.
+#
+# Built 2026-06-22 (Week-2 L3). Roots scanned:
+#   /iris/u/mikulrai/checkpoints/openpi/
+# =============================================================================
+
+ckpt_root: /iris/u/mikulrai/checkpoints/openpi
+
+registry:
+
+  # ===========================================================================
+  # LiftBarrier (LB)
+  # ===========================================================================
+
+  # --- LB wristcam (wc) decentralised — E9 BASELINE (full-FT bs16x20k) --------
+  # Ledger CITE: LB wc decent Pi0.5 32/60, step 19999, job 15783395.
+  pi05_robofactory_lb_wc_decent_arm0:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm0/lb-wc-dec-a0-bs16-20k-2026-05-16-fp/19999
+    step: 19999
+    wandb_id: 0htz9zrs
+    git_sha: null
+    norm_stats_md5: 8eceaaae7a26b19e3417a53bc5f2103e
+    trust: CITE
+    note: >-
+      E9 BASELINE full-FT bs16x20k. Sibling runs that MUST NOT be served as this
+      config: lb-wc-decent-a0-bs16-20k-2026-05-13, lb_wc_decent_arm0_v1,
+      overfit_ep0_arm0 (+ .trash dirs). Decent run is the citable one.
+    flagged_siblings:
+      - lb-wc-decent-a0-bs16-20k-2026-05-13
+      - lb_wc_decent_arm0_v1
+      - overfit_ep0_arm0
+
+  pi05_robofactory_lb_wc_decent_arm1:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm1/lb-wc-dec-a1-bs16-20k-2026-05-16-fp/19999
+    step: 19999
+    wandb_id: e4q76co0
+    git_sha: null
+    norm_stats_md5: df771ac4ed9dcf976bb321ddb956fade
+    trust: CITE
+    note: E9 BASELINE full-FT bs16x20k, arm1 of the wc-decent pair.
+    flagged_siblings:
+      - lb-wc-decent-a1-bs16-20k-2026-05-13
+      - lb_wc_decent_arm1_v1
+      - overfit_ep0_arm1
+
+  # --- LB wc decent PDROP twin (lora_only b32x10k, proprio_dropout 0.7) -------
+  # Ledger CITE: LB wc decent Pi0.5 (PDROP twin) 32/60, step 9999, job 15770583.
+  pi05_robofactory_lb_wc_decent_propriodrop_arm0:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_propriodrop_arm0/lb_wc_decent_propriodrop_arm0_b32_v1/9999
+    step: 9999
+    wandb_id: 54mh1oke
+    git_sha: null
+    norm_stats_md5: 8eceaaae7a26b19e3417a53bc5f2103e
+    trust: CITE
+    note: >-
+      PDROP twin, the b32_v1 run @ step 9999. Sibling recipe runs (b128_v1,
+      b32_noshuffle_v1, _v1) are DIFFERENT recipes, not interchangeable.
+    flagged_siblings:
+      - lb_wc_decent_propriodrop_arm0_b128_v1
+      - lb_wc_decent_propriodrop_arm0_b32_noshuffle_v1
+      - lb_wc_decent_propriodrop_arm0_v1
+
+  pi05_robofactory_lb_wc_decent_propriodrop_arm1:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_propriodrop_arm1/lb_wc_decent_propriodrop_arm1_b32_v1/9999
+    step: 9999
+    wandb_id: 64bxbpcu
+    git_sha: null
+    norm_stats_md5: df771ac4ed9dcf976bb321ddb956fade
+    trust: CITE
+    note: PDROP twin arm1, b32_v1 @ step 9999.
+    flagged_siblings:
+      - lb_wc_decent_propriodrop_arm1_b128_v1
+      - lb_wc_decent_propriodrop_arm1_b32_noshuffle_v1
+      - lb_wc_decent_propriodrop_arm1_v1
+
+  # --- LB workspace (ws) decentralised — the one stale headline that HELD -----
+  # Ledger CITE: LB ws decent Pi0.5 56/60 (93.3%), E10, job 15869692.
+  pi05_robofactory_lb_ws_decent_arm0:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm0/lb-ws-dec-a0-bs16-20k-2026-05-16-fp/19999
+    step: 19999
+    wandb_id: dcz7p4yw
+    git_sha: null
+    norm_stats_md5: 8eceaaae7a26b19e3417a53bc5f2103e
+    trust: CITE
+    note: >-
+      E10 HELD at 93.3% (the only stale ws/PM headline that survived the clean
+      stack). Sibling _smoke / _v1 runs are NOT the canonical eval ckpt.
+    flagged_siblings:
+      - lb_ws_decent_arm0_smoke
+      - lb_ws_decent_arm0_v1
+
+  pi05_robofactory_lb_ws_decent_arm1:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm1/lb-ws-dec-a1-bs16-20k-2026-05-16-fp/19999
+    step: 19999
+    wandb_id: yd1ocve2
+    git_sha: null
+    norm_stats_md5: df771ac4ed9dcf976bb321ddb956fade
+    trust: CITE
+    note: LB ws decent arm1, E10 HELD pair.
+    flagged_siblings:
+      - lb_ws_decent_arm1_smoke
+      - lb_ws_decent_arm1_v1
+
+  # --- LB ws CENTRALISED — THE provenance disaster. UNVERIFIED, DO NOT EVAL ---
+  # Ledger UNVERIFIED: the "LB ws 100% -> 20%" reading. Two runs, none reproduce
+  # the original 60/60; available ckpts score 48.3% / 35.0% / 15.0% / 20.0%.
+  # E10's 20.0% used 05-16-fp/19999 = the WORSE training run, resolved by name.
+  pi05_robofactory_lb_ws_cent:
+    canonical_ckpt_dir: null          # NO trustworthy canonical established
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: UNVERIFIED
+    guard_action: fail                # hard-fail: never silently re-resolve by name
+    note: >-
+      ROOT-CAUSE CASE for this registry (decision-table row #8). config_name
+      maps to TWO real runs and the original 60/60 recorded no checkpoint and is
+      irreproducible. Candidate runs/steps and their sweep SRs:
+        lb-ws-cent-bs16-20k-2026-05-15/10000  ~48.3% (wandb q0v61151, least-bad)
+        lb-ws-cent-bs16-20k-2026-05-15/14000  ~35.0%
+        lb-ws-cent-bs16-20k-2026-05-16-fp/10000 ~15.0%
+        lb-ws-cent-bs16-20k-2026-05-16-fp/19999 ~20.0% (wandb tkphun7q; E10 picked THIS)
+      Needs deliberate checkpoint selection or retrain before any number is
+      pinned/cited. Until then the guard hard-fails so no eval auto-grabs a run.
+    candidate_runs:
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_cent/lb-ws-cent-bs16-20k-2026-05-15
+        wandb_id: q0v61151
+        steps: [10000, 14000]
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_cent/lb-ws-cent-bs16-20k-2026-05-16-fp
+        wandb_id: tkphun7q
+        steps: [10000, 19999]
+
+  # --- LB wc CENTRALISED — two runs, never a citable headline; flag ambiguous -
+  pi05_robofactory_lb_wc_cent:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: AMBIGUOUS
+    guard_action: fail
+    note: >-
+      Two real runs (lb-wc-cent-bs16-20k-2026-05-13 wandb 98y1tdg3, and
+      lb-wc-cent-bs16-20k-2026-05-16-fp wandb kxn7piwz). No audit verdict pins a
+      canonical wc-cent ckpt; the citable LB wc numbers are all DECENT, not cent.
+      Left unpinned + hard-fail to prevent a silent wrong-run resolution.
+    candidate_runs:
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_cent/lb-wc-cent-bs16-20k-2026-05-13
+        wandb_id: 98y1tdg3
+        steps: [10000, 19999]
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_cent/lb-wc-cent-bs16-20k-2026-05-16-fp
+        wandb_id: kxn7piwz
+        steps: [10000, 19999]
+
+  # --- LB union decentralised — single run, context-only 5-cam recipe ---------
+  # Ledger CITE: LB wc Pi0.5 recipe union 5-cam 17/60.
+  pi05_robofactory_lb_union_decent_arm0:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_union_decent_arm0/lb_union_decent_arm0_v1/19999
+    step: 19999
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: CITE
+    note: Single run; union 5-cam context-only recipe (no dropout). 17/60.
+
+  pi05_robofactory_lb_union_decent_arm1:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_union_decent_arm1/lb_union_decent_arm1_v1/19999
+    step: 19999
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: CITE
+    note: LB union decent arm1, single run.
+
+  # ===========================================================================
+  # ThreeRobotsStackCube (TSC)
+  # ===========================================================================
+
+  # --- TSC d2_wristcam decentralised — the "IMPORTANT_TSC" keep-set runs ------
+  # NOTE (project memory): d2_wristcam was trained on the TABLE scene; eval scene
+  # must match. These are the run dirs literally named IMPORTANT_TSC_ARM*.
+  pi05_robofactory_decent_wristcam_lora_finetune_arm0:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_wristcam_lora_finetune_arm0/IMPORTANT_TSC_ARM0/19999
+    step: 19999
+    wandb_id: o8atbues
+    git_sha: null
+    norm_stats_md5: 2887efc620acf02d89b6c58837e4f21f
+    trust: CITE
+    note: TSC d2_wristcam decent arm0; single real run (IMPORTANT_TSC_ARM0).
+
+  pi05_robofactory_decent_wristcam_lora_finetune_arm1:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_wristcam_lora_finetune_arm1/IMPORTANT_TSC_ARM1/19999
+    step: 19999
+    wandb_id: 7szlzxur
+    git_sha: null
+    norm_stats_md5: 5a645b0e3d8481bc1772ab38571636d9
+    trust: CITE
+    note: TSC d2_wristcam decent arm1.
+
+  pi05_robofactory_decent_wristcam_lora_finetune_arm2:
+    canonical_ckpt_dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_decent_wristcam_lora_finetune_arm2/IMPORTANT_TSC_ARM2/19999
+    step: 19999
+    wandb_id: qrm2sqaq
+    git_sha: null
+    norm_stats_md5: 36da3347eb28fc518191ea0b76fea75d
+    trust: CITE
+    note: TSC d2_wristcam decent arm2.
+
+  # --- TSC 3sc wc decent — 2-3 runs per arm (noaug vs zerostate); AMBIGUOUS ----
+  # Two distinct recipes (postseedfix_noaug vs postseedfix_zerostate) live under
+  # one config_name. They are NOT the same experiment, so neither is "the"
+  # canonical without picking which recipe the table cell refers to.
+  pi05_robofactory_tsc_wc_decent_arm0:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: AMBIGUOUS
+    guard_action: fail
+    note: >-
+      Two recipes under one config_name (noaug wandb 1ea9c3s4 vs zerostate
+      4vnzpytn, both steps 10000/19999) plus a SHMDIAG smoke (zbdbntry, 2000).
+      Pick the recipe the table cell means before pinning.
+    candidate_runs:
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm0/pi05_3sc_wc_decent_postseedfix_noaug_arm0_v1
+        wandb_id: 1ea9c3s4
+        steps: [10000, 19999]
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm0/pi05_3sc_wc_decent_postseedfix_zerostate_arm0_v1
+        wandb_id: 4vnzpytn
+        steps: [10000, 19999]
+
+  pi05_robofactory_tsc_wc_decent_arm1:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: AMBIGUOUS
+    guard_action: fail
+    note: >-
+      noaug (36ah8o36) vs zerostate (kk3dlzmp), both steps 10000/19999.
+    candidate_runs:
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm1/pi05_3sc_wc_decent_postseedfix_noaug_arm1_v1
+        wandb_id: 36ah8o36
+        steps: [10000, 19999]
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm1/pi05_3sc_wc_decent_postseedfix_zerostate_arm1_v1
+        wandb_id: kk3dlzmp
+        steps: [10000, 19999]
+
+  pi05_robofactory_tsc_wc_decent_arm2:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: AMBIGUOUS
+    guard_action: fail
+    note: >-
+      noaug (a7coa5st) vs zerostate (q0prmgil), both steps 10000/19999.
+    candidate_runs:
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm2/pi05_3sc_wc_decent_postseedfix_noaug_arm2_v1
+        wandb_id: a7coa5st
+        steps: [10000, 19999]
+      - dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_tsc_wc_decent_arm2/pi05_3sc_wc_decent_postseedfix_zerostate_arm2_v1
+        wandb_id: q0prmgil
+        steps: [10000, 19999]
+
+  # --- TSC d1 decentralised (lora) — NO full checkpoint on disk; MISSING -------
+  # The manifest `tsc_pi05_d1_decent` points at
+  #   .../pi05_robofactory_decent_lora_finetune_arm0/pi05_d1_decent_arm0_v0/19999
+  # which DOES NOT EXIST: the decent_lora_finetune_arm{0,1,2} dirs are EMPTY.
+  pi05_robofactory_decent_lora_finetune_arm0:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: MISSING
+    guard_action: fail
+    note: >-
+      config dir is EMPTY on disk. The manifest entry tsc_pi05_d1_decent points
+      at pi05_d1_decent_arm0_v0/19999 which does not exist -> any eval of this
+      config WILL fail to load. Flagged so the guard surfaces it up front.
+
+  pi05_robofactory_decent_lora_finetune_arm1:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: MISSING
+    guard_action: fail
+    note: config dir EMPTY on disk (TSC d1 decent arm1).
+
+  pi05_robofactory_decent_lora_finetune_arm2:
+    canonical_ckpt_dir: null
+    step: null
+    wandb_id: null
+    git_sha: null
+    norm_stats_md5: null
+    trust: MISSING
+    guard_action: fail
+    note: config dir EMPTY on disk (TSC d1 decent arm2).
