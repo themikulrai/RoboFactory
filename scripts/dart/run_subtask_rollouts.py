@@ -61,6 +61,7 @@ def _solver_alarm_handler(signum, frame):
 import robofactory  # registers envs + PandaWristCamMulti  # noqa: E402
 from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver  # noqa: E402
 from robofactory.planner import subtask_scenarios as scenarios  # noqa: E402
+from robofactory.planner import subtask_scenarios_tsc as scenarios_tsc  # noqa: E402
 from robofactory.planner.subtask_interpreter import (  # noqa: E402
     SubtaskRecorder,
     run_program,
@@ -71,9 +72,13 @@ from robofactory import CONFIG_DIR  # noqa: E402
 HF_DOWNLOAD_ROOT = "/iris/u/mikulrai/data/RoboFactory/hf_download"
 
 # (env_id, yaml_rel, n_agents, scenario_sampler). Only tasks with a scenario
-# sampler are runnable here; LiftBarrier is Phase-1. (3SC is Phase-4.)
+# sampler are runnable here. LiftBarrier (2 arms) + ThreeRobotsStackCube (3 arms).
 TASK_MAP = {
     "LiftBarrier": ("LiftBarrier-rf", "table/lift_barrier.yaml", 2, scenarios.sample),
+    "ThreeRobotsStackCube": (
+        "ThreeRobotsStackCube-rf", "table/three_robots_stack_cube.yaml", 3,
+        scenarios_tsc.sample,
+    ),
 }
 
 
