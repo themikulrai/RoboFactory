@@ -123,6 +123,12 @@ class Args:
     wandb_tags: str = "eval,pi05,cent"
     video_max: int = 3
     video_all: bool = False
+    swap_arms: bool = False
+    """SWAP DIAGNOSTIC (num_arms==2 only; no-op otherwise): mirror the two arms so the
+    policy sees physical-arm1 in slot0 and physical-arm0 in slot1 (state + wrist image)
+    AND its slot0 output drives physical arm1 (input + output consistently swapped).
+    Compare swap-on vs swap-off SR per seed to tell whether a grasp failure follows the
+    PHYSICAL side or the ACTION SLOT. Only wired into the single-env (num_envs==1) path."""
 
 
 def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
@@ -146,9 +152,16 @@ def _get_qpos(obs: dict, robot_uid: str, arm_i: int) -> np.ndarray:
     raise KeyError(f"qpos lookup failed: arm={arm_i} uid={robot_uid} agent_keys={list(agent.keys())}")
 
 
-def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda", pad_to: int = 0) -> np.ndarray:
+def _build_state(obs: dict, num_arms: int, robot_uid: str = "panda", pad_to: int = 0, swap_arms: bool = False) -> np.ndarray:
     state_parts: list[np.ndarray] = []
-    for i in range(num_arms):
+    # SWAP DIAGNOSTIC (num_arms==2 only): present physical arms to the policy in
+    # reversed order [1,0]. The policy's "slot0" state block then carries
+    # physical-arm1 and "slot1" carries physical-arm0. This is paired with the
+    # same swap in _build_obs_dict (wrist images) and _delta_to_absolute_action
+    # (output dispatch); a SYMMETRIC policy is unchanged, only a slot/side
+    # asymmetry alters behavior. See --swap-arms.
+    arm_order = [1, 0] if (swap_arms and num_arms == 2) else list(range(num_arms))
+    for i in arm_order:
         q = _get_qpos(obs, robot_uid, i).squeeze()
         state_parts.append(q[:7].astype(np.float32))
         state_parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
@@ -168,17 +181,25 @@ def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str = "panda", state_pad_to: int = 0) -> dict:
+def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_uid: str = "panda", state_pad_to: int = 0, swap_arms: bool = False) -> dict:
     out: dict = {
-        "state": _build_state(obs, num_arms, robot_uid, pad_to=state_pad_to),
+        "state": _build_state(obs, num_arms, robot_uid, pad_to=state_pad_to, swap_arms=swap_arms),
         "prompt": prompt,
     }
+    # SWAP DIAGNOSTIC (num_arms==2 only): wrist-cam mapping is left_wrist_0<-arm0,
+    # right_wrist_0<-arm1. To present physical-arm1 in slot0 and physical-arm0 in
+    # slot1 consistently with the swapped state, read each slot from the OTHER
+    # physical arm's camera, i.e. swap which sim camera feeds left/right wrist.
+    eff_cam_map = dict(cam_map)
+    if swap_arms and num_arms == 2:
+        eff_cam_map["left_wrist_0_rgb_raw"] = cam_map.get("right_wrist_0_rgb_raw")
+        eff_cam_map["right_wrist_0_rgb_raw"] = cam_map.get("left_wrist_0_rgb_raw")
     # Mirrors training-side RoboFactoryInputs: slots whose mapping is None are
     # zero-filled with the same shape as a real image. Required for sparse
     # configs like pick_meat.json (1-cam).
     ref_shape: tuple[int, int, int] | None = None
     for slot in IMAGE_SLOTS:
-        cam_name = cam_map.get(slot)
+        cam_name = eff_cam_map.get(slot)
         if cam_name is not None:
             img = _extract_image(obs, cam_name)
             out[slot] = img
@@ -193,20 +214,31 @@ def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict, robot_
 
 
 def _delta_to_absolute_action(
-    chunk_step: np.ndarray, current_qpos_per_arm: list[np.ndarray], num_arms: int, action_prefix: str = "panda"
+    chunk_step: np.ndarray, current_qpos_per_arm: list[np.ndarray], num_arms: int, action_prefix: str = "panda", swap_arms: bool = False
 ) -> dict:
     """chunk_step: (num_arms*8,) = per-arm [delta_joints(7), gripper(1)].
 
     Always returns a dict keyed by f"{action_prefix}-{i}". Caller flattens to
     a single ndarray via _flatten_action_dict_for_box when env.action_space is Box.
+
+    SWAP DIAGNOSTIC (num_arms==2 only): the policy's slot0 output (chunk[0:8])
+    drives physical arm1 and slot1 output (chunk[8:16]) drives physical arm0.
+    This is the inverse map of the input swap (state + wrist images), so the
+    whole pipeline is consistently swapped: a SYMMETRIC policy behaves
+    identically, only a slot/side asymmetry changes behavior. The delta is added
+    to the TARGET physical arm's own current qpos (correct, since deltas are
+    relative). The action-dict key is the physical arm index.
     """
     out: dict[str, np.ndarray] = {}
-    for i in range(num_arms):
-        s = i * 8
+    # phys_for_slot[slot] = physical arm index that slot's output drives.
+    phys_for_slot = [1, 0] if (swap_arms and num_arms == 2) else list(range(num_arms))
+    for slot in range(num_arms):
+        s = slot * 8
         delta = chunk_step[s : s + 7]
         gripper = chunk_step[s + 7]
-        target = np.concatenate([current_qpos_per_arm[i] + delta, np.array([gripper], dtype=np.float32)])
-        out[f"{action_prefix}-{i}"] = target.astype(np.float32)
+        phys = phys_for_slot[slot]
+        target = np.concatenate([current_qpos_per_arm[phys] + delta, np.array([gripper], dtype=np.float32)])
+        out[f"{action_prefix}-{phys}"] = target.astype(np.float32)
     return out
 
 
@@ -363,7 +395,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
             video_frames.append(tile_views([_extract_image(obs, s) for s in view_sensors]))
             replanned = False
             if chunk is None or chunk_idx >= args.replan_after:
-                obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, args.state_pad_to)
+                obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid, args.state_pad_to, swap_arms=args.swap_arms)
                 obs_dict["_episode_seed"] = int(seed)  # PR5: server re-keys self._rng per episode (popped before transforms)
                 result = policy.infer(obs_dict)
                 chunk = np.asarray(result["actions"])[:, :active_dim]  # (H, active_dim)
@@ -371,7 +403,7 @@ def run_episode(env, policy, args: Args, cam_map: dict[str, str], active_dim: in
                 replanned = True
 
             cur_qpos = _current_qpos_per_arm(obs, args.num_arms, args.robot_uid)
-            action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, action_prefix)
+            action_dict = _delta_to_absolute_action(chunk[chunk_idx], cur_qpos, args.num_arms, action_prefix, swap_arms=args.swap_arms)
             # PR7: remember the commanded gripper per arm so the hold probe preserves the grasp.
             for _a in range(args.num_arms):
                 last_gripper_per_arm[_a] = float(np.asarray(action_dict[f"{action_prefix}-{_a}"]).reshape(-1)[-1])
@@ -602,6 +634,15 @@ def main(args: Args) -> None:
 
     cam_map = _resolve_camera_mapping(args.camera_mapping)
     active_dim = args.active_dim or args.num_arms * 8
+
+    # SWAP DIAGNOSTIC: only wired into the single-env path. Fail loudly instead of
+    # silently running an UN-swapped vectorised eval that would be mislabeled "swap".
+    if args.swap_arms:
+        if args.num_arms != 2:
+            raise RuntimeError(f"--swap-arms requires --num-arms 2; got {args.num_arms}")
+        if args.num_envs != 1:
+            raise RuntimeError("--swap-arms only implemented for --num-envs 1 (single-env path)")
+        print("[swap] --swap-arms ACTIVE: policy sees arms reversed (slot0<-phys1, slot1<-phys0); slot0 output drives phys1", flush=True)
 
     env_kwargs = dict(
         config=args.config,
