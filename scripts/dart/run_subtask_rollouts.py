@@ -150,15 +150,63 @@ def _run_one_variant(env, spec, max_steps, boundary_hook):
     return rec, out
 
 
+def _env_success(info):
+    """Coerce env-step ``info['success']`` to a python bool, robustly.
+
+    ``info`` may carry a torch tensor / numpy array / scalar / None. Missing or
+    None -> False. A (possibly batched) array is reduced to its first element.
+    """
+    if not info:
+        return False
+    s = info.get("success", None)
+    if s is None:
+        return False
+    if hasattr(s, "detach"):  # torch tensor
+        s = s.detach().cpu().numpy()
+    try:
+        return bool(np.asarray(s).reshape(-1)[0])
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
+def _member_passes(out):
+    """Per-member KEEP predicate.
+
+    A member is kept iff its primitive success checks all passed AND the episode
+    actually reached the goal one of two ways:
+
+      member passes  iff  out['all_success']  AND  (env_success(info) OR completed)
+
+    WHY env-success OR completed (not ``completed`` alone): the LiftBarrier env
+    AUTO-TERMINATES the moment the barrier clears z>0.15 (~step 69) — BEFORE the
+    per-arm primitive queues empty — so ``completed`` is False even on a successful
+    lift. Requiring ``completed`` alone therefore wrongly dropped EVERY success.
+    We accept env-success OR completed instead:
+      * grasp+lift families: the env terminates on the barrier lift -> env_success
+        True (the lift's own check_barrier_lifted may not even have RUN before the
+        early terminate, which is fine — env_success confirms the lift). approach
+        checks always run, so ``all_success`` has len(checked)>0 and reflects them.
+      * approach_stop (no lift, never reaches env-success): kept via completed=True
+        plus its approach checks (check_tcp_near) -> all_success True.
+      * a genuinely FAILED lift: the barrier is not raised, the env never reaches
+        success, the program runs to completion, the lift's check_barrier_lifted RAN
+        and returned False -> all_success False -> dropped.
+    """
+    if out is None:
+        return False
+    if not out.get("all_success", False):
+        return False
+    return _env_success(out.get("info")) or out.get("completed", False)
+
+
 def _group_all_passed(results):
-    """Every member of a contrast group must have: a clean run, completed queues,
-    and all_success True (every primitive with a success_check passed)."""
+    """Every member of a contrast group must pass ``_member_passes`` (a clean run
+    plus the env-success-or-completed keep criterion). One failure -> drop the
+    whole matched group atomically (keeps the contrast balanced)."""
     for rec, out in results:
         if rec is None or out is None:
             return False
-        if not out.get("completed", False):
-            return False
-        if not out.get("all_success", False):
+        if not _member_passes(out):
             return False
     return True
 
@@ -308,13 +356,14 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                 pending = []  # [(episode_id, recorder, T)]
                 for spec in members:
                     rec, out = _run_one_variant(env, spec, max_steps, boundary_hook)
-                    # Re-run must reproduce BOTH a clean finish (completed: all
-                    # queues emptied before max_steps) AND all_success. A variant
-                    # that times out/truncates but happens to have all_success=True
-                    # (some primitives lack checks) must NOT be kept -> mislabelled.
-                    if (rec is None or out is None
-                            or not out.get("all_success", False)
-                            or not out.get("completed", False)):
+                    # Re-run must reproduce the SAME keep criterion as the probe:
+                    # all_success AND (env-success OR completed). The LiftBarrier env
+                    # auto-terminates on the barrier lift BEFORE the queues empty, so
+                    # ``completed`` alone would wrongly drop a real success; env_success
+                    # confirms the lift. approach_stop (no lift) is kept via completed.
+                    # A failed lift (no env-success, completed, lift check ran False)
+                    # has all_success False -> dropped. See _member_passes.
+                    if rec is None or not _member_passes(out):
                         group_ok = False
                         try:
                             env.flush_trajectory(save=False)

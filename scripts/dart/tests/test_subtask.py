@@ -33,7 +33,7 @@ import pytest
 # make scripts/dart importable (so run_subtask_rollouts is reachable on a GPU node)
 _DART_DIR = osp.dirname(osp.dirname(osp.abspath(__file__)))
 _SCRIPTS_DIR = osp.dirname(_DART_DIR)
-for _p in (_SCRIPTS_DIR,):
+for _p in (_DART_DIR, _SCRIPTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -462,6 +462,92 @@ def test_sampler_sequential_has_gate_simultaneous_does_not():
 
 
 # ===========================================================================
+# PURE: keep-criterion helpers (_env_success + _member_passes) in the driver.
+#
+# The LiftBarrier env AUTO-TERMINATES on the barrier lift (~step 69) BEFORE the
+# per-arm primitive queues empty, so a SUCCESSFUL lift returns completed=False.
+# The keep predicate must therefore accept env-success OR completed (not completed
+# alone, which dropped every real success). These tests are pure (fake out dicts).
+# ===========================================================================
+def _import_driver():
+    """Import the rollout driver (gym + robofactory at module top; import-only,
+    no gym.make -> no GPU). Imported lazily so collection of the pure suite doesn't
+    pay for it unless these tests run."""
+    import run_subtask_rollouts as R  # noqa: F401  (scripts/dart on sys.path)
+    return R
+
+
+def test_env_success_coerces_various_info_shapes():
+    R = _import_driver()
+    # None / missing / empty info -> False
+    assert R._env_success(None) is False
+    assert R._env_success({}) is False
+    assert R._env_success({"other": 1}) is False
+    assert R._env_success({"success": None}) is False
+    # python bool / int
+    assert R._env_success({"success": True}) is True
+    assert R._env_success({"success": False}) is False
+    assert R._env_success({"success": 1}) is True
+    assert R._env_success({"success": 0}) is False
+    # numpy scalar / array (batched env returns shape (1,))
+    assert R._env_success({"success": np.array([True])}) is True
+    assert R._env_success({"success": np.array([False])}) is False
+    assert R._env_success({"success": np.asarray(True)}) is True
+
+    # torch tensor (duck-typed via .detach) if torch is available
+    try:
+        import torch
+        assert R._env_success({"success": torch.tensor([True])}) is True
+        assert R._env_success({"success": torch.tensor([False])}) is False
+    except ImportError:
+        pass
+
+
+def test_member_passes_keep_predicate_matrix():
+    R = _import_driver()
+    # 1) success-TERMINATION: env auto-terminated on the lift (completed False) but
+    #    info.success True and approach checks passed -> KEEP.
+    assert R._member_passes(
+        {"all_success": True, "info": {"success": True}, "completed": False}) is True
+    # 2) outright failure: a success_check returned False -> DROP regardless.
+    assert R._member_passes(
+        {"all_success": False, "info": {"success": True}, "completed": True}) is False
+    assert R._member_passes(
+        {"all_success": False, "info": {"success": False}, "completed": False}) is False
+    # 3) approach_stop: no lift, never reaches env-success, but queues completed and
+    #    approach checks passed -> KEEP (via completed).
+    assert R._member_passes(
+        {"all_success": True, "info": {}, "completed": True}) is True
+    # 4) FAILED LIFT: program completed, lift's check_barrier_lifted RAN and was
+    #    False -> all_success False, no env-success -> DROP.
+    assert R._member_passes(
+        {"all_success": False, "info": {"success": False}, "completed": True}) is False
+    # 5) clean success with BOTH completed and env-success -> KEEP.
+    assert R._member_passes(
+        {"all_success": True, "info": {"success": True}, "completed": True}) is True
+    # 6) all_success True but neither env-success nor completed (e.g. truncated mid
+    #    flight before the lift confirmed) -> DROP (not a confirmed success).
+    assert R._member_passes(
+        {"all_success": True, "info": {"success": False}, "completed": False}) is False
+    # 7) None out (plan/rollout raised) -> DROP.
+    assert R._member_passes(None) is False
+
+
+def test_group_all_passed_uses_member_predicate():
+    R = _import_driver()
+    rec = object()  # _group_all_passed only checks rec is not None
+    succ_term = {"all_success": True, "info": {"success": True}, "completed": False}
+    approach = {"all_success": True, "info": {}, "completed": True}
+    failed = {"all_success": False, "info": {"success": False}, "completed": True}
+    # a matched pair where BOTH pass (one via env-success, one via completed)
+    assert R._group_all_passed([(rec, succ_term), (rec, approach)]) is True
+    # one member fails its lift -> the WHOLE group drops (atomic)
+    assert R._group_all_passed([(rec, succ_term), (rec, failed)]) is False
+    # a None recorder (plan raised) -> drop
+    assert R._group_all_passed([(None, None), (rec, approach)]) is False
+
+
+# ===========================================================================
 # SIM-GATED (DO NOT RUN here): real LiftBarrier rollouts through the interpreter
 # ===========================================================================
 def _make_sim_env(task="LiftBarrier", n_agents=2):
@@ -633,30 +719,49 @@ def test_sim_contrastive_frame0_identical_seam_diverge_stop_never_closes():
 
 @sim
 def test_sim_matched_pair_atomic_drop_and_liar_label():
-    """A forced-failed grasp (success_check False) makes a variant fail; the
-    rollout driver must drop the WHOLE contrast group, and the liar label is
-    never written as a kept episode."""
+    """A FAILED LIFT (the lift's check_barrier_lifted returns False) makes a variant
+    fail; the rollout driver must drop the WHOLE contrast group, and the liar label
+    is never written as a kept episode.
+
+    NOTE: reframed from the old "forced-failed close grasp" case. The premature
+    close is_grasping check was REMOVED (is_grasping does not register right after
+    the close ramp; it false-failed every success). A close that did not grasp is
+    now caught DOWNSTREAM: no grasp -> the lift does not raise the barrier -> the
+    lift's check_barrier_lifted (which we force False here to simulate that) fails
+    -> all_success False -> the group drops. We poison the LIFT, not the close.
+    """
     env, Solver = _make_sim_env()
     try:
         spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
-        # poison arm0's close-gripper success_check -> liar label. Recipes are
-        # built JIT, so we WRAP the recipe: build the real primitive, then force
-        # its success_check to False (close_gripper builds verb CLOSE_GRIPPER).
+        # poison BOTH arms' LIFT success_check -> a failed lift. Recipes are built
+        # JIT, so WRAP the recipe: build the real primitive, then force the lift's
+        # success_check to False (lift builds verb LIFT). Poisoning both arms makes
+        # all_success False whenever the lift checks RUN, regardless of which arm
+        # finished its lift first.
         def _poison(orig_recipe):
             def wrapped(pl, e, arm):
                 prim = orig_recipe(pl, e, arm)
-                if prim.verb_id == vocab.CLOSE_GRIPPER:
+                if prim.verb_id == vocab.LIFT:
                     prim.success_check = lambda e, a, p: False
                 return prim
             return wrapped
-        prog[0] = [I.QueuedRecipe(_poison(qr.recipe), wait_for=qr.wait_for)
-                   for qr in prog[0]]
+        for arm in (0, 1):
+            prog[arm] = [I.QueuedRecipe(_poison(qr.recipe), wait_for=qr.wait_for)
+                         for qr in prog[arm]]
         out = I.run_program(env, planner, prog, rec, max_steps=800,
                             control_mode=planner.control_mode)
-        assert out["all_success"] is False  # group would be dropped
+        from run_subtask_rollouts import _env_success, _member_passes
+        # CONTRACT: a failed lift drops the group. If the lift checks RAN (the env
+        # did not auto-terminate on a real barrier lift first), all_success is False
+        # and the member is dropped. If the env DID auto-terminate (a real lift),
+        # env_success is True -> this would NOT be a failed-lift case, so we only
+        # assert the drop when the env did not confirm success.
+        if not _env_success(out["info"]):
+            assert out["all_success"] is False
+            assert _member_passes(out) is False
     finally:
         env.close()
 

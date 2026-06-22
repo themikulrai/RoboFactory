@@ -56,7 +56,6 @@ from . import subtask_vocab as vocab
 from . import subtask_primitives as P
 from .subtask_interpreter import (
     QueuedRecipe,
-    check_is_grasping,
     check_tcp_near,
     check_barrier_lifted,
 )
@@ -123,10 +122,15 @@ def _approach_qp(target_id: int, *, grip: float,
 
 
 def _close_qp(target_id: int) -> QueuedRecipe:
+    # NO success_check on close: is_grasping does NOT register immediately after the
+    # close ramp (the grasp seats during the subsequent lift; even the canonical
+    # solveLiftBarrier shows is_grasping=False right after its own close). A close
+    # that did not actually grasp is caught DOWNSTREAM: no grasp -> the lift never
+    # raises the barrier -> the env never reaches success -> the group is dropped.
+    # So we DROP the premature check_is_grasping here (it false-failed every success).
     def recipe(planner, env, arm: int) -> P.Primitive:
-        sc = check_is_grasping("barrier")
         return P.close_gripper(planner, env, arm=arm, task=LB, start_grip=P.OPEN,
-                               target_id=target_id, success_check=sc)
+                               target_id=target_id, success_check=None)
     return QueuedRecipe(recipe)
 
 

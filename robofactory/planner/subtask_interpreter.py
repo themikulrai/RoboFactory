@@ -66,12 +66,17 @@ PrimitiveRecipe = Callable[[object, object, int], Primitive]
 
 # Verbs whose label is a CLAIM about a spatial/grasp outcome and therefore MUST
 # carry a success_check, or a failed primitive silently mislabels the data (the
-# liar-label loophole): "close_gripper that did not grasp" must be droppable.
+# liar-label loophole). CLOSE_GRIPPER is NOT in this set: is_grasping does not
+# register immediately after the close ramp (the grasp seats during the subsequent
+# lift; even the canonical solveLiftBarrier shows is_grasping=False right after its
+# own close), so checking it right after the close is PREMATURE and false-fails on
+# success. A close that did not grasp is caught DOWNSTREAM (no grasp -> the lift
+# never reaches env success -> the group is dropped), so close needs no own check.
 # wait/open_gripper have no spatial claim to verify (open just releases), so they
-# are exempt. ``run_program`` lints the program against this set (warning by
+# are exempt too. ``run_program`` lints the program against this set (warning by
 # default; raise with check_success_coverage="error").
 VERBS_REQUIRING_SUCCESS_CHECK = frozenset(
-    {vocab.APPROACH, vocab.CLOSE_GRIPPER, vocab.LIFT, vocab.PLACE}
+    {vocab.APPROACH, vocab.LIFT, vocab.PLACE}
 )
 
 # A per-primitive gate: advance this primitive only once predicate(env, state)
@@ -572,8 +577,9 @@ def _lint_success_coverage(programs: Dict[int, List[QueuedRecipe]], planner, env
         "run_program: these primitives claim a spatial/grasp outcome but have NO "
         "success_check, so a failed primitive would be mislabelled (liar-label "
         f"loophole): {offenders}. Attach a success_check (approach->check_tcp_near, "
-        "close_gripper->check_is_grasping, lift->check_*_lifted, place->placed) or "
-        "pass check_success_coverage='off' if this is intentional."
+        "lift->check_*_lifted, place->placed) or pass check_success_coverage='off' "
+        "if this is intentional. (close_gripper is exempt: is_grasping is premature "
+        "right after the close ramp; a non-grasp is caught downstream by the lift.)"
     )
     if mode == "error":
         raise ValueError(msg)
