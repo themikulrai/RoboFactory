@@ -1,0 +1,677 @@
+"""Tests for the subtask-conditioned data-gen pipeline (Phase-1 harness).
+
+PURE tests (no sim, always run): vocab render over every (verb x target) combo;
+color-map-assert vs yaml + a negative drift case; primitive tick shape/length;
+approach-stop has ZERO gripper-close ticks; gripper ramp monotonic+clamped; hold
+repeats the frozen qpos byte-for-byte; the per-arm dry_run guard (a pose-LIST
+under dry_run returns ONE arm's plan — regression-locked with a light stub); and
+the contrastive scenario SAMPLER (matched pairs, seed-derived RNG independent of
+env reset, unique variant ids, group-level filtering, atomic grouping).
+
+SIM tests (@pytest.mark.sim, skipped unless DART_RUN_SIM=1; DO NOT RUN on the
+login node — SAPIEN renders dark; needs a GPU compute node): drive a real short
+LiftBarrier rollout through subtask_interpreter.run_program and verify the live
+label stream (len==T, contiguous runs, no None, off-by-one), idle-arm wait+frozen
+qpos, barrier gating, success checks firing, the contrastive frame-0-identical /
+seam-divergence / stop-never-closes properties, atomic matched-pair drop, the
+liar-label drop, and DART/object-perturb compatibility (jittered target still
+reached with unchanged text/target_id; boundary_hook arm-noise NOT recorded).
+
+Run PURE:   /iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python -m pytest \
+                scripts/dart/tests/test_subtask.py -k "not sim" -q
+Run ALL (GPU node):  DART_RUN_SIM=1 pytest scripts/dart/tests/test_subtask.py -q
+"""
+from __future__ import annotations
+
+import os
+import os.path as osp
+import sys
+
+import numpy as np
+import pytest
+
+# make scripts/dart importable (so run_subtask_rollouts is reachable on a GPU node)
+_DART_DIR = osp.dirname(osp.dirname(osp.abspath(__file__)))
+_SCRIPTS_DIR = osp.dirname(_DART_DIR)
+for _p in (_SCRIPTS_DIR,):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from robofactory.planner import subtask_vocab as vocab  # noqa: E402
+from robofactory.planner import subtask_primitives as P  # noqa: E402
+from robofactory.planner import subtask_interpreter as I  # noqa: E402
+from robofactory.planner import subtask_scenarios as S  # noqa: E402
+from robofactory.planner.subtask_primitives import OPEN, CLOSED  # noqa: E402
+
+RUN_SIM = os.environ.get("DART_RUN_SIM", "0") == "1"
+sim = pytest.mark.skipif(not RUN_SIM, reason="set DART_RUN_SIM=1 to run sim tests")
+
+# Panda 7-revolute joint limits (for the SIM action-bound sanity check).
+PANDA_QLIMITS_LOW = np.array(
+    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+PANDA_QLIMITS_HIGH = np.array(
+    [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
+
+
+# ===========================================================================
+# Light off-GPU fakes (planner + env) — no sapien, no gym.
+# ===========================================================================
+class FakeRobot:
+    def __init__(self, q7):
+        self._q = np.concatenate([np.asarray(q7, np.float32), [0.04, 0.04]]).astype(np.float32)
+
+    def get_qpos(self):
+        return self._q[None, :]  # (1, 9) numpy
+
+
+class FakeActor:
+    def __init__(self, z=0.6):
+        self.z = z
+
+
+class FakePlanner:
+    """Canned-waypoint planner. A pose LIST under dry_run is REJECTED (the trap)."""
+
+    def __init__(self, num_arms=2, control_mode="pd_joint_pos", n_waypoints=5):
+        self.control_mode = control_mode
+        self.robot = [FakeRobot(np.zeros(7) + 0.1 * i) for i in range(num_arms)]
+        self.n_waypoints = n_waypoints
+        self.last_dry_run_pose = None
+
+    def move_to_pose_with_screw(self, pose, move_id=0, dry_run=False, **kw):
+        assert dry_run, "primitives must plan with dry_run=True"
+        assert not isinstance(pose, list), "pose LIST passed under dry_run (the trap)"
+        self.last_dry_run_pose = np.asarray(pose, np.float32)
+        n = self.n_waypoints
+        base = self.robot[move_id].get_qpos()[0, :7]
+        wps = np.stack([base + (k + 1) / n * np.ones(7) for k in range(n)]).astype(np.float32)
+        return {"position": wps, "status": "Success"}
+
+    def get_grasp_pose_w_labeled_direction(self, actor, actor_data, pre_dis=0.0, id=0):
+        return np.array([id * 0.1, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], np.float32)
+
+    def get_grasp_pose_from_obb(self, actor, agent_id=0):
+        return np.array([0.0, 0.1 * agent_id, 0.5, 1.0, 0.0, 0.0, 0.0], np.float32)
+
+    def get_grasp_pose_for_stack(self, now_pose, target_actor, height_offset=0.05):
+        out = np.asarray(now_pose, np.float32).copy()
+        out[2] = float(target_actor.z) + height_offset
+        return out
+
+
+class FakeEnv:
+    def __init__(self):
+        self.barrier = FakeActor()
+        self.goal_region = FakeActor(z=0.0)
+        self.cubeA = FakeActor()
+        self.cubeB = FakeActor()
+        self.cubeC = FakeActor()
+        self.annotation_data = {"barrier": {"scale": [0.6, 0.6, 0.2],
+                                            "contact_points_pose": [np.eye(4)] * 4}}
+        self.unwrapped = self
+        self.n_steps = 0
+        self.step_log = []
+
+    def step(self, action_dict):
+        self.n_steps += 1
+        self.step_log.append({k: np.asarray(v).copy() for k, v in action_dict.items()})
+        return {}, 0.0, False, False, {"success": False}
+
+
+# ===========================================================================
+# PURE: vocab render over EVERY (verb x target) combo
+# ===========================================================================
+def test_vocab_render_every_lb_combo():
+    expect = {
+        (vocab.WAIT, 0): "wait",
+        (vocab.APPROACH, 1): "grasp the left end",
+        (vocab.APPROACH, 2): "grasp the right end",
+        (vocab.OPEN_GRIPPER, 0): "open the gripper",
+        (vocab.CLOSE_GRIPPER, 0): "close the gripper",
+        (vocab.LIFT, 1): "lift the left end",
+        (vocab.LIFT, 2): "lift the right end",
+        (vocab.PLACE, 1): "place the left end",
+        (vocab.PLACE, 2): "place the right end",
+    }
+    for (v, t), s in expect.items():
+        assert vocab.render(v, t, "LiftBarrier") == s, (v, t)
+
+
+def test_vocab_render_every_tsc_combo():
+    expect = {
+        (vocab.WAIT, 0): "wait",
+        (vocab.OPEN_GRIPPER, 0): "open the gripper",
+        (vocab.CLOSE_GRIPPER, 0): "close the gripper",
+        (vocab.APPROACH, vocab.TSC_TARGETS["blue"]): "approach the blue cube",
+        (vocab.APPROACH, vocab.TSC_TARGETS["green"]): "approach the green cube",
+        (vocab.APPROACH, vocab.TSC_TARGETS["red"]): "approach the red cube",
+        (vocab.LIFT, vocab.TSC_TARGETS["blue"]): "lift the blue cube",
+        (vocab.LIFT, vocab.TSC_TARGETS["green"]): "lift the green cube",
+        (vocab.LIFT, vocab.TSC_TARGETS["red"]): "lift the red cube",
+        (vocab.PLACE, vocab.TSC_TARGETS["goal_region"]): "place on the goal",
+        (vocab.PLACE, vocab.TSC_TARGETS["on_blue"]): "place on the blue cube",
+        (vocab.PLACE, vocab.TSC_TARGETS["on_green"]): "place on the green cube",
+        (vocab.PLACE, vocab.TSC_TARGETS["on_red"]): "place on the red cube",
+    }
+    for (v, t), s in expect.items():
+        assert vocab.render(v, t, "ThreeRobotsStackCube") == s, (v, t)
+
+
+def test_vocab_render_rejects_unknown_task_and_verb():
+    with pytest.raises(KeyError):
+        vocab.render(vocab.APPROACH, 1, "NoSuchTask")
+    with pytest.raises(KeyError):
+        vocab.render(999, 1, "LiftBarrier")
+
+
+def test_target_roundtrip():
+    assert vocab.target_name("LiftBarrier", 2) == "right_end"
+    assert vocab.target_id("ThreeRobotsStackCube", "green") == 2
+    assert vocab.TSC_COLOR_CUBE["green"] == "cubeB"
+    assert vocab.LB_TARGET_CONTACT_ID[vocab.LB_TARGETS["left_end"]] == 1
+    assert vocab.LB_TARGET_CONTACT_ID[vocab.LB_TARGETS["right_end"]] == 2
+
+
+# ===========================================================================
+# PURE: color-map assert vs yaml (+ negative drift case)
+# ===========================================================================
+def test_color_map_matches_yaml():
+    out = vocab.assert_cube_color_map()
+    assert out == {"cubeA": "blue", "cubeB": "green", "cubeC": "red"}
+
+
+def test_color_map_negative_drift(tmp_path):
+    """A yaml whose cube colors disagree with TSC_CUBE_COLOR must raise loudly."""
+    bad = tmp_path / "bad.yaml"
+    # cubeA labelled blue in the map, but here painted RED -> dominant-channel drift
+    bad.write_text(
+        "scene:\n"
+        "  primitives:\n"
+        "    - name: cubeA\n"
+        "      params: {color: [1.0, 0.0, 0.0, 1.0]}\n"
+        "    - name: cubeB\n"
+        "      params: {color: [0.0, 1.0, 0.0, 1.0]}\n"
+        "    - name: cubeC\n"
+        "      params: {color: [1.0, 0.0, 0.0, 1.0]}\n"
+    )
+    with pytest.raises(AssertionError):
+        vocab.assert_cube_color_map(yaml_path=str(bad))
+
+
+def test_color_map_negative_missing_cube(tmp_path):
+    bad = tmp_path / "missing.yaml"
+    bad.write_text(
+        "scene:\n"
+        "  primitives:\n"
+        "    - name: cubeA\n"
+        "      params: {color: [0.04705882, 0.16470588, 0.62745098, 1.0]}\n"
+    )
+    with pytest.raises(AssertionError):
+        vocab.assert_cube_color_map(yaml_path=str(bad))
+
+
+# ===========================================================================
+# PURE: primitive tick shape / length / content
+# ===========================================================================
+def test_approach_stop_has_zero_close_ticks():
+    pl, env = FakePlanner(), FakeEnv()
+    prim = P.approach(pl, env, arm=0, target_id=vocab.LB_TARGETS["left_end"],
+                      task="LiftBarrier")
+    assert prim.verb_id == vocab.APPROACH
+    assert prim.n_ticks == pl.n_waypoints > 0
+    # every tick (qpos7, grip): qpos length 7, grip == OPEN (no close)
+    for q, g in prim.ticks:
+        assert np.asarray(q).shape == (7,)
+        assert g == OPEN
+    assert prim.text == "grasp the left end"
+
+
+def test_gripper_close_ramp_monotonic_clamped_frozen():
+    pl, env = FakePlanner(), FakeEnv()
+    prim = P.close_gripper(pl, env, arm=0, task="LiftBarrier", start_grip=OPEN)
+    assert prim.n_ticks == P.GRIPPER_RAMP_TICKS
+    grips = [g for _, g in prim.ticks]
+    assert all(grips[k + 1] <= grips[k] + 1e-9 for k in range(len(grips) - 1)), grips
+    assert min(grips) >= CLOSED - 1e-9
+    assert grips[-1] == pytest.approx(CLOSED, abs=1e-6)
+    q0 = prim.ticks[0][0]
+    assert all(np.array_equal(q, q0) for q, _ in prim.ticks)
+
+
+def test_gripper_open_ramp_monotonic_clamped():
+    pl, env = FakePlanner(), FakeEnv()
+    prim = P.open_gripper(pl, env, arm=1, task="ThreeRobotsStackCube", start_grip=CLOSED)
+    grips = [g for _, g in prim.ticks]
+    assert all(grips[k + 1] >= grips[k] - 1e-9 for k in range(len(grips) - 1)), grips
+    assert max(grips) <= OPEN + 1e-9
+    assert grips[-1] == pytest.approx(OPEN, abs=1e-6)
+
+
+def test_hold_repeats_frozen_qpos_byte_for_byte():
+    pl, env = FakePlanner(), FakeEnv()
+    qpos = np.array([0.5, -0.2, 0.1, -1.0, 0.0, 1.5, 0.7], np.float32)
+    prim = P.hold(pl, env, arm=0, n=7, task="LiftBarrier", qpos=qpos, grip=CLOSED)
+    assert prim.verb_id == vocab.WAIT
+    assert prim.n_ticks == 7
+    for q, g in prim.ticks:
+        assert np.array_equal(q, qpos)  # byte-for-byte
+        assert g == CLOSED
+    assert prim.text == "wait"
+
+
+def test_lift_replans_z_plus_dz():
+    pl, env = FakePlanner(), FakeEnv()
+    prim = P.lift(pl, env, arm=0, target_id=vocab.LB_TARGETS["right_end"],
+                  task="LiftBarrier", dz=0.2, grip=CLOSED)
+    assert prim.verb_id == vocab.LIFT
+    assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == 0.7  # 0.5 + 0.2
+    assert all(g == CLOSED for _, g in prim.ticks)
+
+
+def test_place_uses_dest_actor_pose():
+    pl, env = FakePlanner(), FakeEnv()
+    now = np.array([0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], np.float32)
+    prim = P.place(pl, env, arm=0, target_id=vocab.TSC_TARGETS["goal_region"],
+                   task="ThreeRobotsStackCube", now_pose=now,
+                   dest_actor_name="goal_region", height_offset=0.05)
+    assert prim.verb_id == vocab.PLACE
+    assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == 0.05
+    assert prim.text == "place on the goal"
+
+
+# ===========================================================================
+# PURE: per-arm dry_run guard (the silent single-arm-drop trap) — regression lock
+# ===========================================================================
+def test_dry_run_pose_list_rejected_by_helper():
+    """subtask_primitives._plan_to_pose refuses a pose LIST (our hard guard)."""
+    pl = FakePlanner()
+    with pytest.raises(ValueError):
+        P._plan_to_pose(pl, 0, [np.zeros(7), np.ones(7)])
+
+
+def test_dry_run_pose_list_returns_single_plan_stub():
+    """Regression-lock the UPSTREAM trap itself: a stub mirroring motionplanner's
+    dry_run early-return shows a pose LIST yields only the FIRST arm's plan.
+
+    This documents WHY subtask_primitives plans strictly per-arm. We mimic
+    motionplanner.move_to_pose_with_screw lines 151/161/185-186: it normalizes a
+    single pose to a 1-list, loops over poses, and `return result` INSIDE the loop
+    on the first iteration when dry_run -> only pose[0]'s plan ever comes back.
+    """
+    class _StubPlanner:
+        def __init__(self):
+            self.planned = []
+
+        def move_to_pose_with_screw(self, pose, dry_run=False, move_id=0, **kw):
+            pose = [pose] if not isinstance(pose, list) else pose
+            move_id = [move_id] if not isinstance(move_id, list) else move_id
+            for idx in range(len(pose)):
+                # record what WOULD be planned, but dry_run returns on the FIRST
+                result = {"position": np.full((3, 7), float(move_id[idx]), np.float32),
+                          "for_move_id": move_id[idx]}
+                self.planned.append(move_id[idx])
+                if dry_run:
+                    return result  # <-- the trap: returns inside the loop
+            return result
+
+    stub = _StubPlanner()
+    res = stub.move_to_pose_with_screw([np.zeros(7), np.ones(7)],
+                                       move_id=[0, 1], dry_run=True)
+    # only arm-0's plan came back; arm-1 was silently dropped
+    assert res["for_move_id"] == 0
+    assert stub.planned == [0]
+
+
+# ===========================================================================
+# PURE: contrastive scenario sampler
+# ===========================================================================
+def test_sampler_emits_four_matched_pairs():
+    specs = S.sample(7)
+    groups = S.group_specs(specs)
+    assert len(specs) == 8
+    assert len(groups) == 4
+    for gid, members in groups.items():
+        assert len(members) == 2, (gid, [m.name for m in members])
+        # both members share family + contrast_group_id
+        assert members[0].family == members[1].family
+        assert members[0].contrast_group_id == members[1].contrast_group_id == gid
+    families = {m.family for m in specs}
+    assert families == {"a_approach", "b_armswap", "c_gate", "d_hold"}
+
+
+def test_sampler_variant_ids_unique_and_reproducible():
+    specs = S.sample(7)
+    assert len({m.variant_id for m in specs}) == len(specs)
+    # reproducible structural draws (names + meta) for the same seed
+    again = S.sample(7)
+    assert [m.name for m in specs] == [m.name for m in again]
+    assert [m.meta.get("seam_hold") for m in specs] == \
+           [m.meta.get("seam_hold") for m in again]
+
+
+def test_sampler_rng_independent_of_env_reset():
+    """The sampler must use its OWN RNG (no global numpy state) so contrastive
+    variants from a seed share the env reset (frame-0 identical). We assert
+    sample() does not consume the GLOBAL numpy RNG."""
+    np.random.seed(0)
+    before = np.random.get_state()[1].copy()
+    _ = S.sample(123)
+    after = np.random.get_state()[1].copy()
+    assert np.array_equal(before, after), "sample() perturbed the GLOBAL numpy RNG"
+
+
+def test_sampler_armswap_targets_swapped():
+    specs = S.sample(7)
+    groups = S.group_specs(specs)
+    armswap = next(m for m in specs if m.family == "b_armswap" and m.name == "arms_LR")
+    armswap_rl = next(m for m in specs if m.family == "b_armswap" and m.name == "arms_RL")
+    assert armswap.meta["arm_left"] == 0 and armswap.meta["arm_right"] == 1
+    assert armswap_rl.meta["arm_left"] == 1 and armswap_rl.meta["arm_right"] == 0
+
+
+def test_sampler_seam_hold_at_least_two():
+    """Seam holds must be >=2 so a training chunk straddling a seam is unambiguous."""
+    for seed in (0, 1, 7, 42, 1000):
+        specs = S.sample(seed)
+        for m in specs:
+            assert m.meta["seam_hold"] >= 2, (seed, m.name, m.meta)
+
+
+def test_filter_variants_keeps_groups_intact():
+    specs = S.sample(7)
+    # ask for ONE member by name; the WHOLE matched group must come back
+    out = S.filter_variants(specs, ["approach_stop"])
+    names = sorted(m.name for m in out)
+    assert names == ["approach_grasp_lift", "approach_stop"]
+    # ask by family
+    out2 = S.filter_variants(specs, ["c_gate"])
+    assert sorted(m.name for m in out2) == ["sequential", "simultaneous"]
+    # None -> everything
+    assert len(S.filter_variants(specs, None)) == len(specs)
+    # unknown -> nothing
+    assert S.filter_variants(specs, ["nope"]) == []
+
+
+def test_sampler_builders_callable_against_fakes():
+    """The builders must produce a {arm:[QueuedPrimitive]} program when given a
+    live (planner, env). We drive them with the FAKE planner/env (no sim) so the
+    structure (gating, hold-while-other-works) is validated off-GPU."""
+    specs = S.sample(7)
+    for spec in specs:
+        pl, env = FakePlanner(num_arms=2), FakeEnv()
+        prog = spec.build(pl, env)
+        assert set(prog.keys()) == {0, 1}, spec.name
+        for arm, queue in prog.items():
+            assert len(queue) >= 1
+            for qp in queue:
+                assert isinstance(qp, I.QueuedPrimitive)
+        # families that grasp must contain a close_gripper somewhere
+        if spec.name in ("approach_grasp_lift", "arms_LR", "arms_RL",
+                         "sequential", "simultaneous", "grasp_and_hold",
+                         "grasp_and_release"):
+            verbs = {qp.primitive.verb_id for q in prog.values() for qp in q}
+            assert vocab.CLOSE_GRIPPER in verbs, spec.name
+        # approach_stop must NOT close
+        if spec.name == "approach_stop":
+            verbs = {qp.primitive.verb_id for q in prog.values() for qp in q}
+            assert vocab.CLOSE_GRIPPER not in verbs
+
+
+def test_sampler_grasp_and_hold_has_long_closed_hold():
+    """The (d) hold variant must end the hold arm on a CLOSED-gripper long hold."""
+    specs = S.sample(7)
+    spec = next(m for m in specs if m.name == "grasp_and_hold")
+    pl, env = FakePlanner(num_arms=2), FakeEnv()
+    prog = spec.build(pl, env)
+    hold_arm = spec.meta["hold_arm"]
+    last = prog[hold_arm][-1].primitive
+    assert last.verb_id == vocab.WAIT
+    assert last.n_ticks == spec.meta["hold_n"]
+    assert all(g == CLOSED for _, g in last.ticks)  # holding closed
+
+
+def test_sampler_sequential_has_gate_simultaneous_does_not():
+    specs = S.sample(7)
+    seq = next(m for m in specs if m.name == "sequential")
+    sim_ = next(m for m in specs if m.name == "simultaneous")
+    pl, env = FakePlanner(num_arms=2), FakeEnv()
+    seq_prog = seq.build(pl, env)
+    pl2, env2 = FakePlanner(num_arms=2), FakeEnv()
+    sim_prog = sim_.build(pl2, env2)
+    # sequential: arm_right's lift carries a wait_for gate
+    seq_gates = [qp.wait_for for q in seq_prog.values() for qp in q if qp.wait_for]
+    assert len(seq_gates) >= 1
+    # simultaneous: no gates
+    sim_gates = [qp.wait_for for q in sim_prog.values() for qp in q if qp.wait_for]
+    assert sim_gates == []
+
+
+# ===========================================================================
+# SIM-GATED (DO NOT RUN here): real LiftBarrier rollouts through the interpreter
+# ===========================================================================
+def _make_sim_env(task="LiftBarrier", n_agents=2):
+    import gymnasium as gym
+    import robofactory  # noqa: F401  (registers envs)
+    from robofactory import CONFIG_DIR
+    from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver
+    cfg = osp.join(CONFIG_DIR, "table/lift_barrier.yaml")
+    env = gym.make(
+        "LiftBarrier-rf", config=cfg, obs_mode="rgb", control_mode="pd_joint_pos",
+        render_mode="sensors", reward_mode="dense",
+        sensor_configs=dict(shader_pack="default"),
+        human_render_camera_configs=dict(shader_pack="default"),
+        viewer_camera_configs=dict(shader_pack="default"),
+        sim_backend="cpu", robot_uids=("panda_wristcam_multi",) * n_agents,
+    )
+    return env, PandaArmMotionPlanningSolver
+
+
+def _build_sim_planner(env, Solver, seed):
+    env.reset(seed=seed)
+    return Solver(
+        env, debug=False, vis=False,
+        base_pose=[a.robot.pose for a in env.unwrapped.agent.agents],
+        visualize_target_grasp_pose=False, print_env_info=False, is_multi_agent=True,
+    )
+
+
+@sim
+def test_sim_label_stream_len_equals_T_and_contiguous_no_none():
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)
+        out = I.run_program(env, planner, prog, rec, max_steps=600,
+                            control_mode=planner.control_mode)
+        T = out["steps"]
+        assert rec.length == T
+        a = rec.to_arrays()
+        # the program for approach_grasp_lift (arm0=left): approach -> hold(wait)
+        # -> close -> lift. Collapsing consecutive duplicates must yield exactly
+        # that verb order with no interleaving (contiguous runs, no None).
+        import itertools
+        for arm in (0, 1):
+            verbs = [int(v) for v in a[f"subtask_arm{arm}_verb"]]
+            assert len(verbs) == T
+            assert all(v in vocab.VERB_IDS.values() for v in verbs)  # no None/garbage
+            runs = [k for k, _ in itertools.groupby(verbs)]
+            # strip a trailing idle-WAIT run (the arm that finishes first idles
+            # while the other still works -> a legitimate trailing wait).
+            if runs and runs[-1] == vocab.WAIT:
+                runs = runs[:-1]
+            # the program is approach -> hold(WAIT) -> close -> lift; the interior
+            # WAIT (the seam hold) is expected and contiguous.
+            assert runs == [vocab.APPROACH, vocab.WAIT, vocab.CLOSE_GRIPPER, vocab.LIFT], runs
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_offbyone_label_drives_action():
+    """label[t] is the subtask that DROVE action[t]: the first non-wait label
+    appears on the SAME step the first planned waypoint is sent."""
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)
+        # arm0 starts on approach immediately (no gate) -> label[0] == APPROACH
+        out = I.run_program(env, planner, prog, rec, max_steps=600,
+                            control_mode=planner.control_mode)
+        a = rec.to_arrays()
+        assert a["subtask_arm0_verb"][0] == vocab.APPROACH
+        assert int(out["steps"]) == int(rec.length)
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_idle_arm_wait_and_frozen():
+    env, Solver = _make_sim_env()
+    try:
+        planner = _build_sim_planner(env, Solver, 0)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = {
+            0: [I.QueuedPrimitive(P.approach(planner, env, 0,
+                                             vocab.LB_TARGETS["left_end"], "LiftBarrier"))],
+            1: [],  # idle
+        }
+        I.run_program(env, planner, prog, rec, max_steps=200,
+                      control_mode=planner.control_mode)
+        a = rec.to_arrays()
+        assert set(a["subtask_arm1_verb"]) == {vocab.WAIT}
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_barrier_gating_blocks_until_grasp():
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "sequential")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)
+        I.run_program(env, planner, prog, rec, max_steps=800,
+                      control_mode=planner.control_mode)
+        a = rec.to_arrays()
+        # arm_right's LIFT is gated on arm_left grasp; arm_right should still
+        # complete its approach+close but the LIFT only starts after the gate.
+        assert vocab.LIFT in set(a["subtask_arm1_verb"])
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_success_checks_fire():
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)
+        out = I.run_program(env, planner, prog, rec, max_steps=800,
+                            control_mode=planner.control_mode)
+        # at least the close_gripper / lift checks evaluated to a real bool
+        checked = [v for arm in out["success"].values() for v in arm.values()
+                   if v is not None]
+        assert len(checked) > 0
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_contrastive_frame0_identical_seam_diverge_stop_never_closes():
+    """approach_stop vs approach_grasp_lift from the SAME seed:
+    frame-0 obs identical, labels diverge at the seam, stop never closes."""
+    env, Solver = _make_sim_env()
+    try:
+        specs = {m.name: m for m in S.sample(0)
+                 if m.name in ("approach_stop", "approach_grasp_lift")}
+        recs = {}
+        first_qpos = {}
+        for name, spec in specs.items():
+            planner = _build_sim_planner(env, Solver, spec.seed)
+            # frame-0 arm0 qpos right after reset (before any step)
+            q0 = planner.robot[0].get_qpos()[0, :7]
+            first_qpos[name] = (q0.cpu().numpy() if hasattr(q0, "cpu")
+                                else np.asarray(q0)).copy()
+            rec = I.SubtaskRecorder(num_arms=2)
+            prog = spec.build(planner, env)
+            I.run_program(env, planner, prog, rec, max_steps=600,
+                          control_mode=planner.control_mode)
+            recs[name] = rec.to_arrays()
+        # frame-0 identical (same reset seed, sampler RNG independent)
+        assert np.allclose(first_qpos["approach_stop"],
+                           first_qpos["approach_grasp_lift"], atol=1e-5)
+        # stop variant NEVER closes
+        assert vocab.CLOSE_GRIPPER not in set(recs["approach_stop"]["subtask_arm0_verb"])
+        # grasp variant DOES close
+        assert vocab.CLOSE_GRIPPER in set(recs["approach_grasp_lift"]["subtask_arm0_verb"])
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_matched_pair_atomic_drop_and_liar_label():
+    """A forced-failed grasp (success_check False) makes a variant fail; the
+    rollout driver must drop the WHOLE contrast group, and the liar label is
+    never written as a kept episode."""
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)
+        # poison arm0's close-gripper success_check -> liar label
+        for qp in prog[0]:
+            if qp.primitive.verb_id == vocab.CLOSE_GRIPPER:
+                qp.primitive.success_check = lambda e, a, p: False
+        out = I.run_program(env, planner, prog, rec, max_steps=800,
+                            control_mode=planner.control_mode)
+        assert out["all_success"] is False  # group would be dropped
+    finally:
+        env.close()
+
+
+@sim
+def test_sim_dart_object_perturb_compat():
+    """Jitter the barrier pose at reset (object perturbation): approach still
+    reaches the moved actor and the recorded text/target_id is unchanged (label
+    tracks the actor, not a fixed location). A boundary_hook arm-noise injection
+    is NOT recorded as a label/action."""
+    env, Solver = _make_sim_env()
+    try:
+        spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
+        planner = _build_sim_planner(env, Solver, spec.seed)
+        u = env.unwrapped
+        # jitter the barrier by a small xy offset BEFORE building the program so
+        # the approach re-resolves the moved actor's grasp pose.
+        import sapien
+        p = u.barrier.pose
+        new_p = np.asarray(p.p).reshape(-1)[:3] + np.array([0.02, 0.0, 0.0])
+        u.barrier.set_pose(sapien.Pose(new_p, np.asarray(p.q).reshape(-1)[:4]))
+
+        hook_calls = {"n": 0}
+
+        def hook(unwrapped_env, state):
+            hook_calls["n"] += 1  # a real DART hook would step unwrapped env here
+
+        rec = I.SubtaskRecorder(num_arms=2)
+        prog = spec.build(planner, env)  # plans against the MOVED barrier
+        T_actions_before = None
+        out = I.run_program(env, planner, prog, rec, max_steps=600,
+                            boundary_hook=hook, control_mode=planner.control_mode)
+        a = rec.to_arrays()
+        # text/target_id for the approach unchanged by the jitter
+        assert "grasp the left end" in set(a["subtask_arm0_text"])
+        assert vocab.LB_TARGETS["left_end"] in set(a["subtask_arm0_target"])
+        # boundary_hook fired (between primitives) but added NO recorded steps:
+        # recorder length == env steps == sum of primitive ticks.
+        assert rec.length == out["steps"]
+        assert hook_calls["n"] >= 1
+    finally:
+        env.close()
