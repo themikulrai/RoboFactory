@@ -131,6 +131,9 @@ TASK_MAP = {
 # Captured by the monkeypatch and restored in a finally:. Module-level so the
 # original is reachable from the closure that replaces the bound method.
 _ORIG_MOVE = PandaArmMotionPlanningSolver.move_to_pose_with_screw
+# The original follow_path; the dense "jitter" scheme wraps it (re-implements
+# its step loop verbatim + an unwrapped nudge before each recorded step).
+_ORIG_FOLLOW_PATH = PandaArmMotionPlanningSolver.follow_path
 
 # When DART_CAPTURE_DISTURBANCES is non-empty it is treated as a list onto which
 # every emitted disturbance action_dict is appended (used by the sim tests to
@@ -195,6 +198,194 @@ def _inject_disturbance(self, rng, sigma, K, move_id, floor):
             base.step(action_dict)  # UNWRAPPED -> not recorded
 
 
+def _estimate_n_moves(task_name):
+    """Best-effort count of real move_to_pose_with_screw calls in a task's
+    solver, used ONLY to tune the dense p_shove so expected events land near the
+    [shove_min,shove_max] mid. Counts textual occurrences in the solver source
+    (a static upper bound; loops/branches make it approximate — that's fine, it
+    only sets a probability). Returns 0 if the source can't be inspected, which
+    makes run() fall back to p_shove=1.0 (inject on every move)."""
+    import inspect
+    try:
+        solver = TASK_MAP[task_name][2]
+        src = inspect.getsource(solver)
+        return src.count("move_to_pose_with_screw")
+    except Exception:
+        return 0
+
+
+def _pick_single_arm(rng, move_id):
+    """Pick ONE arm id at random from this move's move_id list. Dense scheme is
+    single-arm by design (perturb one arm, not all), so both jitter and shove
+    select exactly one eligible (moving) arm per event."""
+    move_id = move_id if isinstance(move_id, list) else [move_id]
+    if len(move_id) == 0:
+        return None
+    return int(rng.choice(np.asarray(move_id, dtype=np.int64)))
+
+
+def _jitter_nudge(self, rng, jitter_sigma, arm_id, waypoint7):
+    """ONE unwrapped env step that commands, for ONE chosen arm, a target of
+    (that arm's CLEAN waypoint at this follow_path step + N(0, jitter_sigma, 7));
+    gripper clean; all OTHER arms HOLD current qpos. NOT recorded (unwrapped env).
+    Mirrors follow_path's single-agent (flat action) vs multi-agent (dict)
+    branching + control_mode handling.
+
+    BOUNDED, not a random walk: the nudge is centered on the PATH waypoint, not
+    on the (already-drifted) current qpos, so the arm stays within ~sigma of the
+    path every jittered step and the noise never accumulates. (The old
+    qpos+noise form compounded over ~40% of steps and wandered the arm off-task
+    -> 8% yield; this waypoint+noise form keeps yield high while still producing
+    genuinely-perturbed recorded observations with clean-waypoint labels.)
+
+    ``waypoint7`` is the 7-joint clean waypoint for ``arm_id`` at this step
+    (result_group[move_idx]["position"][min(i, ...)][:7]); the caller supplies it.
+    The recorded step (in the wrapper) still commands the clean waypoint, so the
+    recorded action is unchanged -> only the NEXT recorded obs reflects a small,
+    bounded drift."""
+    base = self.base_env
+    assert base is self.env.unwrapped, (
+        "jitter MUST use unwrapped env (else noise becomes a training label)"
+    )
+    waypoint7 = np.asarray(waypoint7, dtype=np.float64)[:7]
+    nudged = waypoint7 + rng.normal(0.0, jitter_sigma, size=waypoint7.shape[0])
+    if not self.is_multi_agent:
+        # single-agent: arm_id is always 0 (the only arm)
+        if self.control_mode == "pd_joint_pos_vel":
+            action = np.hstack([nudged, nudged * 0, self.gripper_state[0]])
+        else:
+            action = np.hstack([nudged, self.gripper_state[0]])  # gripper CLEAN
+        if _DISTURBANCE_SINK is not None:
+            _DISTURBANCE_SINK.append(np.asarray(action, dtype=np.float64).copy())
+        base.step(action)  # UNWRAPPED -> not recorded
+    else:
+        action_dict = {}
+        for aid in range(self.agent_num):
+            if aid == arm_id:
+                target = nudged  # waypoint + noise (bounded around the path)
+            else:
+                target = self.robot[aid].get_qpos()[0, :-2].cpu().numpy()  # HOLD
+            if self.control_mode == "pd_joint_pos_vel":
+                action_dict[f"panda-{aid}"] = np.hstack(
+                    [target, target * 0, self.gripper_state[aid]])
+            else:
+                action_dict[f"panda-{aid}"] = np.hstack(
+                    [target, self.gripper_state[aid]])
+        if _DISTURBANCE_SINK is not None:
+            _DISTURBANCE_SINK.append(
+                {k: np.asarray(v, dtype=np.float64).copy() for k, v in action_dict.items()})
+        base.step(action_dict)  # UNWRAPPED -> not recorded
+
+
+def _make_dart_jitter_follow_path(rng, jitter_frac, jitter_sigma, ep_counter):
+    """Replacement for follow_path implementing the dense JITTER mechanism.
+
+    It re-implements follow_path's step loop VERBATIM (copied from
+    motionplanner.py:101-146) and, before a randomly-chosen ~jitter_frac
+    fraction of the recorded env.step calls, runs ONE unwrapped _jitter_nudge on
+    ONE randomly-chosen moving arm (move_id). The nudge is centered on that arm's
+    CLEAN WAYPOINT at this step (waypoint + N(0, jitter_sigma)), NOT on current
+    qpos, so the drift is BOUNDED around the path and never compounds into a
+    random walk off-task. The recorded step itself is UNCHANGED — it still
+    issues self.env.step(clean waypoint). So the recorded action stays the clean
+    waypoint while the next recorded obs shows a small, bounded drift.
+    n_jitter_steps is tallied into ep_counter for the sidecar meta."""
+
+    def dart_follow_path(self, result_group, move_id, refine_steps: int = 0):
+        n_step = 0
+        for i in range(len(result_group)):
+            n_step = max(n_step, result_group[i]["position"].shape[0])
+        # Multi-Agent check collision
+        # if check_collision(self, result_group, move_id, n_step, jump):
+        #     print("Collision detected")
+        #     return False
+        for i in range(n_step + refine_steps):
+            # --- DART jitter: ONE unwrapped nudge before this recorded step,
+            # with probability jitter_frac, on ONE random moving arm. The nudge
+            # target is that arm's CLEAN waypoint at step i + N(0, jitter_sigma)
+            # -> bounded around the path (no compounding random walk). NOT
+            # recorded; the recorded self.env.step below is unchanged. ---
+            if rng.random() < jitter_frac:
+                arm_id = _pick_single_arm(rng, move_id)
+                if arm_id is not None:
+                    # the SAME waypoint the recorded step will command for arm_id
+                    if not self.is_multi_agent:
+                        waypoint7 = result_group[0]["position"][min(i, n_step - 1)]
+                    else:
+                        move_idx = move_id.index(arm_id)
+                        self_step = result_group[move_idx]["position"].shape[0]
+                        waypoint7 = result_group[move_idx]["position"][min(i, self_step - 1)]
+                    _jitter_nudge(self, rng, jitter_sigma, arm_id, waypoint7)
+                    ep_counter["n_jitter_steps"] += 1
+            if not self.is_multi_agent:
+                qpos = result_group[0]["position"][min(i, n_step - 1)]
+                if self.control_mode == "pd_joint_pos_vel":
+                    qvel = result_group[0]["velocity"][min(i, n_step - 1)]
+                    action = np.hstack([qpos, qvel, self.gripper_state])
+                else:
+                    action = np.hstack([qpos, self.gripper_state])
+                obs, reward, terminated, truncated, info = self.env.step(action)
+            else:
+                action_dict = dict()
+                for id in range(self.agent_num):
+                    if id not in move_id:
+                        qpos = self.robot[id].get_qpos()[0, :-2].cpu().numpy()
+                        if self.control_mode == "pd_joint_pos":
+                            action = np.hstack([qpos, self.gripper_state[id]])
+                        else:
+                            action = np.hstack([qpos, qpos * 0, self.gripper_state[id]])
+                        action_dict[f"panda-{id}"] = action
+                    else:
+                        move_idx = move_id.index(id)
+                        self_step = result_group[move_idx]["position"].shape[0]
+                        qpos = result_group[move_idx]["position"][min(i, self_step - 1)]
+                        if self.control_mode == "pd_joint_pos_vel":
+                            qvel = result_group[move_idx]["velocity"][min(i, self_step - 1)]
+                            action = np.hstack([qpos, qvel, self.gripper_state[id]])
+                        else:
+                            action = np.hstack([qpos, self.gripper_state[id]])
+                        action_dict[f"panda-{id}"] = action
+                obs, reward, terminated, truncated, info = self.env.step(action_dict)
+            self.elapsed_steps += 1
+            if self.print_env_info:
+                print(
+                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
+                )
+            if self.vis:
+                self.base_env.render_human()
+        return True, obs, reward, terminated, truncated, info
+
+    return dart_follow_path
+
+
+def _make_dense_move(rng, sigma_min, sigma_max, K, floor, p_shove, ep_counter):
+    """Build the replacement move_to_pose_with_screw for the DENSE scheme.
+
+    SHOVE+RECOVER: on each REAL (not dry_run) move, with probability p_shove,
+    shove ONE randomly-chosen arm from that move's move_id (single arm, random
+    each event) with a held offset of intensity sigma ~ U(sigma_min, sigma_max)
+    over K unwrapped steps, then the original move re-plans to target (the clean
+    recovery is recorded). p_shove is tuned by run() so the expected event count
+    over a typical episode lands at the mid of [shove-min, shove-max]. Tasks with
+    few primitives (e.g. LiftBarrier ~2) simply get fewer events — acceptable."""
+
+    def dense_move(self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1):
+        if not dry_run:
+            ep_counter["n_calls"] += 1
+            if rng.random() < p_shove:
+                sigma = float(rng.uniform(sigma_min, sigma_max))
+                arm_id = _pick_single_arm(rng, move_id)
+                if arm_id is not None:
+                    _inject_disturbance(self, rng, sigma, K, [arm_id], floor)
+                    ep_counter["n_shove_events"] += 1
+        return _ORIG_MOVE(
+            self, pose, dry_run=dry_run, refine_steps=refine_steps,
+            move_id=move_id, jump=jump,
+        )
+
+    return dense_move
+
+
 def _make_dart_move(rng, sigma, k_min, k_max, p_inject, floor, ep_counter):
     """Build the replacement move_to_pose_with_screw. Keeps the original
     signature so existing solver code calls it unchanged.
@@ -248,7 +439,9 @@ def _load_seeds(task_name, num):
 def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
         dart_seed=0, max_retries_per_seed=5, per_attempt_timeout=300,
         override_seeds=None, save_video=False, inject_floor=0.15,
-        config_suffix=""):
+        config_suffix="", scheme="shove", jitter_frac=0.40, jitter_sigma=0.05,
+        shove_min=4, shove_max=5, shove_k=10, shove_sigma_min=0.05,
+        shove_sigma_max=0.09):
     env_id, yaml_rel, solver, n_agents = TASK_MAP[task_name]
     # --config-suffix lets data-gen select an alternate yaml (e.g.
     # table/lift_barrier_aug.yaml) WITHOUT touching eval: we splice the suffix in
@@ -307,8 +500,15 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
     print(f"[dart] task={task_name}  env_id={env_id}  n_agents={n_agents}")
     print(f"[dart] output_h5={out_h5}")
     print(f"[dart] config={config_rel}  (suffix={config_suffix!r})")
-    print(f"[dart] sigma={sigma}  inject_floor={inject_floor}  "
-          f"k=[{k_min},{k_max}]  p_inject={p_inject}  dart_seed={dart_seed}")
+    print(f"[dart] scheme={scheme}")
+    if scheme == "shove":
+        print(f"[dart] sigma={sigma}  inject_floor={inject_floor}  "
+              f"k=[{k_min},{k_max}]  p_inject={p_inject}  dart_seed={dart_seed}")
+    else:  # dense
+        print(f"[dart] jitter_frac={jitter_frac}  jitter_sigma={jitter_sigma}  "
+              f"shove=[{shove_min},{shove_max}]  shove_k={shove_k}  "
+              f"shove_sigma=[{shove_sigma_min},{shove_sigma_max}]  "
+              f"inject_floor={inject_floor}  dart_seed={dart_seed}")
 
     # Dedicated RNG so the disturbance draws NEVER perturb env RNG / the
     # reproducibility of the task seeds.
@@ -328,16 +528,39 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
     # the H5/JSON traj index. _episode_id starts at -1; first save -> 0.
     episodes_meta = []
 
-    # Episode-level injection counter shared with the monkeypatched move. Reset
-    # to zero immediately BEFORE each solver call (see the loop below) so the
-    # "first real move always injects" rule fires once PER EPISODE, guaranteeing
-    # n_injects >= 1 for every attempt.
-    ep_counter = {"n_calls": 0, "n_injects": 0}
+    # Episode-level counter shared with the monkeypatched methods. Reset to zero
+    # immediately BEFORE each solver call (see the loop below). For "shove":
+    # n_calls/n_injects (force-first-move => n_injects >= 1). For "dense":
+    # n_calls/n_shove_events/n_jitter_steps (no force-first; events are
+    # probabilistic so an episode can legitimately have 0 of either).
+    ep_counter = {"n_calls": 0, "n_injects": 0,
+                  "n_shove_events": 0, "n_jitter_steps": 0}
 
-    # --- install the DART monkeypatch (restored in finally:) ---
-    PandaArmMotionPlanningSolver.move_to_pose_with_screw = _make_dart_move(
-        rng, sigma, k_min, k_max, p_inject, inject_floor, ep_counter
-    )
+    # For "dense": tune p_shove so the EXPECTED number of shove events over a
+    # typical episode lands at the mid of [shove_min, shove_max]. We don't know
+    # the primitive count up front, so we estimate it from the solver's
+    # move_to_pose_with_screw call count and clamp p_shove to [0, 1]. Tasks with
+    # fewer primitives than the target simply get fewer events (e.g. LiftBarrier
+    # has ~2 real moves so it caps below shove_min — acceptable/documented).
+    n_moves_est = _estimate_n_moves(task_name)
+    shove_target = (shove_min + shove_max) / 2.0
+    p_shove = 1.0 if n_moves_est <= 0 else min(1.0, shove_target / n_moves_est)
+
+    # --- install the DART monkeypatch(es) (restored in finally:) ---
+    if scheme == "dense":
+        PandaArmMotionPlanningSolver.move_to_pose_with_screw = _make_dense_move(
+            rng, shove_sigma_min, shove_sigma_max, shove_k, inject_floor,
+            p_shove, ep_counter
+        )
+        PandaArmMotionPlanningSolver.follow_path = _make_dart_jitter_follow_path(
+            rng, jitter_frac, jitter_sigma, ep_counter
+        )
+        print(f"[dart] dense: n_moves_est={n_moves_est}  p_shove={p_shove:.3f} "
+              f"(target ~{shove_target} events/episode)", flush=True)
+    else:  # shove (EXISTING behavior, unchanged)
+        PandaArmMotionPlanningSolver.move_to_pose_with_screw = _make_dart_move(
+            rng, sigma, k_min, k_max, p_inject, inject_floor, ep_counter
+        )
 
     passed = 0
     total_attempts = 0
@@ -352,6 +575,7 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
         Never touches the wrapper's own <Task>.json."""
         dart_meta = {
             "task": task_name,
+            "scheme": str(scheme),
             "sigma": float(sigma),
             "inject_floor": float(inject_floor),
             "config_suffix": str(config_suffix),
@@ -359,6 +583,14 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
             "k_max": int(k_max),
             "p_inject": float(p_inject),
             "dart_seed": int(dart_seed),
+            # dense-scheme params (recorded regardless of scheme for provenance)
+            "jitter_frac": float(jitter_frac),
+            "jitter_sigma": float(jitter_sigma),
+            "shove_min": int(shove_min),
+            "shove_max": int(shove_max),
+            "shove_k": int(shove_k),
+            "shove_sigma_min": float(shove_sigma_min),
+            "shove_sigma_max": float(shove_sigma_max),
             "num": int(num),                   # requested episode count
             "attempted": int(total_attempts),  # total solver runs (incl retries)
             "passed": int(passed),
@@ -376,9 +608,12 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
             for attempt in range(max_retries_per_seed):
                 total_attempts += 1
                 # Reset the episode-level injection counter so the patched move
-                # force-injects on this episode's FIRST real move (>=1 guaranteed).
+                # force-injects on this episode's FIRST real move (>=1 guaranteed
+                # in shove mode); also re-arms the dense per-episode tallies.
                 ep_counter["n_calls"] = 0
                 ep_counter["n_injects"] = 0
+                ep_counter["n_shove_events"] = 0
+                ep_counter["n_jitter_steps"] = 0
                 signal.alarm(int(per_attempt_timeout))
                 try:
                     res = solver(env, seed=seed, debug=False, vis=False)
@@ -410,6 +645,9 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
                         "seed": int(seed),     # back-compat alias
                         "sigma": float(sigma),
                         "n_injects": int(ep_counter["n_injects"]),
+                        # dense-scheme per-episode tallies (0 in shove mode)
+                        "n_jitter_steps": int(ep_counter["n_jitter_steps"]),
+                        "n_shove_events": int(ep_counter["n_shove_events"]),
                     })
                     # Persist the group-link B-tree to disk so a SIGKILL during
                     # the next solver call leaves a valid (truncated) H5, not a
@@ -428,8 +666,9 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
             if not success_this_seed and not timed_out_this_seed:
                 print(f"  seed {seed}: FAILED after {max_retries_per_seed} attempts — skipping", flush=True)
     finally:
-        # ALWAYS restore the original method, even on exception.
+        # ALWAYS restore the original method(s), even on exception.
         PandaArmMotionPlanningSolver.move_to_pose_with_screw = _ORIG_MOVE
+        PandaArmMotionPlanningSolver.follow_path = _ORIG_FOLLOW_PATH
         # ALWAYS write the sidecar metadata, even on SIGALRM / partial run, so
         # the sweep figure always has a valid keep-rate point for this sigma.
         try:
@@ -469,13 +708,40 @@ if __name__ == "__main__":
         type=str,
         default="/iris/u/mikulrai/data/RoboFactory/hf_download_dart",
     )
-    ap.add_argument("--sigma", type=float, required=True,
-                    help="std-dev of Gaussian joint-target noise added to the "
-                         "7 arm joints of the moving arm(s) during injection")
-    ap.add_argument("--inject-floor", type=float, default=0.15, dest="inject_floor",
+    ap.add_argument("--scheme", choices=("shove", "dense"), default="shove",
+                    help="'shove' (default) = EXISTING force-first-move + "
+                         "probabilistic all-moving-arm shove behavior, unchanged. "
+                         "'dense' = richly-but-gently perturbed recovery data: "
+                         "per-step single-arm jitter (~jitter-frac of steps) PLUS "
+                         "4-5 single-arm shove+replan events per episode")
+    ap.add_argument("--sigma", type=float, default=0.05,
+                    help="[shove scheme] std-dev of Gaussian joint-target noise "
+                         "added to the 7 arm joints of the moving arm(s) during "
+                         "injection. Ignored by the dense scheme (which uses "
+                         "--shove-sigma-min/--shove-sigma-max + --jitter-sigma)")
+    ap.add_argument("--inject-floor", type=float, default=None, dest="inject_floor",
                     help="minimum L2 norm of the per-arm joint offset; offsets "
                          "drawn below this are scaled UP to the floor (random "
-                         "direction kept) so a disturbance is never trivial")
+                         "direction kept) so a disturbance is never trivial. "
+                         "Default 0.15 for shove, 0.0 for dense (dense sigma is "
+                         "already small/explicit)")
+    # --- dense-scheme params ---
+    ap.add_argument("--jitter-frac", type=float, default=0.40, dest="jitter_frac",
+                    help="[dense] fraction of recorded follow_path steps before "
+                         "which one unwrapped single-arm jitter nudge fires")
+    ap.add_argument("--jitter-sigma", type=float, default=0.05, dest="jitter_sigma",
+                    help="[dense] std-dev of the per-step jitter nudge (7 arm "
+                         "joints of one randomly-chosen moving arm)")
+    ap.add_argument("--shove-min", type=int, default=4, dest="shove_min",
+                    help="[dense] target min shove+replan events per episode")
+    ap.add_argument("--shove-max", type=int, default=5, dest="shove_max",
+                    help="[dense] target max shove+replan events per episode")
+    ap.add_argument("--shove-k", type=int, default=10, dest="shove_k",
+                    help="[dense] number of held unwrapped steps per shove event")
+    ap.add_argument("--shove-sigma-min", type=float, default=0.05, dest="shove_sigma_min",
+                    help="[dense] min of U(.,.) shove intensity (per event)")
+    ap.add_argument("--shove-sigma-max", type=float, default=0.09, dest="shove_sigma_max",
+                    help="[dense] max of U(.,.) shove intensity (per event)")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="suffix spliced before '.yaml' in the task config path "
                          "(e.g. '_aug' -> table/lift_barrier_aug.yaml) so data-gen "
@@ -505,6 +771,11 @@ if __name__ == "__main__":
         num_eff = len(override_seeds)
     else:
         num_eff = args.num
+    # inject_floor default depends on the scheme: 0.15 for shove (never-trivial
+    # disturbances), 0.0 for dense (sigma is already small/explicit).
+    inject_floor = args.inject_floor
+    if inject_floor is None:
+        inject_floor = 0.0 if args.scheme == "dense" else 0.15
     run(args.task, num_eff, args.record_dir,
         sigma=args.sigma,
         k_min=args.k_min,
@@ -515,5 +786,13 @@ if __name__ == "__main__":
         per_attempt_timeout=args.per_attempt_timeout,
         override_seeds=override_seeds,
         save_video=args.save_video,
-        inject_floor=args.inject_floor,
-        config_suffix=args.config_suffix)
+        inject_floor=inject_floor,
+        config_suffix=args.config_suffix,
+        scheme=args.scheme,
+        jitter_frac=args.jitter_frac,
+        jitter_sigma=args.jitter_sigma,
+        shove_min=args.shove_min,
+        shove_max=args.shove_max,
+        shove_k=args.shove_k,
+        shove_sigma_min=args.shove_sigma_min,
+        shove_sigma_max=args.shove_sigma_max)

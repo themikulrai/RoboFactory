@@ -597,6 +597,287 @@ def test_scene_builder_randyaw_block_is_key_guarded():
 
 
 # ---------------------------------------------------------------------------
+# PURE: DENSE scheme — jitter (single-arm, jitter_sigma) + frequent single-arm
+# shove+replan, both via the UNWRAPPED env (noise-not-recorded contract).
+# ---------------------------------------------------------------------------
+class _RecordingWrapEnv:
+    """Wrapped env: .step() RECORDS (mimics RecordEpisodeMA), and .unwrapped is
+    the shared fake base env whose .step() does NOT record. The follow_path
+    test asserts the recorded action equals the CLEAN waypoint (not any nudge)."""
+
+    def __init__(self, base):
+        self.unwrapped = base
+        self.recorded = []  # actions handed to the WRAPPED (recorded) step
+
+    def step(self, action):
+        if isinstance(action, dict):
+            self.recorded.append({k: np.asarray(v, dtype=np.float64).copy()
+                                  for k, v in action.items()})
+        else:
+            self.recorded.append(np.asarray(action, dtype=np.float64).copy())
+        # follow_path unpacks 5 values from env.step
+        return None, 0.0, False, False, {}
+
+
+class _DenseFakeSolver:
+    """Fake solver exposing what BOTH _jitter_nudge and the wrapped follow_path
+    read: base_env / env(.unwrapped, .step) / robot qpos / gripper_state /
+    is_multi_agent / agent_num / control_mode / elapsed_steps / print_env_info /
+    vis. The wrapped env records; the base env does not."""
+
+    def __init__(self, q7_list, multi_agent, control_mode="pd_joint_pos"):
+        base = _FakeBaseEnv()
+        self.base_env = base
+        self.env = _RecordingWrapEnv(base)
+        self.is_multi_agent = multi_agent
+        self.agent_num = len(q7_list)
+        self.robot = [_FakeRobot(q7) for q7 in q7_list]
+        self.gripper_state = [1.0 for _ in q7_list]
+        self.control_mode = control_mode
+        self.elapsed_steps = 0
+        self.print_env_info = False
+        self.vis = False
+
+
+def _result_group(positions_list):
+    """Build a follow_path result_group: one dict per moving arm with a
+    'position' array of shape (T, 7)."""
+    return [{"position": np.asarray(p, dtype=np.float64)} for p in positions_list]
+
+
+def test_dense_jitter_single_arm_and_uses_jitter_sigma():
+    """(a) The dense jitter nudge perturbs exactly ONE arm (not all), uses
+    jitter_sigma, and is centered on that arm's CLEAN WAYPOINT (not current qpos)
+    so it is bounded around the path (no compounding random walk). The chosen
+    arm's target must equal waypoint + small noise, NOT qpos + noise."""
+    rdr = _rdr()
+    q0a = np.array([0.0, 0.1, 0.2, -0.3, 0.4, 0.9, -0.1])
+    q0b = np.array([0.5, -0.2, 0.1, -0.6, 0.3, 0.8, 0.2])   # current qpos arm 1
+    q0c = np.array([-0.3, 0.4, -0.1, -0.5, 0.2, 1.0, 0.0])
+    # waypoint for the perturbed arm, deliberately FAR from its current qpos so
+    # we can prove the nudge tracks the waypoint, not the drifted qpos.
+    waypoint = np.array([2.0, -1.0, 0.7, -2.0, 1.3, 2.5, -0.9])
+    solver = _DenseFakeSolver([q0a, q0b, q0c], multi_agent=True)
+    rng = np.random.default_rng(0)
+    rdr._jitter_nudge(solver, rng, jitter_sigma=0.05, arm_id=1, waypoint7=waypoint)
+    step = solver.base_env.steps[0]
+    a0, a1, a2 = (np.asarray(step[f"panda-{i}"]) for i in range(3))
+    # only arm 1 perturbed; 0 and 2 held at current qpos
+    assert np.allclose(a0[:7], q0a)
+    assert np.allclose(a2[:7], q0c)
+    # arm 1 target is centered on the WAYPOINT (within a few sigma), NOT qpos
+    assert np.linalg.norm(a1[:7] - waypoint) < 0.05 * 7  # close to waypoint
+    assert np.linalg.norm(a1[:7] - q0b) > 1.0            # far from current qpos
+    assert not np.allclose(a1[:7], waypoint)             # but genuinely perturbed
+    # grippers all clean
+    for a, g in zip((a0, a1, a2), solver.gripper_state):
+        assert a[7] == g
+    # nudge went to the UNWRAPPED env, NOT the recorded wrapped env
+    assert len(solver.env.recorded) == 0
+    assert len(solver.base_env.steps) == 1
+
+    # jitter_sigma scale: std of (target - waypoint) over many draws ~ sigma,
+    # and centered on the waypoint regardless of (differing) current qpos.
+    wp = np.zeros(7)
+    deltas = []
+    for s in range(4000):
+        sv = _DenseFakeSolver([np.ones(7) * 0.3], multi_agent=False)  # qpos != wp
+        r = np.random.default_rng(s)
+        rdr._jitter_nudge(sv, r, jitter_sigma=0.05, arm_id=0, waypoint7=wp)
+        deltas.append(np.asarray(sv.base_env.steps[0])[:7] - wp)
+    deltas = np.concatenate(deltas)
+    assert abs(deltas.std() - 0.05) < 0.01
+    assert abs(deltas.mean()) < 0.01
+
+
+def test_dense_pick_single_arm_is_one_of_move_id():
+    """(a)/(b) _pick_single_arm returns exactly ONE id, always drawn from the
+    move_id set (never 'all'); over many draws it covers every member."""
+    rdr = _rdr()
+    rng = np.random.default_rng(0)
+    seen = set()
+    for _ in range(500):
+        a = rdr._pick_single_arm(rng, [0, 2, 3])
+        assert a in (0, 2, 3)
+        seen.add(a)
+    assert seen == {0, 2, 3}  # all reachable, but one at a time
+    # scalar move_id is normalized to a single-element list
+    assert rdr._pick_single_arm(rng, 1) == 1
+    # empty move_id -> None (no arm to perturb)
+    assert rdr._pick_single_arm(rng, []) is None
+
+
+def test_dense_shove_event_is_single_arm():
+    """(b) A dense shove event perturbs exactly ONE arm from the move's move_id
+    even when the move drives several arms. Driven through the REAL _make_dense_move
+    with p_shove=1.0 (always shove) and a stubbed _ORIG_MOVE / _inject_disturbance
+    capturing the move_id list handed to the injection."""
+    rdr = _rdr()
+    captured = []
+    orig_move = rdr._ORIG_MOVE
+    orig_inject = rdr._inject_disturbance
+    try:
+        rdr._ORIG_MOVE = lambda self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1: None
+        rdr._inject_disturbance = (
+            lambda self, rng, sigma, K, move_id, floor: captured.append(list(move_id)))
+        ep_counter = {"n_calls": 0, "n_injects": 0,
+                      "n_shove_events": 0, "n_jitter_steps": 0}
+        rng = np.random.default_rng(0)
+        dense_move = rdr._make_dense_move(
+            rng, sigma_min=0.05, sigma_max=0.09, K=10, floor=0.0,
+            p_shove=1.0, ep_counter=ep_counter)
+        fake_self = object()
+        # a multi-arm move: move_id=[0,1] — the shove must pick ONE of them
+        for _ in range(50):
+            dense_move(fake_self, pose=None, dry_run=False, move_id=[0, 1])
+        assert ep_counter["n_shove_events"] == 50
+        # every captured injection targeted exactly ONE arm, from {0,1}
+        assert all(len(m) == 1 for m in captured)
+        assert {m[0] for m in captured} == {0, 1}  # both reachable over draws
+        # dry_run never shoves
+        before = len(captured)
+        dense_move(fake_self, pose=None, dry_run=True, move_id=[0, 1])
+        assert len(captured) == before
+    finally:
+        rdr._ORIG_MOVE = orig_move
+        rdr._inject_disturbance = orig_inject
+
+
+def test_dense_shove_sigma_in_uniform_range():
+    """(b) Per-event shove intensity is drawn U(sigma_min, sigma_max)."""
+    rdr = _rdr()
+    sigmas = []
+    orig_move = rdr._ORIG_MOVE
+    orig_inject = rdr._inject_disturbance
+    try:
+        rdr._ORIG_MOVE = lambda self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1: None
+        rdr._inject_disturbance = (
+            lambda self, rng, sigma, K, move_id, floor: sigmas.append(sigma))
+        ep_counter = {"n_calls": 0, "n_injects": 0,
+                      "n_shove_events": 0, "n_jitter_steps": 0}
+        rng = np.random.default_rng(0)
+        dense_move = rdr._make_dense_move(
+            rng, sigma_min=0.05, sigma_max=0.09, K=10, floor=0.0,
+            p_shove=1.0, ep_counter=ep_counter)
+        for _ in range(2000):
+            dense_move(object(), pose=None, dry_run=False, move_id=[0])
+    finally:
+        rdr._ORIG_MOVE = orig_move
+        rdr._inject_disturbance = orig_inject
+    sigmas = np.array(sigmas)
+    assert sigmas.min() >= 0.05 - 1e-9
+    assert sigmas.max() <= 0.09 + 1e-9
+    assert sigmas.std() > 0.005  # genuinely spread across the range
+
+
+def test_dense_jitter_goes_through_unwrapped_and_asserts():
+    """(c) noise-not-recorded contract for the JITTER path: _jitter_nudge steps
+    ONLY env.unwrapped (asserted in-code) and never the recorded wrapped env."""
+    rdr = _rdr()
+    solver = _DenseFakeSolver([np.zeros(7)], multi_agent=False)
+    assert solver.base_env is solver.env.unwrapped  # precondition
+    rng = np.random.default_rng(0)
+    rdr._jitter_nudge(solver, rng, jitter_sigma=0.05, arm_id=0, waypoint7=np.zeros(7))
+    assert len(solver.base_env.steps) == 1     # unwrapped stepped
+    assert len(solver.env.recorded) == 0       # recorded buffer untouched
+    # break the contract -> the in-code assert fires
+    solver.env.unwrapped = _FakeBaseEnv()
+    with pytest.raises(AssertionError):
+        rdr._jitter_nudge(solver, rng, jitter_sigma=0.05, arm_id=0, waypoint7=np.zeros(7))
+
+
+def test_dense_shove_goes_through_unwrapped():
+    """(c) noise-not-recorded contract for the SHOVE path: the dense shove routes
+    through _inject_disturbance, which asserts base is env.unwrapped and steps
+    only the unwrapped env (not the recorded wrapped env)."""
+    rdr = _rdr()
+    solver = _DenseFakeSolver([np.zeros(7), np.zeros(7)], multi_agent=True)
+    orig_move = rdr._ORIG_MOVE
+    try:
+        rdr._ORIG_MOVE = lambda self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1: None
+        ep_counter = {"n_calls": 0, "n_injects": 0,
+                      "n_shove_events": 0, "n_jitter_steps": 0}
+        rng = np.random.default_rng(0)
+        dense_move = rdr._make_dense_move(
+            rng, sigma_min=0.05, sigma_max=0.09, K=10, floor=0.0,
+            p_shove=1.0, ep_counter=ep_counter)
+        dense_move(solver, pose=None, dry_run=False, move_id=[0, 1])
+    finally:
+        rdr._ORIG_MOVE = orig_move
+    assert len(solver.base_env.steps) == 10    # K unwrapped steps
+    assert len(solver.env.recorded) == 0       # recorded buffer untouched
+    # break the contract on a fresh solver -> _inject_disturbance assert fires
+    bad = _DenseFakeSolver([np.zeros(7)], multi_agent=False)
+    bad.env.unwrapped = _FakeBaseEnv()
+    with pytest.raises(AssertionError):
+        rdr._inject_disturbance(bad, np.random.default_rng(0), sigma=0.05, K=2,
+                                move_id=[0], floor=0.0)
+
+
+def test_dense_follow_path_records_clean_waypoint_not_nudge():
+    """(d) The wrapped follow_path preserves the original recorded-step semantics:
+    every RECORDED action equals the CLEAN waypoint from result_group (NOT the
+    jittered target). With jitter_frac=1.0 a nudge fires before EVERY step, yet
+    the recorded actions are byte-for-byte the clean waypoints; the nudges land
+    only on the unwrapped (non-recorded) env."""
+    rdr = _rdr()
+    # single-agent, 3 waypoints (7 joints each)
+    wps = np.array([[0.1, 0.2, 0.3, -0.4, 0.5, 1.0, -0.2],
+                    [0.15, 0.25, 0.35, -0.45, 0.55, 1.05, -0.25],
+                    [0.2, 0.3, 0.4, -0.5, 0.6, 1.1, -0.3]])
+    solver = _DenseFakeSolver([np.zeros(7)], multi_agent=False)
+    ep_counter = {"n_calls": 0, "n_injects": 0,
+                  "n_shove_events": 0, "n_jitter_steps": 0}
+    rng = np.random.default_rng(0)
+    fp = rdr._make_dart_jitter_follow_path(
+        rng, jitter_frac=1.0, jitter_sigma=0.05, ep_counter=ep_counter)
+    fp(solver, _result_group([wps]), move_id=[0])
+    # exactly one recorded step per waypoint, each == the CLEAN waypoint + gripper
+    assert len(solver.env.recorded) == wps.shape[0]
+    for rec, wp in zip(solver.env.recorded, wps):
+        rec = np.asarray(rec)
+        assert np.allclose(rec[:7], wp), "recorded action is NOT the clean waypoint"
+        assert rec[7] == solver.gripper_state[0]  # gripper clean
+    # jitter_frac=1.0 -> one unwrapped nudge before each of the 3 steps
+    assert ep_counter["n_jitter_steps"] == 3
+    assert len(solver.base_env.steps) == 3       # all nudges on unwrapped env
+    # and NONE of the recorded actions equals a nudge target
+    for rec in solver.env.recorded:
+        for nudge in solver.base_env.steps:
+            assert not np.allclose(np.asarray(rec)[:7], np.asarray(nudge)[:7]), \
+                "a nudge target leaked into the recorded buffer"
+
+
+def test_dense_follow_path_zero_jitter_matches_clean_loop():
+    """(d) With jitter_frac=0.0 the wrapped follow_path is behaviorally identical
+    to the original clean loop: no unwrapped steps, recorded actions == clean
+    waypoints, multi-agent non-moving arms held at their qpos."""
+    rdr = _rdr()
+    q0a = np.zeros(7)
+    q0b = np.array([0.5, -0.2, 0.1, -0.6, 0.3, 0.8, 0.2])  # held (not moving)
+    wps = np.array([[0.1, 0.2, 0.3, -0.4, 0.5, 1.0, -0.2],
+                    [0.2, 0.3, 0.4, -0.5, 0.6, 1.1, -0.3]])
+    solver = _DenseFakeSolver([q0a, q0b], multi_agent=True)
+    ep_counter = {"n_calls": 0, "n_injects": 0,
+                  "n_shove_events": 0, "n_jitter_steps": 0}
+    fp = rdr._make_dart_jitter_follow_path(
+        np.random.default_rng(0), jitter_frac=0.0, jitter_sigma=0.05,
+        ep_counter=ep_counter)
+    fp(solver, _result_group([wps]), move_id=[0])  # only arm 0 moves
+    assert ep_counter["n_jitter_steps"] == 0
+    assert len(solver.base_env.steps) == 0  # NO unwrapped steps at all
+    assert len(solver.env.recorded) == wps.shape[0]
+    for rec, wp in zip(solver.env.recorded, wps):
+        rec = rec  # dict
+        a0 = np.asarray(rec["panda-0"])
+        a1 = np.asarray(rec["panda-1"])
+        assert np.allclose(a0[:7], wp)        # moving arm follows the waypoint
+        assert np.allclose(a1[:7], q0b)       # non-moving arm holds its qpos
+        assert a0[7] == solver.gripper_state[0]
+        assert a1[7] == solver.gripper_state[1]
+
+
+# ---------------------------------------------------------------------------
 # SIM tests (GPU compute node only; DART_RUN_SIM=1)
 # ---------------------------------------------------------------------------
 def _run_liftbarrier_recovered(tmp_path, sigma=0.05, p_inject=0.5, dart_seed=0,
