@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import shlex
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from robofactory.scripts.canonical.eval.manifest_schema import (
     PolicyType,
     load_manifest,
 )
+from robofactory.utils.ckpt_registry import CkptRegistry, assert_registry_or_exit
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # robofactory/
@@ -98,6 +100,62 @@ def run_preflight(cfg: LauncherCfg, argv_seeds: str, *, dry_run: bool = False) -
     if dry_run:
         return
     subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+
+
+def run_registry_drift_guard(cfg: LauncherCfg, *, dry_run: bool = False) -> None:
+    """Week-2 L3 (decision-table row #8): hard-fail BEFORE GPU/server bringup if a
+    pi0.5 launcher resolves a checkpoint that disagrees with the pinned canonical
+    in ``scripts/canonical/eval/ckpt_registry.yaml``.
+
+    This is the manifest-side half of the guard (catches a wrong `dir:` in the YAML
+    up front, even in --dry-run). The server-side half — comparing the PR2
+    server-identity metadata the served policy actually announces — is enforced by
+    the eval driver via ``check_from_server_metadata`` after connect. Both consult
+    the same registry.
+
+    Only pi0.5 launchers carry a `train_config` + resolvable ckpt dir; DP launchers
+    are out of L3 scope and skipped. An unregistered config (PM/2SC/LP) is a no-op.
+    """
+    is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
+    if not is_pi05:
+        return
+    try:
+        registry = CkptRegistry.load()
+    except OSError as e:
+        # Missing registry file should not silently disable the guard; warn loudly.
+        print(f"[run_eval] WARN: ckpt registry not loaded ({e}); drift guard skipped",
+              file=sys.stderr, flush=True)
+        return
+
+    pairs: list[tuple[str, str, str]] = []  # (config_name, ckpt_dir, label)
+    if cfg.policy_type == PolicyType.PI05_SINGLE and cfg.ckpt.train_config and cfg.ckpt.dir:
+        pairs.append((cfg.ckpt.train_config, cfg.ckpt.dir, "single"))
+    elif cfg.policy_type == PolicyType.PI05_DECENT and cfg.server is not None:
+        for i, (acfg, adir) in enumerate(
+            zip(cfg.server.arm_configs or [], cfg.server.arm_dirs or [])
+        ):
+            pairs.append((acfg, adir, f"arm{i}"))
+
+    for config_name, ckpt_dir, label in pairs:
+        step = pathlib.PurePath(ckpt_dir).name
+        resolved_step = int(step) if step.isdigit() else None
+        print(f"[run_eval] ckpt-registry guard: {label} config={config_name} "
+              f"dir={ckpt_dir}", file=sys.stderr, flush=True)
+        if dry_run:
+            # Still run the pure comparison in dry-run; it never touches a GPU.
+            from robofactory.utils.ckpt_registry import check_registry_drift
+            ok, diag, _ = check_registry_drift(
+                registry, config_name, ckpt_dir, resolved_step, label=label
+            )
+            if not ok:
+                print(f"[run_eval] DRY-RUN would hard-fail: {diag}",
+                      file=sys.stderr, flush=True)
+            elif diag:
+                print(f"[run_eval] DRY-RUN warn: {diag}", file=sys.stderr, flush=True)
+            continue
+        assert_registry_or_exit(
+            registry, config_name, ckpt_dir, resolved_step, label=label
+        )
 
 
 def run_env_hooks(cfg: LauncherCfg, *, dry_run: bool = False) -> None:
@@ -416,6 +474,8 @@ def run_launcher(
 
     run_env_hooks(cfg, dry_run=dry_run)
     run_preflight(cfg, argv_seeds=seeds, dry_run=dry_run)
+    # Week-2 L3: hard-fail on a wrong-checkpoint-for-config before GPU/server bringup.
+    run_registry_drift_guard(cfg, dry_run=dry_run)
     if preflight_only:
         print(
             f"[run_eval] preflight-only mode: stopping before driver/servers.",
