@@ -9,6 +9,7 @@ import numpy as np
 from gymnasium import spaces
 import sapien
 from transforms3d.euler import euler2quat
+from transforms3d.quaternions import qmult
 
 if TYPE_CHECKING:
     from mani_skill.envs.sapien_env import BaseEnv
@@ -123,6 +124,10 @@ class RFSceneBuilder(SceneBuilder):
                         lock_y=primitive_cfg['pos']['random_quaternions'][1],
                         lock_z=primitive_cfg['pos']['random_quaternions'][2]
                     )
+                if 'randyaw_deg' in primitive_cfg['pos']:
+                    yaw = np.deg2rad((self.env._episode_rng.rand() * 2 - 1) * primitive_cfg['pos']['randyaw_deg'])
+                    dq = euler2quat(0, 0, yaw)
+                    qpos = qmult(np.array(qpos), dq)
                 asset.set_pose(Pose.create_from_pq(ppos, qpos))
 
         # objects
@@ -147,6 +152,10 @@ class RFSceneBuilder(SceneBuilder):
                         lock_y=asset_cfg['pos']['random_quaternions'][1],
                         lock_z=asset_cfg['pos']['random_quaternions'][2]
                     )
+                if 'randyaw_deg' in asset_cfg['pos']:
+                    yaw = np.deg2rad((self.env._episode_rng.rand() * 2 - 1) * asset_cfg['pos']['randyaw_deg'])
+                    dq = euler2quat(0, 0, yaw)
+                    qpos = qmult(np.array(qpos), dq)
                 asset.set_pose(Pose.create_from_pq(ppos, qpos))
                 self.movable_objects[asset_cfg['name']] = asset
         # agents

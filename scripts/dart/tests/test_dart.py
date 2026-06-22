@@ -166,6 +166,437 @@ def test_dart_rng_does_not_consume_global():
 
 
 # ---------------------------------------------------------------------------
+# PURE: AUG1 — guaranteed >=1 injection (force-first-move) + magnitude floor
+#
+# These drive the ACTUAL run_dart_rollouts helpers (_make_dart_move and
+# _inject_disturbance) — no sim. A tiny fake "solver" mimics the bits the
+# disturbance hook touches (base_env / env.unwrapped / robot qpos / gripper),
+# so the real floor + force-first-move logic is exercised, not a copy of it.
+# ---------------------------------------------------------------------------
+class _FakeBaseEnv:
+    """Stand-in for env.unwrapped: records every action handed to .step()."""
+
+    def __init__(self):
+        self.steps = []
+
+    def step(self, action):
+        # store a deep copy so later mutations can't alias the captured value
+        if isinstance(action, dict):
+            self.steps.append({k: np.asarray(v, dtype=np.float64).copy()
+                               for k, v in action.items()})
+        else:
+            self.steps.append(np.asarray(action, dtype=np.float64).copy())
+        return None
+
+
+class _FakeRobot:
+    """Stand-in for solver.robot[aid]: get_qpos()[0, :-2] -> 7 arm joints.
+
+    Returns a torch-like object exposing .cpu().numpy(); we just hand back a
+    numpy view since _inject_disturbance only calls .cpu().numpy()."""
+
+    class _QposHandle:
+        def __init__(self, arr):
+            self._arr = arr  # shape (1, 9): 7 joints + 2 gripper fingers
+
+        def __getitem__(self, idx):
+            return _FakeRobot._CpuNumpy(self._arr[idx])
+
+    class _CpuNumpy:
+        def __init__(self, arr):
+            self._arr = np.asarray(arr)
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self._arr
+
+    def __init__(self, q7):
+        # full qpos row = 7 arm joints + 2 finger joints
+        self._full = np.hstack([np.asarray(q7, dtype=np.float64), [0.04, 0.04]])
+
+    def get_qpos(self):
+        return _FakeRobot._QposHandle(self._full[None, :])  # (1, 9)
+
+
+class _FakeEnvWrap:
+    """Wrapped env whose .unwrapped is the shared fake base env."""
+
+    def __init__(self, base):
+        self.unwrapped = base
+
+
+class _FakeSolver:
+    """Minimal object exposing exactly the attributes _inject_disturbance reads."""
+
+    def __init__(self, q7_list, multi_agent):
+        base = _FakeBaseEnv()
+        self.base_env = base
+        self.env = _FakeEnvWrap(base)
+        self.is_multi_agent = multi_agent
+        self.agent_num = len(q7_list)
+        self.robot = [_FakeRobot(q7) for q7 in q7_list]
+        # gripper_state is indexed per agent; a scalar per agent is fine.
+        self.gripper_state = [1.0 for _ in q7_list]
+
+
+def _rdr():
+    from dart import run_dart_rollouts as rdr  # noqa: E402
+    return rdr
+
+
+def test_force_first_move_injects_even_at_p_inject_zero():
+    """AUG1 (1): with p_inject=0.0 the FIRST real (not dry_run) move STILL
+    injects, guaranteeing n_injects >= 1. dry_run moves never inject. We
+    monkeypatch the heavy bits (_ORIG_MOVE no-op, _inject_disturbance a counter)
+    so this is a pure logic test of the closure / ep_counter gate."""
+    rdr = _rdr()
+    ep_counter = {"n_calls": 0, "n_injects": 0}
+    injected_calls = []
+
+    orig_move = rdr._ORIG_MOVE
+    orig_inject = rdr._inject_disturbance
+    try:
+        # planning probe (the real method) becomes a no-op so we test only gating
+        rdr._ORIG_MOVE = lambda self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1: None
+        rdr._inject_disturbance = lambda self, rng, sigma, K, move_id, floor: injected_calls.append(K)
+
+        rng = np.random.default_rng(0)
+        # p_inject=0.0 -> only the force-first-move rule can ever inject
+        dart_move = rdr._make_dart_move(rng, sigma=0.3, k_min=5, k_max=15,
+                                        p_inject=0.0, floor=0.15,
+                                        ep_counter=ep_counter)
+
+        fake_self = object()  # _ORIG_MOVE/_inject are no-ops; self is unused here
+        # a dry_run probe BEFORE any real move must NOT inject and must NOT count
+        dart_move(fake_self, pose=None, dry_run=True, move_id=0)
+        assert ep_counter["n_calls"] == 0
+        assert ep_counter["n_injects"] == 0
+        assert injected_calls == []
+
+        # first REAL move -> forced injection even though p_inject == 0.0
+        dart_move(fake_self, pose=None, dry_run=False, move_id=0)
+        assert ep_counter["n_calls"] == 1
+        assert ep_counter["n_injects"] == 1
+        assert len(injected_calls) == 1
+
+        # subsequent real moves at p_inject=0.0 must NOT inject again
+        for _ in range(20):
+            dart_move(fake_self, pose=None, dry_run=False, move_id=0)
+        assert ep_counter["n_injects"] == 1  # still exactly one
+        assert ep_counter["n_calls"] == 21
+    finally:
+        rdr._ORIG_MOVE = orig_move
+        rdr._inject_disturbance = orig_inject
+
+
+def test_force_first_move_resets_per_episode():
+    """AUG1 (1): resetting ep_counter to zero (as run() does before each solver
+    call) re-arms the force-first-move rule, so EACH episode gets >= 1 injection
+    even at p_inject=0.0."""
+    rdr = _rdr()
+    ep_counter = {"n_calls": 0, "n_injects": 0}
+    n_inject = [0]
+    orig_move = rdr._ORIG_MOVE
+    orig_inject = rdr._inject_disturbance
+    try:
+        rdr._ORIG_MOVE = lambda self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1: None
+        rdr._inject_disturbance = lambda self, rng, sigma, K, move_id, floor: n_inject.__setitem__(0, n_inject[0] + 1)
+        rng = np.random.default_rng(1)
+        dart_move = rdr._make_dart_move(rng, sigma=0.3, k_min=5, k_max=15,
+                                        p_inject=0.0, floor=0.15,
+                                        ep_counter=ep_counter)
+        fake_self = object()
+        for _ in range(3):  # 3 simulated episodes
+            ep_counter["n_calls"] = 0  # run() does this before each solver call
+            ep_counter["n_injects"] = 0
+            for _ in range(5):  # several real moves per episode
+                dart_move(fake_self, pose=None, dry_run=False, move_id=0)
+            assert ep_counter["n_injects"] == 1  # exactly the forced first move
+        assert n_inject[0] == 3  # one forced injection per episode
+    finally:
+        rdr._ORIG_MOVE = orig_move
+        rdr._inject_disturbance = orig_inject
+
+
+def test_inject_floor_enforced_single_agent():
+    """AUG1 (2): a per-arm offset whose raw draw is below the floor is scaled UP
+    so the commanded net joint displacement has L2 >= inject_floor. Driven
+    through the REAL _inject_disturbance with a fake single-agent solver."""
+    rdr = _rdr()
+    floor = 0.15
+    q7 = np.array([0.1, 0.2, 0.3, -0.4, 0.5, 1.0, -0.2])
+    # sigma tiny so the raw draw is almost always below the floor -> floor binds
+    norms = []
+    for s in range(200):
+        solver = _FakeSolver([q7], multi_agent=False)
+        rng = np.random.default_rng(s)
+        rdr._inject_disturbance(solver, rng, sigma=1e-4, K=3, move_id=0, floor=floor)
+        # the HELD target is whatever was stepped; recover net displacement
+        stepped = solver.base_env.steps[0]            # flat action [7 + gripper]
+        target = np.asarray(stepped)[:7]
+        disp = target - q7
+        norms.append(float(np.linalg.norm(disp)))
+        # all K steps must HOLD the identical target (no per-step re-sampling)
+        for st in solver.base_env.steps:
+            assert np.allclose(np.asarray(st)[:7], target)
+        # gripper channel stays clean
+        assert np.asarray(stepped)[7] == solver.gripper_state[0]
+    norms = np.array(norms)
+    # Floor enforced. The production scaling is off/(mag+1e-9)*floor, so when the
+    # raw draw mag is tiny the +1e-9 guard against div-by-zero pulls the result a
+    # hair UNDER the floor by ~floor*1e-9/mag (sub-microradian). Tolerate that
+    # documented epsilon; the floor is still effectively binding.
+    assert (norms >= floor - 1e-4).all(), f"min floored norm {norms.min()} < {floor}"
+    assert (norms <= floor + 1e-6).all(), f"max floored norm {norms.max()} > {floor}"
+    # randomness preserved above the floor: directions differ across draws
+    assert norms.std() < 1e-3  # all pinned ~at the floor (tiny sigma)
+    # but the DIRECTION must vary across seeds (not a constant vector)
+    dirs = []
+    for s in range(50):
+        solver = _FakeSolver([q7], multi_agent=False)
+        rng = np.random.default_rng(s)
+        rdr._inject_disturbance(solver, rng, sigma=1e-4, K=1, move_id=0, floor=floor)
+        d = np.asarray(solver.base_env.steps[0])[:7] - q7
+        dirs.append(d / (np.linalg.norm(d) + 1e-12))
+    dirs = np.array(dirs)
+    assert dirs.std(axis=0).max() > 1e-2, "floored offset direction does not vary"
+
+
+def test_inject_floor_randomness_above_floor():
+    """AUG1 (2): when sigma is large the raw draw exceeds the floor and is used
+    UNCHANGED, so magnitude varies across draws (randomness preserved above the
+    floor — the floor only lifts trivially-small draws)."""
+    rdr = _rdr()
+    floor = 0.15
+    q7 = np.zeros(7)
+    norms = []
+    for s in range(300):
+        solver = _FakeSolver([q7], multi_agent=False)
+        rng = np.random.default_rng(s)
+        rdr._inject_disturbance(solver, rng, sigma=0.5, K=1, move_id=0, floor=floor)
+        d = np.asarray(solver.base_env.steps[0])[:7] - q7
+        norms.append(float(np.linalg.norm(d)))
+    norms = np.array(norms)
+    assert (norms >= floor - 1e-6).all()         # never below floor
+    assert norms.std() > 0.1                       # genuinely varying magnitude
+    assert norms.max() > floor + 0.3               # large draws pass through
+
+
+def test_inject_multi_agent_only_moving_arm_perturbed():
+    """AUG1 (2): in the multi-agent path only arms in move_id drift; other arms
+    HOLD their captured qpos exactly; every arm's gripper channel stays clean."""
+    rdr = _rdr()
+    q0a = np.array([0.0, 0.1, 0.2, -0.3, 0.4, 0.9, -0.1])
+    q0b = np.array([0.5, -0.2, 0.1, -0.6, 0.3, 0.8, 0.2])
+    solver = _FakeSolver([q0a, q0b], multi_agent=True)
+    rng = np.random.default_rng(3)
+    rdr._inject_disturbance(solver, rng, sigma=0.4, K=4, move_id=[0], floor=0.15)
+    step0 = solver.base_env.steps[0]
+    a0 = np.asarray(step0["panda-0"])
+    a1 = np.asarray(step0["panda-1"])
+    # agent 0 (in move_id) is perturbed; agent 1 is held at its captured qpos
+    assert not np.allclose(a0[:7], q0a)
+    assert np.allclose(a1[:7], q0b)
+    # grippers clean on both
+    assert a0[7] == solver.gripper_state[0]
+    assert a1[7] == solver.gripper_state[1]
+    # held identically for all K steps
+    for st in solver.base_env.steps:
+        assert np.allclose(np.asarray(st["panda-0"]), a0)
+        assert np.allclose(np.asarray(st["panda-1"]), a1)
+
+
+def test_inject_disturbance_uses_unwrapped_env_and_fills_sink():
+    """PURE noise-not-recorded contract: _inject_disturbance steps ONLY the
+    UNWRAPPED env (base is self.env.unwrapped — asserted in-code) and appends to
+    _DISTURBANCE_SINK exactly the actions it stepped, so the sim leak check has
+    something to compare against. Driven without sim via the fake solver."""
+    rdr = _rdr()
+    solver = _FakeSolver([np.zeros(7)], multi_agent=False)
+    # contract precondition the production code asserts:
+    assert solver.base_env is solver.env.unwrapped
+    sink = []
+    orig_sink = rdr._DISTURBANCE_SINK
+    rdr._DISTURBANCE_SINK = sink
+    try:
+        rng = np.random.default_rng(0)
+        rdr._inject_disturbance(solver, rng, sigma=0.3, K=5, move_id=0, floor=0.15)
+    finally:
+        rdr._DISTURBANCE_SINK = orig_sink
+    # K steps -> K stepped actions -> K sink entries, each matching the step
+    assert len(solver.base_env.steps) == 5
+    assert len(sink) == 5
+    for stepped, captured in zip(solver.base_env.steps, sink):
+        assert np.allclose(np.asarray(stepped), np.asarray(captured))
+
+
+def test_inject_disturbance_asserts_unwrapped():
+    """If base_env is NOT env.unwrapped the in-code assert MUST fire (this is the
+    guard that keeps injected noise out of the recorded buffer)."""
+    rdr = _rdr()
+    solver = _FakeSolver([np.zeros(7)], multi_agent=False)
+    # break the contract: point the wrapped env's .unwrapped at a different obj
+    solver.env.unwrapped = _FakeBaseEnv()
+    rng = np.random.default_rng(0)
+    with pytest.raises(AssertionError):
+        rdr._inject_disturbance(solver, rng, sigma=0.3, K=2, move_id=0, floor=0.15)
+
+
+# ---------------------------------------------------------------------------
+# PURE: AUG2 — aug yamls + scene_builder randyaw_deg gating
+# ---------------------------------------------------------------------------
+import yaml  # noqa: E402
+
+# _DART_DIR == <repo>/scripts/dart -> repo root is two dirnames up.
+_REPO_ROOT = osp.dirname(osp.dirname(_DART_DIR))
+_CONFIG_DIR = osp.join(_REPO_ROOT, "robofactory", "configs", "table")
+
+
+def _load_yaml(name):
+    with open(osp.join(_CONFIG_DIR, name)) as f:
+        return yaml.safe_load(f)
+
+
+def _barrier_obj(cfg):
+    return cfg["objects"][0]  # LiftBarrier has a single object: the barrier
+
+
+def _cubes(cfg):
+    prims = cfg["scene"]["primitives"]
+    return [p for p in prims if p["name"] in ("cubeA", "cubeB", "cubeC")]
+
+
+def test_aug_yamls_exist_and_parse():
+    """AUG2: both _aug yamls exist and parse as valid YAML with the expected
+    top-level task_name."""
+    lb = _load_yaml("lift_barrier_aug.yaml")
+    tsc = _load_yaml("three_robots_stack_cube_aug.yaml")
+    assert lb["task_name"] == "LiftBarrier"
+    assert tsc["task_name"] == "ThreeRobotsStackCube"
+
+
+def test_aug_lift_barrier_wider_and_has_yaw():
+    """AUG2: the aug barrier's randp_scale is STRICTLY wider (>=, with at least
+    one strictly greater) than canonical, and carries randyaw_deg == 30."""
+    canon = _barrier_obj(_load_yaml("lift_barrier.yaml"))["pos"]
+    aug = _barrier_obj(_load_yaml("lift_barrier_aug.yaml"))["pos"]
+    c = np.asarray(canon["randp_scale"], dtype=np.float64)
+    a = np.asarray(aug["randp_scale"], dtype=np.float64)
+    assert (a >= c).all(), f"aug randp_scale {a} not >= canonical {c}"
+    assert (a > c).any(), f"aug randp_scale {a} is not strictly wider than {c}"
+    assert aug.get("randyaw_deg") == 30
+    # canonical must have NO yaw key (isolation; double-checked below too)
+    assert "randyaw_deg" not in canon
+
+
+def test_aug_stack_cube_wider_and_has_yaw():
+    """AUG2: every aug cube has randp_scale strictly wider than canonical (by
+    absolute magnitude — canonical uses a negative scale on cubeA's y) and
+    randyaw_deg == 30 (replacing the uncapped random_quaternions)."""
+    canon_cubes = {c["name"]: c["pos"] for c in _cubes(_load_yaml("three_robots_stack_cube.yaml"))}
+    aug_cubes = {c["name"]: c["pos"] for c in _cubes(_load_yaml("three_robots_stack_cube_aug.yaml"))}
+    assert set(aug_cubes) == {"cubeA", "cubeB", "cubeC"}
+    for name in ("cubeA", "cubeB", "cubeC"):
+        c = np.abs(np.asarray(canon_cubes[name]["randp_scale"], dtype=np.float64))
+        a = np.abs(np.asarray(aug_cubes[name]["randp_scale"], dtype=np.float64))
+        assert (a >= c).all(), f"{name}: aug |randp_scale| {a} not >= canonical {c}"
+        assert (a > c).any(), f"{name}: aug |randp_scale| {a} not strictly wider than {c}"
+        assert aug_cubes[name].get("randyaw_deg") == 30, f"{name} missing randyaw_deg==30"
+        # aug replaced the uncapped 360deg yaw with a bounded one
+        assert "random_quaternions" not in aug_cubes[name], \
+            f"{name}: aug must NOT keep uncapped random_quaternions"
+
+
+def test_canonical_yamls_unchanged_isolation():
+    """AUG2 ISOLATION: canonical yamls must be byte-equivalent to upstream in the
+    randomization fields — NO randyaw_deg key anywhere, original randp_scale, and
+    cubes still use the uncapped random_quaternions. Re-read from disk."""
+    lb = _load_yaml("lift_barrier.yaml")
+    tsc = _load_yaml("three_robots_stack_cube.yaml")
+    # canonical barrier: original randp_scale, no yaw key
+    bpos = _barrier_obj(lb)["pos"]
+    assert bpos["randp_scale"] == [0.3, 0.05, 0.]
+    assert "randyaw_deg" not in bpos
+    # canonical cubes: original randp_scale, random_quaternions present, no yaw key
+    canon = {c["name"]: c["pos"] for c in _cubes(tsc)}
+    assert canon["cubeA"]["randp_scale"] == [0.05, -0.05, 0.]
+    assert canon["cubeB"]["randp_scale"] == [0.05, 0.05, 0.]
+    assert canon["cubeC"]["randp_scale"] == [0.05, 0.05, 0.]
+    for name in ("cubeA", "cubeB", "cubeC"):
+        assert canon[name].get("random_quaternions") == [1, 1, 0]
+        assert "randyaw_deg" not in canon[name]
+
+
+def _apply_randyaw(qpos, randyaw_deg, rng_val):
+    """Reference of the scene_builder randyaw_deg block (gated identically in the
+    primitive and object branches): yaw in [-deg, +deg] applied as a LOCAL-frame
+    post-multiply of the base quaternion."""
+    from transforms3d.euler import euler2quat
+    from transforms3d.quaternions import qmult
+    yaw = np.deg2rad((rng_val * 2 - 1) * randyaw_deg)
+    dq = euler2quat(0, 0, yaw)
+    return qmult(np.array(qpos), dq)
+
+
+def test_randyaw_gating_no_key_is_noop():
+    """AUG2: the randyaw_deg block is KEY-GATED. A pos dict WITHOUT the key takes
+    the original code path unchanged (we assert by exercising the in-code guard
+    directly on a config dict: 'randyaw_deg' in pos is False -> qpos untouched)."""
+    pos_no_key = {"randp_scale": [0.1, 0.1, 0.0], "qpos": [1.0, 0.0, 0.0, 0.0]}
+    qpos = np.array(pos_no_key["qpos"])
+    # this mirrors the exact in-code guard: only mutate when the key is present
+    if "randyaw_deg" in pos_no_key:
+        qpos = _apply_randyaw(qpos, pos_no_key["randyaw_deg"], 0.7)
+    assert np.allclose(qpos, [1.0, 0.0, 0.0, 0.0])  # unchanged -> gated off
+
+
+def test_randyaw_deg_zero_is_noop():
+    """AUG2: randyaw_deg == 0 (or rng giving the midpoint) yields the identity
+    rotation, a safe no-op even when the key is present."""
+    qpos = [1.0, 0.0, 0.0, 0.0]
+    out = _apply_randyaw(qpos, 0.0, 0.42)        # deg=0 -> yaw=0 -> identity
+    assert np.allclose(out, qpos)
+    out2 = _apply_randyaw(qpos, 30.0, 0.5)        # rng_val=0.5 -> (1-1)... yaw=0
+    assert np.allclose(out2, qpos)
+
+
+def test_randyaw_pure_z_rotation_and_bounds():
+    """AUG2: applied to an identity base quat, randyaw_deg gives a PURE world-z
+    rotation (roll==pitch==0) bounded to [-deg, +deg], and the result stays a
+    unit quaternion."""
+    from transforms3d.euler import quat2euler
+    yaws = []
+    for s in range(500):
+        rng = np.random.default_rng(s)
+        q = _apply_randyaw([1.0, 0.0, 0.0, 0.0], 30.0, float(rng.random()))
+        assert abs(np.linalg.norm(q) - 1.0) < 1e-9     # unit quaternion
+        roll, pitch, yaw = quat2euler(q)
+        assert abs(roll) < 1e-9 and abs(pitch) < 1e-9  # pure z rotation
+        yaws.append(np.rad2deg(yaw))
+    yaws = np.array(yaws)
+    assert yaws.min() >= -30.0 - 1e-6 and yaws.max() <= 30.0 + 1e-6
+    assert yaws.std() > 5.0                              # genuinely random yaw
+    assert abs(yaws.mean()) < 3.0                        # symmetric about 0
+
+
+def test_scene_builder_randyaw_block_is_key_guarded():
+    """AUG2: source-level guard — both the primitive and object branches of
+    RFSceneBuilder.initialize mutate qpos ONLY inside `if 'randyaw_deg' in
+    ...['pos']:`. Asserts the gate exists twice so canonical (no-key) yamls keep
+    the byte-for-byte original path."""
+    import inspect
+    import robofactory.utils.scenes.scene_builder as sb
+    src = inspect.getsource(sb.RFSceneBuilder.initialize)
+    # exactly the two gated insertions (primitive + object branches)
+    assert src.count("'randyaw_deg' in primitive_cfg['pos']") == 1
+    assert src.count("'randyaw_deg' in asset_cfg['pos']") == 1
+    # both guarded blocks use the local-frame post-multiply
+    assert src.count("qmult(np.array(qpos), dq)") == 2
+
+
+# ---------------------------------------------------------------------------
 # SIM tests (GPU compute node only; DART_RUN_SIM=1)
 # ---------------------------------------------------------------------------
 def _run_liftbarrier_recovered(tmp_path, sigma=0.05, p_inject=0.5, dart_seed=0,

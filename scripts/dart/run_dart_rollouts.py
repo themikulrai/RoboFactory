@@ -138,11 +138,18 @@ _ORIG_MOVE = PandaArmMotionPlanningSolver.move_to_pose_with_screw
 _DISTURBANCE_SINK = None
 
 
-def _inject_disturbance(self, rng, sigma, K, move_id):
+def _inject_disturbance(self, rng, sigma, K, move_id, floor):
     """Step the UNWRAPPED env K times with a noisy joint target so the arm
     drifts off-path. NOT recorded (unwrapped env => RecordEpisode buffer is not
     touched). Only the 7 arm joints of the moving arm(s) get noise; gripper
     channel stays clean.
+
+    Magnitude floor (user wants "random everything but never trivial"): for each
+    moving arm we sample ONE random offset vector off ~ N(0, sigma, 7), and if
+    its L2 norm falls below ``floor`` we scale it UP to the floor while keeping
+    the random direction. The same q0+off target is then HELD for all K steps so
+    the net joint displacement is ~= off (>= floor) with random direction AND
+    magnitude. q0 (each moving arm's 7-joint qpos) is captured ONCE up front.
 
     Mirrors follow_path's single-agent (flat action) vs multi-agent (dict)
     branching so the hook is general even though LiftBarrier is multi-agent.
@@ -153,23 +160,34 @@ def _inject_disturbance(self, rng, sigma, K, move_id):
         "disturbance MUST use unwrapped env (else noise becomes a training label)"
     )
 
-    for _ in range(K):
-        if not self.is_multi_agent:
-            # single-agent: base.step takes a flat action [7 arm + gripper]
-            q = self.robot[0].get_qpos()[0, :-2].cpu().numpy()
-            if 0 in move_id:
-                q = q + rng.normal(0.0, sigma, size=q.shape[0])  # drift arm only
-            action = np.hstack([q, self.gripper_state[0]])  # gripper CLEAN
+    def _offset(n):
+        # random direction + magnitude; floored UP so it is never trivial.
+        off = rng.normal(0.0, sigma, size=n)
+        mag = float(np.linalg.norm(off))
+        if mag < floor:
+            off = off / (mag + 1e-9) * floor  # scale to floor, keep direction
+        return off
+
+    if not self.is_multi_agent:
+        # single-agent: base.step takes a flat action [7 arm + gripper]
+        q0 = self.robot[0].get_qpos()[0, :-2].cpu().numpy()  # captured ONCE
+        target = q0.copy()
+        if 0 in move_id:
+            target = q0 + _offset(q0.shape[0])  # drift arm only
+        action = np.hstack([target, self.gripper_state[0]])  # gripper CLEAN
+        for _ in range(K):  # HOLD the same drifted target
             if _DISTURBANCE_SINK is not None:
                 _DISTURBANCE_SINK.append(np.asarray(action, dtype=np.float64).copy())
             base.step(action)  # UNWRAPPED -> not recorded
-        else:
-            action_dict = {}
-            for aid in range(self.agent_num):
-                q = self.robot[aid].get_qpos()[0, :-2].cpu().numpy()
-                if aid in move_id:
-                    q = q + rng.normal(0.0, sigma, size=q.shape[0])  # 7 joints
-                action_dict[f"panda-{aid}"] = np.hstack([q, self.gripper_state[aid]])
+    else:
+        action_dict = {}
+        for aid in range(self.agent_num):
+            q0 = self.robot[aid].get_qpos()[0, :-2].cpu().numpy()  # captured ONCE
+            target = q0.copy()
+            if aid in move_id:
+                target = q0 + _offset(q0.shape[0])  # 7 joints
+            action_dict[f"panda-{aid}"] = np.hstack([target, self.gripper_state[aid]])
+        for _ in range(K):  # HOLD the same drifted target
             if _DISTURBANCE_SINK is not None:
                 _DISTURBANCE_SINK.append(
                     {k: np.asarray(v, dtype=np.float64).copy() for k, v in action_dict.items()}
@@ -177,17 +195,31 @@ def _inject_disturbance(self, rng, sigma, K, move_id):
             base.step(action_dict)  # UNWRAPPED -> not recorded
 
 
-def _make_dart_move(rng, sigma, k_min, k_max, p_inject):
+def _make_dart_move(rng, sigma, k_min, k_max, p_inject, floor, ep_counter):
     """Build the replacement move_to_pose_with_screw. Keeps the original
-    signature so existing solver code calls it unchanged."""
+    signature so existing solver code calls it unchanged.
+
+    ``ep_counter`` is a mutable dict {"n_calls", "n_injects"} owned by run() and
+    reset to zero immediately BEFORE each solver call. It guarantees >=1
+    injection per episode: the FIRST real (not dry_run) move always injects, so
+    an episode can never be silently mislabeled as DART while being clean. Every
+    later real move injects with probability p_inject — everything else stays
+    random.
+    """
 
     def dart_move(self, pose, dry_run=False, refine_steps=0, move_id=0, jump=1):
-        # only inject on REAL moves (dry_run is a planning-only probe) and only
-        # with probability p_inject; never perturb env RNG / seed reproducibility
-        # (we use a dedicated Generator passed in here).
-        if (not dry_run) and rng.random() < p_inject:
-            K = int(rng.integers(k_min, k_max + 1))
-            _inject_disturbance(self, rng, sigma, K, move_id)
+        # only inject on REAL moves (dry_run is a planning-only probe); never
+        # perturb env RNG / seed reproducibility (we use a dedicated Generator
+        # passed in here).
+        if not dry_run:
+            # force-inject on the FIRST real move of the episode; afterwards
+            # inject with probability p_inject. Guarantees n_injects >= 1.
+            force = ep_counter["n_calls"] == 0
+            ep_counter["n_calls"] += 1
+            if force or rng.random() < p_inject:
+                K = int(rng.integers(k_min, k_max + 1))
+                _inject_disturbance(self, rng, sigma, K, move_id, floor)
+                ep_counter["n_injects"] += 1
         return _ORIG_MOVE(
             self, pose, dry_run=dry_run, refine_steps=refine_steps,
             move_id=move_id, jump=jump,
@@ -215,9 +247,14 @@ def _load_seeds(task_name, num):
 
 def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
         dart_seed=0, max_retries_per_seed=5, per_attempt_timeout=300,
-        override_seeds=None, save_video=False):
+        override_seeds=None, save_video=False, inject_floor=0.15,
+        config_suffix=""):
     env_id, yaml_rel, solver, n_agents = TASK_MAP[task_name]
-    config_path = osp.join(CONFIG_DIR, yaml_rel)
+    # --config-suffix lets data-gen select an alternate yaml (e.g.
+    # table/lift_barrier_aug.yaml) WITHOUT touching eval: we splice the suffix in
+    # before the .yaml extension. Empty suffix -> original path unchanged.
+    config_rel = yaml_rel.replace(".yaml", f"{config_suffix}.yaml")
+    config_path = osp.join(CONFIG_DIR, config_rel)
 
     # --- output path (mirrors hf_download layout) ---
     output_dir = osp.join(record_dir, task_name)
@@ -269,8 +306,9 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
     )
     print(f"[dart] task={task_name}  env_id={env_id}  n_agents={n_agents}")
     print(f"[dart] output_h5={out_h5}")
-    print(f"[dart] sigma={sigma}  k=[{k_min},{k_max}]  p_inject={p_inject}  "
-          f"dart_seed={dart_seed}")
+    print(f"[dart] config={config_rel}  (suffix={config_suffix!r})")
+    print(f"[dart] sigma={sigma}  inject_floor={inject_floor}  "
+          f"k=[{k_min},{k_max}]  p_inject={p_inject}  dart_seed={dart_seed}")
 
     # Dedicated RNG so the disturbance draws NEVER perturb env RNG / the
     # reproducibility of the task seeds.
@@ -290,9 +328,15 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
     # the H5/JSON traj index. _episode_id starts at -1; first save -> 0.
     episodes_meta = []
 
+    # Episode-level injection counter shared with the monkeypatched move. Reset
+    # to zero immediately BEFORE each solver call (see the loop below) so the
+    # "first real move always injects" rule fires once PER EPISODE, guaranteeing
+    # n_injects >= 1 for every attempt.
+    ep_counter = {"n_calls": 0, "n_injects": 0}
+
     # --- install the DART monkeypatch (restored in finally:) ---
     PandaArmMotionPlanningSolver.move_to_pose_with_screw = _make_dart_move(
-        rng, sigma, k_min, k_max, p_inject
+        rng, sigma, k_min, k_max, p_inject, inject_floor, ep_counter
     )
 
     passed = 0
@@ -309,6 +353,8 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
         dart_meta = {
             "task": task_name,
             "sigma": float(sigma),
+            "inject_floor": float(inject_floor),
+            "config_suffix": str(config_suffix),
             "k_min": int(k_min),
             "k_max": int(k_max),
             "p_inject": float(p_inject),
@@ -329,6 +375,10 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
             timed_out_this_seed = False
             for attempt in range(max_retries_per_seed):
                 total_attempts += 1
+                # Reset the episode-level injection counter so the patched move
+                # force-injects on this episode's FIRST real move (>=1 guaranteed).
+                ep_counter["n_calls"] = 0
+                ep_counter["n_injects"] = 0
                 signal.alarm(int(per_attempt_timeout))
                 try:
                     res = solver(env, seed=seed, debug=False, vis=False)
@@ -352,10 +402,14 @@ def run(task_name, num, record_dir, sigma, k_min=5, k_max=15, p_inject=0.5,
                     env.flush_trajectory()
                     # episode_id of the just-saved traj == env._episode_id now.
                     episode_id = int(getattr(env, "_episode_id", passed))
+                    # n_injects is read from the shared counter for THIS episode
+                    # (next attempt resets it). Guaranteed >= 1 by construction.
                     episodes_meta.append({
                         "episode_id": episode_id,
-                        "seed": int(seed),
+                        "env_seed": int(seed),
+                        "seed": int(seed),     # back-compat alias
                         "sigma": float(sigma),
+                        "n_injects": int(ep_counter["n_injects"]),
                     })
                     # Persist the group-link B-tree to disk so a SIGKILL during
                     # the next solver call leaves a valid (truncated) H5, not a
@@ -418,6 +472,14 @@ if __name__ == "__main__":
     ap.add_argument("--sigma", type=float, required=True,
                     help="std-dev of Gaussian joint-target noise added to the "
                          "7 arm joints of the moving arm(s) during injection")
+    ap.add_argument("--inject-floor", type=float, default=0.15, dest="inject_floor",
+                    help="minimum L2 norm of the per-arm joint offset; offsets "
+                         "drawn below this are scaled UP to the floor (random "
+                         "direction kept) so a disturbance is never trivial")
+    ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
+                    help="suffix spliced before '.yaml' in the task config path "
+                         "(e.g. '_aug' -> table/lift_barrier_aug.yaml) so data-gen "
+                         "can pick an alternate scene WITHOUT touching eval")
     ap.add_argument("--k-min", type=int, default=5, dest="k_min",
                     help="min number of unwrapped noisy steps per injection")
     ap.add_argument("--k-max", type=int, default=15, dest="k_max",
@@ -452,4 +514,6 @@ if __name__ == "__main__":
         max_retries_per_seed=args.max_retries,
         per_attempt_timeout=args.per_attempt_timeout,
         override_seeds=override_seeds,
-        save_video=args.save_video)
+        save_video=args.save_video,
+        inject_floor=args.inject_floor,
+        config_suffix=args.config_suffix)
