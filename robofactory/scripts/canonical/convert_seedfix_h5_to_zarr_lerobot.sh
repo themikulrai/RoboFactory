@@ -253,11 +253,15 @@ case "$KIND" in
     if [[ ! -f "${CAM_MAP}" ]]; then
       echo "[conv] ERROR  missing camera_mapping JSON: ${CAM_MAP}"; exit 1
     fi
-    EXTRA_ARGS=(--camera_mapping "${CAM_MAP}")
-    # PickMeat uses dedicated prompts
-    if [[ "${TASK}" == "PickMeat" ]]; then
-      EXTRA_ARGS+=(--prompts_path "${CAM_MAP_DIR}/pick_meat_prompts.json")
+    # Every task gets its own per-task prompts (else converter falls back to the
+    # hardcoded TSC "stack the three cubes" DEFAULT_PROMPTS -> wrong language baked in).
+    PROMPTS="${CAM_MAP_DIR}/${SLUG_LC}_prompts.json"
+    if [[ ! -f "${PROMPTS}" ]]; then
+      echo "[conv] ERROR  missing prompts JSON: ${PROMPTS}"
+      echo "[conv]   refusing to fall back to converter DEFAULT_PROMPTS (wrong task language)."
+      exit 1
     fi
+    EXTRA_ARGS=(--camera_mapping "${CAM_MAP}" --prompts_path "${PROMPTS}")
     AGENT_NAME=panda_wristcam_multi
 
     echo "[conv] writing LeRobot repo=${REPO_ID}  cam_map=${CAM_MAP}"
