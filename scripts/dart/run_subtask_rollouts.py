@@ -182,7 +182,7 @@ def _member_passes(out):
     per-arm primitive queues empty — so ``completed`` is False even on a successful
     lift. Requiring ``completed`` alone therefore wrongly dropped EVERY success.
     We accept env-success OR completed instead. EVERY variant now ends with BOTH
-    arms lifting (simultaneous / stagger_* / sequential_lift — no truncated
+    arms lifting (simultaneous / stagger_* — no truncated
     approach-stop variant), so the normal path is:
       * the env terminates on the barrier lift -> env_success True (the lift's own
         check_barrier_lifted may not even have RUN before the early terminate, which

@@ -44,9 +44,23 @@ reference, re-emitted in each matched pair so each contrast is a clean A/B):
     lift together. COMPLETES. Counterfactual vs simultaneous: at frame 0 arm1 is
     ``wait`` here vs ``approach`` there.
   * ``stagger_b_leads`` (vs simultaneous): mirror — arm1 leads, arm0 waits.
-  * ``sequential_lift`` (vs simultaneous): both approach+close UNGATED
-    (simultaneously), but arm1's LIFT is gated on arm0 grasped (lift-timing
-    contrast). Both lift.
+
+DROPPED: ``sequential_lift``. For a rigid barrier BOTH ends must rise together or
+the bar tilts and never reaches centre-z success, so a lift-timing-only contrast is
+physically a NULL contrast: arm0 lifting alone immediately tilts the bar, so the
+sampler can't even encode "arm0 lifts first". Frame-0 was identical to simultaneous
+(both approaches ungated), so it added no usable coordination counterfactual.
+
+GATE MECHANISM (deterministic program-progress, NOT physics):
+The follower's wait gate is a DETERMINISTIC predicate on the LEAD arm's program
+progress (its ``_ArmState.qi``), NOT a physics ``is_grasping`` probe. The lead
+program is ``[approach(qi=0), close(qi=1), lift(qi=2)]`` and ``qi`` increments AFTER
+a primitive completes, so "lead has finished grasping" == ``lead.qi >= 2`` (it has
+finished approach+close and is now on its lift). ``GRASP_IDX = 2``. This makes the
+follower ALWAYS ``wait`` at frame 0 (lead starts at qi=0 < 2), unlike the old
+physics gate which opened early/inconsistently (the bar grasp seats late, so
+``is_grasping`` flickered True before the close ramp finished and the follower
+often did NOT actually wait).
 
 DEADLOCK GUARD: exactly ONE arm has an UNGATED first primitive in every variant
 (never gate arm0's first on arm1 AND arm1's first on arm0). ``gate_graph`` /
@@ -96,7 +110,7 @@ class ProgramSpec:
     variant_id : unique id within a single ``sample(seed)`` call.
     contrast_group_id : shared by the members of a matched contrastive pair;
         the rollout driver drops the WHOLE pair atomically if any member fails.
-    family : the family tag ("stagger_a", "stagger_b", "seq_lift").
+    family : the family tag ("stagger_a", "stagger_b").
     seed : the env reset seed this spec was sampled for.
     build : callable(planner, env) -> {arm: [QueuedRecipe]} (the program STRUCTURE;
         the per-primitive planning is deferred to each recipe, called JIT by the
@@ -156,21 +170,41 @@ def _lift_qp(target_id: int, *, dz: float = 0.2, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _gate_arm_grasping(other_arm: int, actor_name: str = "barrier") -> tuple:
-    """Build a ``wait_for`` gate: (other_arm, predicate(env, state)->bool).
+# Index into the lead program at which the lead arm has FINISHED grasping.
+# Lead program is [approach (qi=0), close (qi=1), lift (qi=2)]; ``_ArmState.qi``
+# increments AFTER a primitive completes (see subtask_interpreter.run_program: on
+# primitive completion ``a.qi += 1``). So the arm reaches ``qi >= 2`` exactly once
+# it has finished BOTH approach and close — i.e. it has grasped and is now on its
+# lift. There is NO seam-hold primitive between approach and close (the builders
+# emit approach->close->lift directly), so the index is the raw program position 2.
+GRASP_IDX = 2
+
+
+def _gate_other_reached(other_arm: int, min_qi: int) -> tuple:
+    """Build a DETERMINISTIC ``wait_for`` gate: (other_arm, predicate(env, state)).
+
+    The gate opens once the OTHER arm's PROGRAM PROGRESS has reached ``min_qi`` —
+    i.e. its ``_ArmState.qi`` (index of its CURRENT primitive) is >= ``min_qi``.
+    This is read from ``state["arms"][other_arm].qi`` (the interpreter passes its
+    live per-arm states in ``state``; see run_program's ``state = {..., "arms":
+    arms}``), NOT from any physics probe. ``qi`` increments AFTER a primitive
+    completes, so ``qi >= GRASP_IDX (=2)`` means the other arm has FINISHED its
+    approach+close and is now on its lift — it has grasped.
+
+    DETERMINISTIC vs the old physics gate: the lead starts at ``qi=0`` so the
+    follower ALWAYS waits at frame 0 (gate closed), and the gate opens at the exact
+    program step the lead's close completes — never early/flaky like
+    ``is_grasping`` (which seats late and flickered, so the follower often did not
+    actually wait).
 
     The interpreter calls gate predicates as ``predicate(env, state)`` (see
     subtask_interpreter._eval_gate) — a DIFFERENT signature from the per-primitive
-    ``success_check(env, arm, primitive)``. So we build a gate-shaped closure that
-    reads the named arm's live grasp state directly.
+    ``success_check(env, arm, primitive)``.
     """
     def _pred(env, state):
-        u = env.unwrapped if hasattr(env, "unwrapped") else env
-        actor = getattr(u, actor_name)
-        agent = u.agent.agents[other_arm]
-        g = agent.is_grasping(actor)
-        g = g.detach().cpu().numpy() if hasattr(g, "detach") else np.asarray(g)
-        return bool(np.asarray(g).reshape(-1)[0])
+        st = state.get("arms", {}) if hasattr(state, "get") else {}
+        a = st.get(other_arm)
+        return bool(a is not None and a.qi >= min_qi)
 
     return (other_arm, _pred)
 
@@ -217,14 +251,16 @@ def _make_stagger_builder(lead_arm: int) -> ProgramBuilder:
     follow_end = _left() if follow_arm == 0 else _right()
 
     def build(planner, env):
-        gate_on_lead = _gate_arm_grasping(lead_arm, "barrier")
+        # gate on the LEADER finishing its grasp (qi >= GRASP_IDX). DETERMINISTIC:
+        # the leader starts at qi=0, so the follower ALWAYS waits at frame 0.
+        gate_on_lead = _gate_other_reached(lead_arm, GRASP_IDX)
         return {
             # leader: ungated approach + close, then a lift gated on the FOLLOWER
             # having grasped (so both ends rise together).
             lead_arm: [
                 _approach_qp(lead_end),
                 _close_qp(lead_end),
-                _lift_qp(lead_end, wait_for=_gate_arm_grasping(follow_arm, "barrier")),
+                _lift_qp(lead_end, wait_for=_gate_other_reached(follow_arm, GRASP_IDX)),
             ],
             # follower: approach gated on the LEADER grasped, then close, then a lift
             # also gated on the leader grasped (already true by then -> rises with).
@@ -233,24 +269,6 @@ def _make_stagger_builder(lead_arm: int) -> ProgramBuilder:
                 _close_qp(follow_end),
                 _lift_qp(follow_end, wait_for=gate_on_lead),
             ],
-        }
-    return build
-
-
-def _make_sequential_lift_builder() -> ProgramBuilder:
-    """Both approach+close UNGATED (simultaneously); arm1's LIFT gated on arm0 grasp.
-
-    The lift-timing contrast vs simultaneous: arm0 lifts as soon as it has grasped,
-    arm1 waits for arm0's grasp before lifting. Both first primitives are ungated.
-    Both lift. (In practice arm0 grasps ~when arm1 does, so the gate is a short
-    timing nudge — the bar still rises together.)
-    """
-    def build(planner, env):
-        gate_on_arm0 = _gate_arm_grasping(0, "barrier")
-        return {
-            0: [_approach_qp(_left()), _close_qp(_left()), _lift_qp(_left())],
-            1: [_approach_qp(_right()), _close_qp(_right()),
-                _lift_qp(_right(), wait_for=gate_on_arm0)],
         }
     return build
 
@@ -363,13 +381,6 @@ def sample(seed: int) -> List[ProgramSpec]:
          {"lead_arm": 1, "follow_arm": 0, "complete": True})
     gid += 1
 
-    # (2) simultaneous  vs  sequential_lift (arm1 lift gated on arm0 grasp)
-    emit("simultaneous", "seq_lift", gid, _make_simultaneous_builder(),
-         {"lead_arm": None, "gated": False, "complete": True})
-    emit("sequential_lift", "seq_lift", gid, _make_sequential_lift_builder(),
-         {"gated_lift_arm": 1, "gate_on_arm": 0, "complete": True})
-    gid += 1
-
     return specs
 
 
@@ -409,6 +420,8 @@ if __name__ == "__main__":
         assert len(members) == 2, (gid, names)  # every group is a matched pair
         assert "simultaneous" in names, (gid, names)  # baseline in every pair
         print(f"  group {gid} [{members[0].family}]: {names}")
+    assert len(s) == 4 and len(by_group) == 2, (len(s), len(by_group))
+    assert {m.family for m in s} == {"stagger_a", "stagger_b"}
     # variant ids unique
     assert len({m.variant_id for m in s}) == len(s)
     # seed reproducible (same structural draws)

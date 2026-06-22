@@ -325,15 +325,17 @@ def test_dry_run_pose_list_returns_single_plan_stub():
 # ===========================================================================
 # PURE: contrastive scenario sampler (all-complete-rollout coordination contrast)
 #
-# New family set (3 matched pairs, 6 variants). Every pair is {simultaneous, X}
+# New family set (2 matched pairs, 4 variants). Every pair is {simultaneous, X}
 # from ONE seed; the contrast is COORDINATION (who waits/leads), NOT truncation —
-# every variant ends with BOTH arms lifting (a complete rollout).
+# every variant ends with BOTH arms lifting (a complete rollout). seq_lift was
+# DROPPED: a rigid barrier needs both ends to rise together, so a lift-timing-only
+# contrast is a physical null (frame-0 identical to simultaneous).
 # ===========================================================================
-def test_sampler_emits_three_matched_pairs():
+def test_sampler_emits_two_matched_pairs():
     specs = S.sample(7)
     groups = S.group_specs(specs)
-    assert len(specs) == 6
-    assert len(groups) == 3
+    assert len(specs) == 4
+    assert len(groups) == 2
     for gid, members in groups.items():
         assert len(members) == 2, (gid, [m.name for m in members])
         # both members share family + contrast_group_id
@@ -342,14 +344,14 @@ def test_sampler_emits_three_matched_pairs():
         # the simultaneous baseline is in EVERY pair (clean A/B)
         assert "simultaneous" in {m.name for m in members}, [m.name for m in members]
     families = {m.family for m in specs}
-    assert families == {"stagger_a", "stagger_b", "seq_lift"}
+    assert families == {"stagger_a", "stagger_b"}
     names = {m.name for m in specs}
-    assert names == {"simultaneous", "stagger_a_leads", "stagger_b_leads",
-                     "sequential_lift"}
-    # the OLD families/variants are GONE
+    assert names == {"simultaneous", "stagger_a_leads", "stagger_b_leads"}
+    # the OLD families/variants are GONE (incl. the dropped seq_lift / sequential_lift)
     assert not (names & {"approach_stop", "approach_grasp_lift", "arms_LR",
                          "arms_RL", "grasp_and_hold", "grasp_and_release",
-                         "sequential"})
+                         "sequential", "sequential_lift"})
+    assert "seq_lift" not in families
 
 
 def test_sampler_variant_ids_unique_and_reproducible():
@@ -396,8 +398,8 @@ def test_filter_variants_keeps_groups_intact():
     names = sorted(m.name for m in out)
     assert names == ["simultaneous", "stagger_a_leads"]
     # ask by family
-    out2 = S.filter_variants(specs, ["seq_lift"])
-    assert sorted(m.name for m in out2) == ["sequential_lift", "simultaneous"]
+    out2 = S.filter_variants(specs, ["stagger_b"])
+    assert sorted(m.name for m in out2) == ["simultaneous", "stagger_b_leads"]
     # None -> everything
     assert len(S.filter_variants(specs, None)) == len(specs)
     # unknown -> nothing
@@ -503,20 +505,49 @@ def test_sampler_stagger_b_is_mirror():
     assert first_gates[0] == 1          # follower (arm0) waits on arm1
 
 
-def test_sampler_sequential_lift_gates_only_arm1_lift():
-    """sequential_lift: both approach+close ungated; only arm1's LIFT is gated."""
+class _FakeArmState:
+    """Minimal stand-in for subtask_interpreter._ArmState exposing only ``.qi``
+    (the index of the arm's CURRENT primitive). Lets us probe the follower's
+    wait gate deterministically OFF-GPU, with no sim and no _ArmState import."""
+
+    def __init__(self, qi):
+        self.qi = int(qi)
+
+
+def test_stagger_follower_wait_gate_is_deterministic_program_progress():
+    """LOCK the deterministic-wait off-GPU: the follower's FIRST QueuedRecipe has a
+    wait_for whose predicate is FALSE while the lead arm sits at qi=0 (not grasped)
+    and TRUE once lead.qi >= GRASP_IDX (finished approach+close = grasped). This is
+    the fix for the flaky physics gate — it depends ONLY on program progress, never
+    on a physics is_grasping probe.
+
+    We check BOTH stagger variants (a leads -> arm0 leads, follower arm1; b leads ->
+    arm1 leads, follower arm0)."""
     specs = S.sample(7)
-    spec = next(m for m in specs if m.name == "sequential_lift")
-    pl, env = FakePlanner(num_arms=2), FakeEnv()
-    prog = spec.build(pl, env)
-    first_gates = S.gate_graph(prog)
-    # both first primitives (approaches) ungated -> simultaneous start
-    assert first_gates[0] is None and first_gates[1] is None
-    # exactly ONE gate in the whole program, on arm1's lift
-    gated = [(arm, qi) for arm, q in prog.items()
-             for qi, qr in enumerate(q) if qr.wait_for]
-    assert gated == [(1, 2)], gated
-    assert prog[1][2].recipe(pl, env, 1).verb_id == vocab.LIFT
+    assert S.GRASP_IDX == 2  # the program-position index of the lift = grasp done
+    for name, lead, follow in (("stagger_a_leads", 0, 1),
+                               ("stagger_b_leads", 1, 0)):
+        spec = next(m for m in specs if m.name == name)
+        pl, env = FakePlanner(num_arms=2), FakeEnv()
+        prog = spec.build(pl, env)
+        # the follower's FIRST primitive (approach) must carry a wait_for on the lead
+        gate = prog[follow][0].wait_for
+        assert gate is not None, name
+        other_arm, predicate = gate
+        assert other_arm == lead, (name, other_arm)
+        # construct fake interpreter state dicts exposing the lead arm's .qi
+        def _state(lead_qi):
+            return {"arms": {lead: _FakeArmState(lead_qi),
+                             follow: _FakeArmState(0)}}
+        # lead not started / not grasped -> follower WAITS (gate closed)
+        assert predicate(env, _state(0)) is False, name
+        assert predicate(env, _state(1)) is False, name  # only finished approach
+        # lead finished approach+close (qi >= GRASP_IDX) -> gate OPENS
+        assert predicate(env, _state(S.GRASP_IDX)) is True, name
+        assert predicate(env, _state(S.GRASP_IDX + 1)) is True, name
+        # robust to a missing/empty arms map -> gate stays closed (no crash)
+        assert predicate(env, {}) is False, name
+        assert predicate(env, {"arms": {}}) is False, name
 
 
 # ===========================================================================
@@ -709,17 +740,23 @@ def test_sim_idle_arm_wait_and_frozen():
 
 @sim
 def test_sim_barrier_gating_blocks_until_grasp():
+    """stagger_a_leads: the follower (arm1) is GATED on the leader (arm0) finishing
+    its grasp (program progress qi >= GRASP_IDX). arm1 holds (wait) at frame 0 and
+    only begins its approach after arm0 grasps; both arms ultimately lift."""
     env, Solver = _make_sim_env()
     try:
-        spec = next(m for m in S.sample(0) if m.name == "sequential_lift")
+        spec = next(m for m in S.sample(0) if m.name == "stagger_a_leads")
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
         I.run_program(env, planner, prog, rec, max_steps=800,
                       control_mode=planner.control_mode)
         a = rec.to_arrays()
-        # arm1's LIFT is gated on arm0 grasp; arm1 still completes its approach+close
-        # but the LIFT only starts after the gate. Both arms ultimately lift.
+        # arm1 (follower) WAITS at frame 0 (gate closed: arm0 not yet grasped).
+        assert a["subtask_arm1_verb"][0] == vocab.WAIT
+        # the leader (arm0) starts its approach immediately (ungated).
+        assert a["subtask_arm0_verb"][0] == vocab.APPROACH
+        # both arms ultimately lift (complete rollout, ends rise together).
         assert vocab.LIFT in set(a["subtask_arm1_verb"])
         assert vocab.LIFT in set(a["subtask_arm0_verb"])
     finally:
@@ -748,13 +785,18 @@ def test_sim_success_checks_fire():
 def test_sim_contrastive_frame0_identical_coordination_diverges():
     """simultaneous vs stagger_a_leads from the SAME seed: frame-0 obs identical,
     but the COORDINATION diverges — in stagger_a_leads the follower (arm1) is
-    WAITING at frame 0 (gated on arm0's grasp) whereas in simultaneous arm1
-    approaches immediately. BOTH variants still complete (both arms lift)."""
+    WAITING at frame 0 (gated on arm0's grasp, a DETERMINISTIC program-progress
+    gate) whereas in simultaneous arm1 approaches immediately. BOTH variants reach
+    env-success (a complete both-ends-lifted rollout). The deterministic gate makes
+    the frame-0 WAIT reproducible (the old physics is_grasping gate opened early and
+    arm1 often did NOT wait)."""
+    from run_subtask_rollouts import _env_success
     env, Solver = _make_sim_env()
     try:
         specs = {m.name: m for m in S.sample(0)
                  if m.name in ("simultaneous", "stagger_a_leads")}
         recs = {}
+        outs = {}
         first_qpos = {}
         for name, spec in specs.items():
             planner = _build_sim_planner(env, Solver, spec.seed)
@@ -764,20 +806,21 @@ def test_sim_contrastive_frame0_identical_coordination_diverges():
                                 else np.asarray(q0)).copy()
             rec = I.SubtaskRecorder(num_arms=2)
             prog = spec.build(planner, env)
-            I.run_program(env, planner, prog, rec, max_steps=800,
-                          control_mode=planner.control_mode)
+            outs[name] = I.run_program(env, planner, prog, rec, max_steps=800,
+                                       control_mode=planner.control_mode)
             recs[name] = rec.to_arrays()
         # frame-0 identical (same reset seed, sampler RNG independent)
         assert np.allclose(first_qpos["simultaneous"],
                            first_qpos["stagger_a_leads"], atol=1e-5)
         # COORDINATION contrast at frame 0: simultaneous -> arm1 approaches; stagger
-        # -> arm1 waits (gated on arm0 grasp).
+        # -> arm1 waits (DETERMINISTICALLY gated on arm0's program progress).
         assert recs["simultaneous"]["subtask_arm1_verb"][0] == vocab.APPROACH
         assert recs["stagger_a_leads"]["subtask_arm1_verb"][0] == vocab.WAIT
-        # BOTH variants complete: both arms lift in each.
+        # BOTH variants complete AND reach env-success (the barrier actually lifts).
         for name in ("simultaneous", "stagger_a_leads"):
             assert vocab.LIFT in set(recs[name]["subtask_arm0_verb"]), name
             assert vocab.LIFT in set(recs[name]["subtask_arm1_verb"]), name
+            assert _env_success(outs[name]["info"]), name
     finally:
         env.close()
 
