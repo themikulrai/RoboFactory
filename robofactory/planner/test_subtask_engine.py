@@ -190,14 +190,35 @@ def _qp(planner, arm):
     return planner.robot[arm].get_qpos()[0, :7].astype(np.float32)
 
 
+def _approach_recipe(target_id, *, grip=OPEN, success_check=None):
+    """Wrap P.approach into a PrimitiveRecipe(planner, env, arm) for tests."""
+    def recipe(planner, env, arm):
+        return P.approach(planner, env, arm=arm, target_id=target_id,
+                          task="LiftBarrier", grip=grip, success_check=success_check)
+    return recipe
+
+
+def _close_recipe(success_check=None):
+    def recipe(planner, env, arm):
+        return P.close_gripper(planner, env, arm=arm, task="LiftBarrier",
+                               success_check=success_check)
+    return recipe
+
+
+def _hold_recipe(n):
+    def recipe(planner, env, arm):
+        return P.hold(planner, env, arm=arm, n=n, task="LiftBarrier")
+    return recipe
+
+
 def test_recorder_length_equals_steps_and_aligned():
     pl, env = FakePlanner(num_arms=2), FakeEnv()
     rec = I.SubtaskRecorder(num_arms=2)
     progs = {
-        0: [I.QueuedPrimitive(P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier")),
-            I.QueuedPrimitive(P.close_gripper(pl, env, 0, "LiftBarrier"))],
-        1: [I.QueuedPrimitive(P.approach(pl, env, 1, vocab.LB_TARGETS["right_end"], "LiftBarrier")),
-            I.QueuedPrimitive(P.close_gripper(pl, env, 1, "LiftBarrier"))],
+        0: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["left_end"])),
+            I.QueuedRecipe(_close_recipe())],
+        1: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["right_end"])),
+            I.QueuedRecipe(_close_recipe())],
     }
     out = I.run_program(env, pl, progs, rec, max_steps=200)
     # both arms: 5 approach + 20 close = 25 ticks each, run simultaneously
@@ -217,7 +238,7 @@ def test_idle_arm_labelled_wait_and_frozen():
     """Arm1 has no program -> labelled wait every tick AND holds frozen qpos."""
     pl, env = FakePlanner(num_arms=2), FakeEnv()
     rec = I.SubtaskRecorder(num_arms=2)
-    progs = {0: [I.QueuedPrimitive(P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier"))],
+    progs = {0: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["left_end"]))],
              1: []}
     out = I.run_program(env, pl, progs, rec, max_steps=50)
     a = rec.to_arrays()
@@ -239,18 +260,15 @@ def test_barrier_gating_blocks_until_predicate():
         return grasped["v"]
 
     # arm0: approach(5) then a close that flips the grasp predicate when it finishes
-    close0 = P.close_gripper(pl, env, 0, "LiftBarrier")
-
     def flip_check(env, arm, prim):
         grasped["v"] = True
         return True
-    close0.success_check = flip_check
 
     progs = {
-        0: [I.QueuedPrimitive(P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier")),
-            I.QueuedPrimitive(close0)],
-        1: [I.QueuedPrimitive(
-                P.approach(pl, env, 1, vocab.LB_TARGETS["right_end"], "LiftBarrier"),
+        0: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["left_end"])),
+            I.QueuedRecipe(_close_recipe(success_check=flip_check))],
+        1: [I.QueuedRecipe(
+                _approach_recipe(vocab.LB_TARGETS["right_end"]),
                 wait_for=(0, arm0_grasped))],
     }
     out = I.run_program(env, pl, progs, rec, max_steps=200)
@@ -265,16 +283,16 @@ def test_success_check_records_per_primitive():
     pl, env = FakePlanner(num_arms=1), FakeEnv()
     rec = I.SubtaskRecorder(num_arms=1)
     # one approach with a success_check that returns False (liar-label guard)
-    prim = P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier",
-                      success_check=lambda env, arm, p: False)
-    progs = {0: [I.QueuedPrimitive(prim)]}
+    progs = {0: [I.QueuedRecipe(
+        _approach_recipe(vocab.LB_TARGETS["left_end"],
+                         success_check=lambda env, arm, p: False))]}
     out = I.run_program(env, pl, progs, rec, max_steps=50)
     assert out["success"][0][0] is False
     assert out["all_success"] is False
 
 
 def test_boundary_hook_called_between_primitives_unrecorded():
-    """boundary_hook fires at primitive transitions and does NOT add recorded steps."""
+    """boundary_hook fires BETWEEN primitives and does NOT add recorded steps."""
     pl, env = FakePlanner(num_arms=1), FakeEnv()
     rec = I.SubtaskRecorder(num_arms=1)
     calls = {"n": 0}
@@ -283,17 +301,111 @@ def test_boundary_hook_called_between_primitives_unrecorded():
         calls["n"] += 1
 
     progs = {0: [
-        I.QueuedPrimitive(P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier")),
-        I.QueuedPrimitive(P.close_gripper(pl, env, 0, "LiftBarrier")),
-        I.QueuedPrimitive(P.hold(pl, env, 0, 3, "LiftBarrier")),
+        I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["left_end"])),
+        I.QueuedRecipe(_close_recipe()),
+        I.QueuedRecipe(_hold_recipe(3)),
     ]}
     n_steps_before = env.n_steps
     out = I.run_program(env, pl, progs, rec, max_steps=200, boundary_hook=hook)
-    # hook fires once per primitive entry (3 primitives) -> 3 calls
-    assert calls["n"] == 3
+    # hook fires BETWEEN primitives, NOT before the first: 3 primitives ->
+    # 2 transitions -> 2 calls (the B1 between-primitives contract).
+    assert calls["n"] == 2
     # recorded steps == sum of ticks (5 + 20 + 3); hook added none
     assert out["steps"] == 28
     assert rec.length == 28
+
+
+def test_boundary_hook_not_refired_while_gated():
+    """A blocked (gated) arm must NOT re-fire the boundary_hook every waiting tick.
+
+    arm1's 2nd primitive (a gated close) waits on a predicate that flips True at
+    step 10. The hook fires only on REAL primitive transitions (an arm actually
+    ENTERING a new primitive), never on a blocked-wait tick. arm0 runs a single
+    approach (its first primitive -> no transition). So the ONLY hook fire is arm1's
+    transition approach->close, once, after the gate opens. (Pre-fix this fired on
+    every one of arm1's waiting ticks.)"""
+    pl, env = FakePlanner(num_arms=2, n_waypoints=5), FakeEnv()
+    rec = I.SubtaskRecorder(num_arms=2)
+    calls = {"n": 0}
+
+    def hook(unwrapped_env, state):
+        calls["n"] += 1
+
+    def gate_opens_at_10(env, state):
+        return state["step"] >= 10
+
+    progs = {
+        # arm0 runs long enough (40 ticks) that arm1's close finishes within bounds
+        0: [I.QueuedRecipe(_hold_recipe(40))],
+        # arm1: approach (5 ticks, done at step 5) then a GATED close that can't
+        # start until step>=10 -> arm1 idles ticks 5..9, then enters close at 10.
+        1: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["right_end"])),
+            I.QueuedRecipe(_close_recipe(), wait_for=(0, gate_opens_at_10))],
+    }
+    out = I.run_program(env, pl, progs, rec, max_steps=200, boundary_hook=hook,
+                        check_success_coverage="off")
+    a = rec.to_arrays()
+    # arm1: 5 approach, then WAIT (blocked on gate) ticks 5..9, then close at 10
+    assert list(a["subtask_arm1_verb"][:5]) == [vocab.APPROACH] * 5
+    assert list(a["subtask_arm1_verb"][5:10]) == [vocab.WAIT] * 5
+    assert a["subtask_arm1_verb"][10] == vocab.CLOSE_GRIPPER
+    # hook fired EXACTLY ONCE: arm1's approach->close transition (gate-released),
+    # NOT once per blocked-wait tick (the bug) and NOT for either first primitive.
+    assert calls["n"] == 1, calls["n"]
+
+
+def test_second_primitive_built_at_entry_from_live_qpos():
+    """JIT building (BUG-A fix): the 2nd primitive's recipe is invoked DURING
+    run_program, AFTER the first primitive has executed its ticks — NOT upfront.
+
+    We record the env.n_steps at the moment each recipe is called. The approach
+    recipe (qi=0) must be built at step 0 (arm at reset); the close recipe (qi=1)
+    must be built only AFTER the 5 approach ticks have stepped (i.e. n_steps==5),
+    reading the LIVE qpos at that point (not the HOME pose)."""
+    pl, env = FakePlanner(num_arms=1, n_waypoints=5), FakeEnv()
+    rec = I.SubtaskRecorder(num_arms=1)
+    built_at = []  # (label, env.n_steps, qpos_seen) per recipe invocation
+
+    def approach_recipe(planner, e, arm):
+        prim = P.approach(planner, e, arm=arm, target_id=vocab.LB_TARGETS["left_end"],
+                          task="LiftBarrier")
+        built_at.append(("approach", e.n_steps, P._current_qpos(planner, arm).copy()))
+        return prim
+
+    def close_recipe(planner, e, arm):
+        # read the live qpos AT BUILD TIME so we can prove it's the entry state
+        q_live = P._current_qpos(planner, arm).copy()
+        built_at.append(("close", e.n_steps, q_live))
+        return P.close_gripper(planner, e, arm=arm, task="LiftBarrier")
+
+    progs = {0: [I.QueuedRecipe(approach_recipe), I.QueuedRecipe(close_recipe)]}
+    # check_success_coverage="off": the lint would otherwise PROBE-build every
+    # recipe pre-run (polluting built_at). Off keeps built_at = the RUN invocations.
+    out = I.run_program(env, pl, progs, rec, max_steps=200,
+                        check_success_coverage="off")
+    assert out["steps"] == 25  # 5 approach + 20 close
+    # exactly two recipe invocations, in order, at the right step counts
+    labels = [b[0] for b in built_at]
+    assert labels == ["approach", "close"], built_at
+    assert built_at[0][1] == 0, "approach must be built at entry (step 0)"
+    assert built_at[1][1] == 5, ("close must be built AT ENTRY after the 5 approach "
+                                 f"ticks stepped, not upfront; saw n_steps={built_at[1][1]}")
+
+
+def test_recipe_not_invoked_before_run_program():
+    """Building the program (the spec.build) must NOT plan: recipes are only
+    invoked by run_program. Here we never call run_program and assert the recipe
+    was not called (no planning side effects)."""
+    pl, env = FakePlanner(num_arms=1), FakeEnv()
+    invoked = {"n": 0}
+
+    def recipe(planner, e, arm):
+        invoked["n"] += 1
+        return P.approach(planner, e, arm=arm, target_id=vocab.LB_TARGETS["left_end"],
+                          task="LiftBarrier")
+
+    _ = I.QueuedRecipe(recipe)  # merely queuing must not build/plan
+    assert invoked["n"] == 0
 
 
 def test_flush_length_guard_raises_on_mismatch():
@@ -307,8 +419,8 @@ def test_flush_npz_roundtrip(tmp_path):
     pl, env = FakePlanner(num_arms=2), FakeEnv()
     rec = I.SubtaskRecorder(num_arms=2)
     progs = {
-        0: [I.QueuedPrimitive(P.approach(pl, env, 0, vocab.LB_TARGETS["left_end"], "LiftBarrier"))],
-        1: [I.QueuedPrimitive(P.approach(pl, env, 1, vocab.LB_TARGETS["right_end"], "LiftBarrier"))],
+        0: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["left_end"]))],
+        1: [I.QueuedRecipe(_approach_recipe(vocab.LB_TARGETS["right_end"]))],
     }
     out = I.run_program(env, pl, progs, rec, max_steps=50)
     path = rec.flush(episode_id=3, out_dir=str(tmp_path), expected_T=out["steps"])

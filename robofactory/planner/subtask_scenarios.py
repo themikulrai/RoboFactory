@@ -1,16 +1,23 @@
 """LiftBarrier subtask scenario + CONTRASTIVE program sampler.
 
 A "scenario" turns a random seed into a list of :class:`ProgramSpec` objects.
-Each spec is a *recipe* that, given a live ``(planner, env)``, builds a per-arm
-program ``{arm: [QueuedPrimitive]}`` for ``subtask_interpreter.run_program``.
+Each spec is a *builder* that, given a live ``(planner, env)``, returns a per-arm
+program ``{arm: [QueuedRecipe]}`` for ``subtask_interpreter.run_program``.
 
-Why a recipe (a builder callable) and not a pre-built program? Primitives plan
-via ``move_to_pose_with_screw(..., dry_run=True)`` against the LIVE actor pose
-(see ``subtask_primitives``). The interpreter resets the env to the seed right
-before running, so the program must be built AFTER reset, against the freshly
-reset env. The sampler therefore stays SIM-FREE: it only decides *structure*
-(which arm grasps which end, gating, hold lengths) using its own RNG, and the
-builders read the live env at run time.
+TWO levels of laziness:
+  * ``spec.build(planner, env)`` returns the program STRUCTURE (per-arm lists of
+    :class:`~.subtask_interpreter.QueuedRecipe`). It does NOT plan — each
+    ``QueuedRecipe`` wraps a :data:`PrimitiveRecipe` callable.
+  * The interpreter calls ``recipe(planner, env, arm)`` JUST-IN-TIME, when the arm
+    ENTERS that primitive, so each primitive plans (per-arm ``dry_run`` screw plan)
+    against the LIVE pose the arm is actually in — not the HOME pose at reset. This
+    is the correct-start-state fix: ``close``/``lift`` after an ``approach`` now plan
+    from the reached pose, and a boundary_hook object perturbation is absorbed by
+    the next recipe.
+
+The sampler stays SIM-FREE: it only decides *structure* (which arm grasps which
+end, gating, hold lengths) using its own RNG; all planning happens later inside the
+recipes at run time.
 
 CONTRASTIVE design (the crux of the data aug, see plan):
 Matched variants are sampled from the SAME seed with an INDEPENDENT
@@ -48,7 +55,7 @@ import numpy as np
 from . import subtask_vocab as vocab
 from . import subtask_primitives as P
 from .subtask_interpreter import (
-    QueuedPrimitive,
+    QueuedRecipe,
     check_is_grasping,
     check_tcp_near,
     check_barrier_lifted,
@@ -58,8 +65,8 @@ LB = "LiftBarrier"
 # LiftBarrier has exactly 2 arms.
 LB_NUM_ARMS = 2
 
-# A builder takes the live (planner, env) and returns {arm: [QueuedPrimitive]}.
-ProgramBuilder = Callable[[object, object], Dict[int, List[QueuedPrimitive]]]
+# A builder takes the live (planner, env) and returns {arm: [QueuedRecipe]}.
+ProgramBuilder = Callable[[object, object], Dict[int, List[QueuedRecipe]]]
 
 
 @dataclass
@@ -74,7 +81,9 @@ class ProgramSpec:
         the rollout driver drops the WHOLE group atomically if any member fails.
     family : the family tag ("a_approach", "b_armswap", "c_gate", "d_hold").
     seed : the env reset seed this spec was sampled for.
-    build : callable(planner, env) -> {arm: [QueuedPrimitive]} (built post-reset).
+    build : callable(planner, env) -> {arm: [QueuedRecipe]} (the program STRUCTURE;
+        the per-primitive planning is deferred to each recipe, called JIT by the
+        interpreter at primitive entry).
     num_arms : arms this program drives (2 for LiftBarrier).
     meta : free-form structure metadata (which arm took which end, gate, etc.).
     """
@@ -89,50 +98,50 @@ class ProgramSpec:
     meta: Dict = field(default_factory=dict)
 
 
-# --------------------------------------------------------------------------- LB builders
-# Each builder is a closure over the STRUCTURE decided by the sampler (which arm
-# grasps which end, gating, hold length). It reads the live env at call time.
+# --------------------------------------------------------------------------- LB recipes
+# Each ``_*_qp`` returns a QueuedRecipe wrapping a PrimitiveRecipe closure
+# ``recipe(planner, env, arm) -> Primitive``. The closure captures the STRUCTURE
+# decided by the sampler (target end, grip, hold length); the interpreter calls it
+# JIT at primitive entry so it plans (per-arm dry_run screw plan) from the LIVE pose
+# the arm is actually in at that moment.
 
 
-def _lb_target_pose_fn(target_id: int):
-    """A target_pose_fn(env, arm) for check_tcp_near: live LB end grasp xyz."""
-    def _fn(env, arm):
-        u = env.unwrapped if hasattr(env, "unwrapped") else env
-        # resolve_lb_end_grasp_pose needs the planner; the interpreter passes env
-        # only, so re-resolve from the barrier annotation directly via the actor.
-        # We reuse the planner stashed on state isn't available here, so fall back
-        # to the contact-point world pose via the barrier transform. Simpler: use
-        # the barrier centre as a coarse target (check_tcp_near tol is generous).
-        return np.asarray(u.barrier.pose.p).reshape(-1)[:3]
-    return _fn
+def _approach_qp(target_id: int, *, grip: float,
+                 success_tol: float = 0.08) -> QueuedRecipe:
+    """approach recipe: plan a reach to the target end's grasp pose (no close).
+
+    success_check = check_tcp_near() with NO fn -> reads the primitive's stored
+    ``target_pose`` (the resolved grasp xyz). TCP converges to that planned pose, so
+    "TCP within tol of target_pose" is the correct check (the old barrier-CENTRE fn
+    was ~0.37m off and could never pass).
+    """
+    def recipe(planner, env, arm: int) -> P.Primitive:
+        sc = check_tcp_near(tol=success_tol)
+        return P.approach(planner, env, arm=arm, target_id=target_id, task=LB,
+                          grip=grip, success_check=sc)
+    return QueuedRecipe(recipe)
 
 
-def _approach_qp(planner, env, arm: int, target_id: int, *, grip: float,
-                 success_tol: float = 0.08) -> QueuedPrimitive:
-    sc = check_tcp_near(_lb_target_pose_fn(target_id), tol=success_tol)
-    prim = P.approach(planner, env, arm=arm, target_id=target_id, task=LB,
-                      grip=grip, success_check=sc)
-    return QueuedPrimitive(prim)
+def _close_qp(target_id: int) -> QueuedRecipe:
+    def recipe(planner, env, arm: int) -> P.Primitive:
+        sc = check_is_grasping("barrier")
+        return P.close_gripper(planner, env, arm=arm, task=LB, start_grip=P.OPEN,
+                               target_id=target_id, success_check=sc)
+    return QueuedRecipe(recipe)
 
 
-def _close_qp(planner, env, arm: int, target_id: int) -> QueuedPrimitive:
-    sc = check_is_grasping("barrier")
-    prim = P.close_gripper(planner, env, arm=arm, task=LB, start_grip=P.OPEN,
-                           target_id=target_id, success_check=sc)
-    return QueuedPrimitive(prim)
+def _lift_qp(target_id: int, *, dz: float = 0.2, wait_for=None) -> QueuedRecipe:
+    def recipe(planner, env, arm: int) -> P.Primitive:
+        sc = check_barrier_lifted(dz=0.15)
+        return P.lift(planner, env, arm=arm, target_id=target_id, task=LB, dz=dz,
+                      grip=P.CLOSED, success_check=sc)
+    return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _lift_qp(planner, env, arm: int, target_id: int, *, dz: float = 0.2,
-             wait_for=None) -> QueuedPrimitive:
-    sc = check_barrier_lifted(dz=0.15)
-    prim = P.lift(planner, env, arm=arm, target_id=target_id, task=LB, dz=dz,
-                  grip=P.CLOSED, success_check=sc)
-    return QueuedPrimitive(prim, wait_for=wait_for)
-
-
-def _hold_qp(planner, env, arm: int, n: int, *, grip: float) -> QueuedPrimitive:
-    prim = P.hold(planner, env, arm=arm, n=n, task=LB, grip=grip)
-    return QueuedPrimitive(prim)
+def _hold_qp(n: int, *, grip: float) -> QueuedRecipe:
+    def recipe(planner, env, arm: int) -> P.Primitive:
+        return P.hold(planner, env, arm=arm, n=n, task=LB, grip=grip)
+    return QueuedRecipe(recipe)
 
 
 def _gate_arm_grasping(other_arm: int, actor_name: str = "barrier") -> tuple:
@@ -164,12 +173,12 @@ def _make_approach_stop_builder(arm_left: int, arm_right: int,
     def build(planner, env):
         return {
             arm_left: [
-                _approach_qp(planner, env, arm_left, vocab.LB_TARGETS["left_end"], grip=P.OPEN),
-                _hold_qp(planner, env, arm_left, seam_hold, grip=P.OPEN),
+                _approach_qp(vocab.LB_TARGETS["left_end"], grip=P.OPEN),
+                _hold_qp(seam_hold, grip=P.OPEN),
             ],
             arm_right: [
-                _approach_qp(planner, env, arm_right, vocab.LB_TARGETS["right_end"], grip=P.OPEN),
-                _hold_qp(planner, env, arm_right, seam_hold, grip=P.OPEN),
+                _approach_qp(vocab.LB_TARGETS["right_end"], grip=P.OPEN),
+                _hold_qp(seam_hold, grip=P.OPEN),
             ],
         }
     return build
@@ -186,17 +195,17 @@ def _make_approach_grasp_lift_builder(arm_left: int, arm_right: int,
         gate = _gate_arm_grasping(arm_left, "barrier") if sequential else None
         prog = {
             arm_left: [
-                _approach_qp(planner, env, arm_left, left_l, grip=P.OPEN),
-                _hold_qp(planner, env, arm_left, seam_hold, grip=P.OPEN),
-                _close_qp(planner, env, arm_left, left_l),
-                _lift_qp(planner, env, arm_left, left_l),
+                _approach_qp(left_l, grip=P.OPEN),
+                _hold_qp(seam_hold, grip=P.OPEN),
+                _close_qp(left_l),
+                _lift_qp(left_l),
             ],
             arm_right: [
-                _approach_qp(planner, env, arm_right, right_l, grip=P.OPEN),
-                _hold_qp(planner, env, arm_right, seam_hold, grip=P.OPEN),
-                _close_qp(planner, env, arm_right, right_l),
+                _approach_qp(right_l, grip=P.OPEN),
+                _hold_qp(seam_hold, grip=P.OPEN),
+                _close_qp(right_l),
                 # the lift carries the optional gate (sequential vs simultaneous)
-                _lift_qp(planner, env, arm_right, right_l, wait_for=gate),
+                _lift_qp(right_l, wait_for=gate),
             ],
         }
         return prog
@@ -211,19 +220,23 @@ def _make_grasp_and_hold_builder(work_arm: int, hold_arm: int,
                   else vocab.LB_TARGETS["right_end"])
         hold_l = (vocab.LB_TARGETS["left_end"] if hold_arm == 0
                   else vocab.LB_TARGETS["right_end"])
+
+        def _long_hold_recipe(planner, env, arm: int) -> P.Primitive:
+            # long hold, gripper CLOSED -> "grasp and hold while other works"
+            return P.hold(planner, env, arm=arm, n=hold_n, task=LB,
+                          grip=P.CLOSED, verb_id=vocab.WAIT, target_id=0)
+
         return {
             hold_arm: [
-                _approach_qp(planner, env, hold_arm, hold_l, grip=P.OPEN),
-                _close_qp(planner, env, hold_arm, hold_l),
-                # long hold, gripper CLOSED -> "grasp and hold while other works"
-                QueuedPrimitive(P.hold(planner, env, hold_arm, hold_n, task=LB,
-                                       grip=P.CLOSED, verb_id=vocab.WAIT, target_id=0)),
+                _approach_qp(hold_l, grip=P.OPEN),
+                _close_qp(hold_l),
+                QueuedRecipe(_long_hold_recipe),
             ],
             work_arm: [
-                _approach_qp(planner, env, work_arm, work_l, grip=P.OPEN),
-                _hold_qp(planner, env, work_arm, seam_hold, grip=P.OPEN),
-                _close_qp(planner, env, work_arm, work_l),
-                _lift_qp(planner, env, work_arm, work_l),
+                _approach_qp(work_l, grip=P.OPEN),
+                _hold_qp(seam_hold, grip=P.OPEN),
+                _close_qp(work_l),
+                _lift_qp(work_l),
             ],
         }
     return build

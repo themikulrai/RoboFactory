@@ -3,10 +3,15 @@ labels every action tick, and records the per-arm subtask stream live.
 
 Design (see plan ``1-this-is-not-witty-quokka.md`` "Architecture: invert control"):
 
-* Each arm has a QUEUE of :class:`~.subtask_primitives.Primitive`. One outer loop
-  advances every arm by one tick, assembles a single ``action_dict`` keyed
-  ``f"{action_prefix}-{i}"`` (format per follow_path:118-138), and does ONE
-  ``env.step(action_dict)`` per tick (wrapped env -> RecordEpisodeMA records it).
+* Each arm has a QUEUE of :class:`QueuedRecipe`. A ``QueuedRecipe`` wraps a
+  :class:`PrimitiveRecipe` — a callable ``recipe(planner, env, arm) -> Primitive``
+  that PLANS one primitive against the LIVE env/qpos. The interpreter calls the
+  recipe WHEN THE ARM ENTERS THAT PRIMITIVE (ti==0), not all upfront, so every
+  primitive plans from the pose the arm is actually in at execution time (the
+  JIT / correct-start-state fix). One outer loop advances every arm by one tick,
+  assembles a single ``action_dict`` keyed ``f"{action_prefix}-{i}"`` (format per
+  follow_path:118-138), and does ONE ``env.step(action_dict)`` per tick (wrapped
+  env -> RecordEpisodeMA records it).
 * **Idle / blocked arm HOLDS the FROZEN last commanded qpos** (NOT live qpos) and
   is labelled ``wait``. An arm is blocked when its next primitive has an unmet
   ``wait_for=(other_arm, predicate)`` gate.
@@ -18,26 +23,29 @@ Design (see plan ``1-this-is-not-witty-quokka.md`` "Architecture: invert control
   ``boundary_hook(env, state)`` where the user's DART arm-noise / object-pose
   perturbation runs on the UNWRAPPED env (unrecorded).
 
-  RE-PLANNING CAVEAT (important): primitives are PRE-BUILT (their ``dry_run``
-  ticks are cached at build time, before ``run_program`` is called) and are
-  consumed here as-is — ``run_program`` does NOT re-plan the next primitive's
-  trajectory after a hook fires. So a hook that *moves an object* will NOT be
-  absorbed by the already-cached next primitive's waypoints. Two supported modes:
-    1. **Arm-joint noise only** (no object move): fully supported — the hook
-       nudges joints on the unwrapped env; the next cached primitive's screw plan
-       still drives toward its (unchanged) target, re-converging from the nudged
-       pose. Labels stay correct.
-    2. **Object-pose perturbation**: must be applied BEFORE the program is built
-       (e.g. jitter the actor at reset, then ``spec.build(planner, env)``), so the
-       cached grasp-pose resolvers read the moved actor. The label still tracks the
-       ACTOR (e.g. "the green cube"), so it stays correct. Perturbing an object
-       *inside* a boundary_hook would stale the next cached primitive — don't.
+  JIT RE-PLANNING (the key contract): primitives are now built LAZILY, by calling
+  ``recipe(planner, env, arm)`` at the moment the arm ENTERS the primitive — i.e.
+  AFTER the boundary_hook for that transition has fired. So the hook may perturb
+  BOTH the arm joints AND the OBJECT poses: the very next recipe re-plans (a fresh
+  per-arm ``dry_run`` screw plan) from the perturbed state, so its waypoints and
+  its stored ``target_pose`` reflect the moved object. Both modes are now first-class:
+    1. **Arm-joint noise**: the recipe re-plans from the nudged qpos.
+    2. **Object-pose perturbation**: the recipe re-resolves the moved actor's grasp
+       pose (resolvers read the LIVE actor pose at call time). The label still tracks
+       the ACTOR (e.g. "the green cube"), so it stays correct.
+  The FIRST primitive of each arm is also built at its entry (arm still at reset =
+  the same state the builders previously planned against), and the hook does NOT
+  fire before the first primitive.
 * Per-primitive **success checks** (run after the primitive's last tick) drop
   trajectories whose labelled subtask did not actually happen (the liar-label
   guard / the crux).
 
 This module imports numpy at top; it does NOT import sapien. It only *uses* the
-passed-in wrapped ``env`` / ``planner`` at call time.
+passed-in wrapped ``env`` / ``planner`` at call time. ``dry_run`` planning inside a
+recipe only PLANS (``move_to_pose_with_screw(dry_run=True)`` returns the joint
+waypoint dict; it does NOT ``env.step`` / advance physics). It may set the
+planner's INTERNAL planning-model qpos, but that is a throwaway planning model,
+not the simulated env — confirmed safe for mid-rollout re-planning.
 """
 
 from __future__ import annotations
@@ -50,6 +58,11 @@ import numpy as np
 
 from . import subtask_vocab as vocab
 from .subtask_primitives import Primitive, OPEN
+
+# A PrimitiveRecipe plans ONE primitive against the LIVE env/qpos at entry time:
+#   recipe(planner, env, arm) -> Primitive
+# (the interpreter calls it when the arm enters the primitive, NOT upfront).
+PrimitiveRecipe = Callable[[object, object, int], Primitive]
 
 # Verbs whose label is a CLAIM about a spatial/grasp outcome and therefore MUST
 # carry a success_check, or a failed primitive silently mislabels the data (the
@@ -68,16 +81,21 @@ WaitFor = Tuple[int, Callable]
 
 
 @dataclass
-class QueuedPrimitive:
-    """A primitive plus its optional cross-arm gate.
+class QueuedRecipe:
+    """A primitive RECIPE plus its optional cross-arm gate.
 
-    ``wait_for`` is (other_arm, predicate); the primitive does not start ticking
-    until predicate(env, state) is True. ``predicate`` is typically a success
-    check on the other arm (e.g. "arm A is grasping"), enabling sequential or
-    hold-while-other-works choreography.
+    ``recipe`` is a :data:`PrimitiveRecipe` — ``recipe(planner, env, arm) ->
+    Primitive`` — called by the interpreter WHEN THE ARM ENTERS this primitive, so
+    the primitive is planned from the LIVE env/qpos at that moment (JIT building).
+
+    ``wait_for`` is (other_arm, predicate); the primitive is not built/ticked until
+    predicate(env, state) is True. ``predicate`` is typically a success check on the
+    other arm (e.g. "arm A is grasping"), enabling sequential or hold-while-other-
+    works choreography. (The recipe is built only AFTER the gate opens, so it plans
+    from the state at the moment the gate releases.)
     """
 
-    primitive: Primitive
+    recipe: PrimitiveRecipe
     wait_for: Optional[WaitFor] = None
 
 
@@ -215,17 +233,36 @@ def _grasp_bool(agent, actor):
     return g.detach().cpu().numpy() if hasattr(g, "detach") else np.asarray(g)
 
 
-def check_tcp_near(target_pose_fn: Callable, tol: float = 0.05) -> Callable:
-    """approach success: arm tcp within ``tol`` (m) of target_pose_fn(env, arm).
+def check_tcp_near(target_pose_fn: Optional[Callable] = None, tol: float = 0.05) -> Callable:
+    """approach/lift success: arm tcp within ``tol`` (m) of the target xyz.
 
-    target_pose_fn returns a length-3 xyz (or 7-vec; first 3 used).
+    The target xyz is resolved one of two ways:
+      * if ``target_pose_fn`` is given: ``target_pose_fn(env, arm)`` (length-3 xyz
+        or 7-vec, first 3 used).
+      * if ``target_pose_fn`` is None (the default, and what the LB scenarios use):
+        the PLANNED ``primitive.target_pose`` stored by the spatial builder at plan
+        time. The TCP converges to the planned pose, so "TCP within tol of the
+        planned target" is the correct check. (The old barrier-CENTRE fn was wrong:
+        each arm reaches an END ~0.37m off centre, so it could never pass.)
+
+    Raises if neither a fn nor a stored target_pose is available (a spatial verb
+    with no target would silently never pass otherwise).
     """
     def _check(env, arm: int, primitive: Primitive) -> bool:
         u = _unwrap(env)
         tcp_p = u.agent.agents[arm].tcp.pose.p
         tcp_p = tcp_p.detach().cpu().numpy() if hasattr(tcp_p, "detach") else np.asarray(tcp_p)
         tcp_p = np.asarray(tcp_p).reshape(-1)[:3]
-        tgt = np.asarray(target_pose_fn(env, arm)).reshape(-1)[:3]
+        if target_pose_fn is not None:
+            tgt = np.asarray(target_pose_fn(env, arm)).reshape(-1)[:3]
+        else:
+            if primitive.target_pose is None:
+                raise ValueError(
+                    "check_tcp_near: no target_pose_fn given and primitive "
+                    f"{primitive.name!r} has no stored target_pose (the spatial "
+                    "builder must set it). Cannot verify approach/lift."
+                )
+            tgt = np.asarray(primitive.target_pose).reshape(-1)[:3]
         return float(np.linalg.norm(tcp_p - tgt)) <= tol
     return _check
 
@@ -256,17 +293,20 @@ def check_actor_z_above(actor_name: str, base_z: float, dz: float = 0.15) -> Cal
 class _ArmState:
     """Per-arm runtime state inside the loop."""
 
-    queue: List[QueuedPrimitive]
-    qi: int = 0                       # index of the current primitive in queue
+    queue: List[QueuedRecipe]
+    qi: int = 0                       # index of the current recipe in queue
     ti: int = 0                       # tick index within the current primitive
     frozen_qpos: Optional[np.ndarray] = None  # last commanded qpos (for holds)
     frozen_grip: float = OPEN         # last commanded grip
     done: bool = False
+    # the Primitive built from the recipe for the CURRENT qi (cached for its
+    # duration); None until built at entry, reset to None when qi advances.
+    built: Optional[Primitive] = None
     # success flags per primitive index (None=not yet checked)
     success: Dict[int, Optional[bool]] = field(default_factory=dict)
 
     @property
-    def current(self) -> Optional[QueuedPrimitive]:
+    def current(self) -> Optional[QueuedRecipe]:
         if self.qi >= len(self.queue):
             return None
         return self.queue[self.qi]
@@ -283,7 +323,7 @@ def _action_for(control_mode: str, qpos7: np.ndarray, grip: float) -> np.ndarray
 def run_program(
     env,
     planner,
-    programs: Dict[int, List[QueuedPrimitive]],
+    programs: Dict[int, List[QueuedRecipe]],
     recorder: SubtaskRecorder,
     max_steps: int,
     boundary_hook: Optional[Callable] = None,
@@ -292,29 +332,36 @@ def run_program(
     verbose: bool = False,
     check_success_coverage: str = "warn",
 ) -> Dict:
-    """Run per-arm primitive programs through the wrapped env, labelling live.
+    """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
+
+    Primitives are built JUST-IN-TIME: when an arm enters a primitive (ti==0), its
+    ``QueuedRecipe.recipe(planner, env, arm)`` is called NOW to plan against the
+    LIVE env/qpos, then its ticks are consumed. This is the correct-start-state fix
+    (a primitive after the first no longer plans from the HOME pose).
 
     Parameters
     ----------
     env : the WRAPPED env (RecordEpisodeMA). env.step(action_dict) is recorded.
-    planner : PandaArmMotionPlanningSolver (for current qpos of idle arms).
-    programs : {arm: [QueuedPrimitive, ...]}. Each arm runs its queue in order.
+    planner : PandaArmMotionPlanningSolver (for current qpos of idle arms / planning).
+    programs : {arm: [QueuedRecipe, ...]}. Each arm runs its recipe queue in order.
     recorder : SubtaskRecorder (already reset). One append per env.step.
     max_steps : hard cap on env.steps (safety).
-    boundary_hook : optional callable(env, state) invoked BETWEEN primitives (when
-        any arm advances to a new primitive; NOT before the first primitive). Runs
-        on the UNWRAPPED env, unrecorded. NOTE: primitives here are PRE-BUILT and
-        their cached ticks are NOT re-planned after the hook — arm-joint noise is
-        absorbed (the cached screw plan re-converges to its unchanged target), but
-        object-pose perturbation must be applied BEFORE building the program (at
-        reset), not inside this hook. See module docstring "RE-PLANNING CAVEAT".
+    boundary_hook : optional callable(env, state) invoked BETWEEN primitives (after
+        one completes, BEFORE the next is built; NOT before the first primitive).
+        Runs on the UNWRAPPED env, unrecorded. Because the next primitive is built
+        AFTER the hook (JIT), the hook MAY perturb arm joints AND object poses: the
+        next recipe re-plans (fresh per-arm dry_run screw plan) from the perturbed
+        state, re-resolving moved actors' grasp poses. See module docstring
+        "JIT RE-PLANNING".
     action_prefix : agent key prefix; action_dict keys are f"{action_prefix}-{i}".
     control_mode : env control mode; defaults to planner.control_mode.
     check_success_coverage : how to handle primitives whose verb is in
         VERBS_REQUIRING_SUCCESS_CHECK but that carry no success_check (the
         liar-label loophole). "warn" (default) emits a UserWarning listing the
-        offenders; "error" raises ValueError; "off" skips the lint. This does NOT
-        change all_success semantics; it only flags programs that can mislabel.
+        offenders; "error" raises ValueError; "off" skips the lint. NOTE: because
+        recipes are built lazily, the lint builds a PROBE primitive per recipe to
+        inspect its verb/success_check; the probe is built against the CURRENT state
+        (pre-run) and discarded (it does not advance physics — dry_run only plans).
 
     Returns
     -------
@@ -329,7 +376,7 @@ def run_program(
         control_mode = getattr(planner, "control_mode", "pd_joint_pos")
 
     if check_success_coverage != "off":
-        _lint_success_coverage(programs, mode=check_success_coverage)
+        _lint_success_coverage(programs, planner, env, mode=check_success_coverage)
 
     num_arms = recorder.num_arms
     arms: Dict[int, _ArmState] = {}
@@ -342,6 +389,23 @@ def run_program(
     # state passed to boundary_hook / predicates (extensible scratchpad)
     state: Dict = {"step": 0, "arms": arms, "planner": planner}
 
+    # Task name for rendering idle "wait" labels, resolved LAZILY on the first idle
+    # tick and cached (so we don't probe-build a recipe unless an arm actually
+    # idles, and never more than once). render(WAIT, 0, task) is just "wait" for
+    # every known task; this only guards an unknown-task KeyError.
+    task_name_cache: Dict[str, Optional[str]] = {"v": None}
+
+    def _task_name() -> str:
+        if task_name_cache["v"] is None:
+            # prefer a task from an already-built primitive (free, no probe)
+            for a in arms.values():
+                if a.built is not None:
+                    task_name_cache["v"] = a.built.task
+                    break
+            else:
+                task_name_cache["v"] = _resolve_task_name(programs, planner, env)
+        return task_name_cache["v"]
+
     info = {}
     terminated = truncated = False
     step = 0
@@ -349,63 +413,70 @@ def run_program(
     def _all_done() -> bool:
         return all(a.current is None for a in arms.values())
 
-    # If any arm starts a brand-new primitive this iteration, we first call the
-    # boundary hook (between-primitives perturbation), THEN plan/tick. We track the
-    # last primitive index each arm has *entered* to detect transitions.
-    #
-    # Init to each arm's starting qi (NOT -1): the boundary_hook fires only BETWEEN
-    # primitives (after one completes, before the next starts), per the spec. On the
-    # first loop iteration entered[i]==a.qi so no transition is detected and the hook
-    # is NOT called before the first primitive — its plan was built (in the builders)
-    # against the same state the first tick runs against, so a leading hook would
-    # otherwise stale that plan (object jitter before the first reach was planned).
+    # Track the last primitive index each arm has *entered* to detect transitions.
+    # The boundary_hook fires only BETWEEN primitives (after one completes, before
+    # the next is BUILT), per the spec. Init to each arm's starting qi (NOT -1): on
+    # the first loop iteration entered[i]==a.qi so no transition is detected and the
+    # hook is NOT called before the first primitive. The first primitive is still
+    # JIT-built at its entry (arm at reset = the same state the builders used).
     entered: Dict[int, int] = {i: arms[i].qi for i in range(num_arms)}
 
     while step < max_steps and not _all_done():
         state["step"] = step
 
-        # --- detect primitive transitions; call boundary_hook BETWEEN primitives ---
-        transition = False
-        for i in range(num_arms):
-            a = arms[i]
-            cur = a.current
-            if cur is not None and a.ti == 0 and entered[i] != a.qi:
-                transition = True
-        if transition and boundary_hook is not None:
-            boundary_hook(_unwrap(env), state)
-
-        # --- gate check + per-arm tick assembly ---
-        action_dict: Dict[str, np.ndarray] = {}
-        labels: Dict[int, Tuple[int, int, str]] = {}
-        # cache the per-arm blocked decision so the advance phase reuses it
-        # (don't re-eval the gate predicate twice per tick — matters for any
-        # predicate with side effects, and avoids redundant sim reads).
+        # --- gate check first: an arm with an unmet wait_for is BLOCKED (it holds
+        # and does NOT enter/build its next primitive yet). We evaluate the gate
+        # ONCE here and reuse the decision in the advance phase. ---
         blocked_this_tick: Dict[int, bool] = {}
-
         for i in range(num_arms):
             a = arms[i]
             cur = a.current
-
             blocked = False
-            if cur is not None and cur.wait_for is not None and a.ti == 0:
+            if cur is not None and cur.wait_for is not None and a.ti == 0 and a.built is None:
                 _other_arm, predicate = cur.wait_for  # other_arm is documentation only
                 if not _eval_gate(predicate, env, state):
                     blocked = True
             blocked_this_tick[i] = blocked
+
+        # --- detect primitive transitions for arms that will ACTUALLY enter a new
+        # primitive this tick (ti==0, not yet built, NOT blocked, and a different qi
+        # than last entered). Fire boundary_hook ONCE, BETWEEN primitives, BEFORE
+        # building so the next recipe's plan absorbs the perturbation. A blocked
+        # (gated) arm does NOT count as a transition -> the hook is not re-fired
+        # every waiting tick. ---
+        transition = any(
+            arms[i].current is not None and arms[i].ti == 0 and arms[i].built is None
+            and not blocked_this_tick[i] and entered[i] != arms[i].qi
+            for i in range(num_arms)
+        )
+        if transition and boundary_hook is not None:
+            boundary_hook(_unwrap(env), state)
+
+        # --- per-arm tick assembly ---
+        action_dict: Dict[str, np.ndarray] = {}
+        labels: Dict[int, Tuple[int, int, str]] = {}
+
+        for i in range(num_arms):
+            a = arms[i]
+            cur = a.current
+            blocked = blocked_this_tick[i]
 
             if cur is None or blocked:
                 # idle/blocked: HOLD frozen last-commanded qpos, labelled wait
                 qpos = a.frozen_qpos
                 grip = a.frozen_grip
                 action_dict[f"{action_prefix}-{i}"] = _action_for(control_mode, qpos, grip)
-                labels[i] = (vocab.WAIT, 0, vocab.render(vocab.WAIT, 0, _task_of(cur, programs, i)))
+                labels[i] = (vocab.WAIT, 0, vocab.render(vocab.WAIT, 0, _task_name()))
                 continue
 
-            # entering this primitive for the first time
-            if a.ti == 0:
+            # entering this primitive for the first time: BUILD it now (JIT) from
+            # the live env/qpos. The boundary_hook (if any) already fired above, so
+            # the recipe re-plans from the perturbed state.
+            if a.ti == 0 and a.built is None:
+                a.built = cur.recipe(planner, env, i)
                 entered[i] = a.qi
 
-            prim = cur.primitive
+            prim = a.built
             qpos7, grip = prim.ticks[a.ti]
             qpos7 = np.asarray(qpos7, dtype=np.float32)
             action_dict[f"{action_prefix}-{i}"] = _action_for(control_mode, qpos7, grip)
@@ -428,18 +499,20 @@ def run_program(
             # was this arm blocked this iteration? if so it didn't tick its primitive
             if blocked_this_tick.get(i, False):
                 continue
+            prim = a.built
             a.ti += 1
-            if a.ti >= cur.primitive.n_ticks:
+            if a.ti >= prim.n_ticks:
                 # primitive finished -> evaluate its success_check (if any)
-                if cur.primitive.success_check is not None:
-                    ok = bool(cur.primitive.success_check(env, i, cur.primitive))
+                if prim.success_check is not None:
+                    ok = bool(prim.success_check(env, i, prim))
                 else:
                     ok = None
                 a.success[a.qi] = ok
                 if verbose:
-                    print(f"[step {step}] arm{i} finished {cur.primitive.name} success={ok}")
+                    print(f"[step {step}] arm{i} finished {prim.name} success={ok}")
                 a.qi += 1
                 a.ti = 0
+                a.built = None  # next primitive is re-built JIT at its entry
 
         if terminated or truncated:
             break
@@ -465,7 +538,8 @@ def run_program(
 # --------------------------------------------------------------------------- helpers
 
 
-def _lint_success_coverage(programs: Dict[int, List[QueuedPrimitive]], mode: str = "warn"):
+def _lint_success_coverage(programs: Dict[int, List[QueuedRecipe]], planner, env,
+                           mode: str = "warn"):
     """Flag primitives that CLAIM a spatial/grasp outcome but carry no success_check.
 
     Closes the liar-label loophole: a primitive with verb in
@@ -473,12 +547,22 @@ def _lint_success_coverage(programs: Dict[int, List[QueuedPrimitive]], mode: str
     as passing in ``all_success`` (it contributes nothing to the ``checked`` list),
     so a failed grasp/approach/lift/place could be written as if it happened.
 
+    Because recipes are built lazily, this builds a throwaway PROBE primitive per
+    recipe (against the current pre-run state) to inspect its verb/success_check.
+    ``dry_run`` planning inside the probe only plans (does not advance physics). If a
+    probe build raises, we skip linting that recipe (it'll surface at run time).
+
     ``mode``: "warn" -> UserWarning listing offenders; "error" -> ValueError.
     """
     offenders: List[str] = []
     for arm, queue in programs.items():
-        for qi, qp in enumerate(queue):
-            prim = qp.primitive
+        for qi, qr in enumerate(queue):
+            try:
+                prim = qr.recipe(planner, env, arm)
+            except Exception:
+                # cannot probe this recipe pre-run (e.g. needs prior arm state);
+                # the run itself will surface any real failure. Skip lint for it.
+                continue
             if (prim.verb_id in VERBS_REQUIRING_SUCCESS_CHECK
                     and prim.success_check is None):
                 offenders.append(f"arm{arm}[{qi}] {prim.name} (verb={prim.verb_id})")
@@ -496,16 +580,21 @@ def _lint_success_coverage(programs: Dict[int, List[QueuedPrimitive]], mode: str
     warnings.warn(msg, UserWarning, stacklevel=2)
 
 
-def _task_of(cur, programs, arm) -> str:
-    """Task name for label rendering of an idle arm (use any program's task)."""
-    if cur is not None:
-        return cur.primitive.task
-    for q in programs.get(arm, []):
-        return q.primitive.task
-    # fall back to any arm's program
-    for prog in programs.values():
+def _resolve_task_name(programs: Dict[int, List[QueuedRecipe]], planner, env) -> str:
+    """Resolve the program's task name once (for rendering idle "wait" labels).
+
+    Probe-builds the first recipe of the first non-empty arm to read its ``.task``;
+    if that fails (or there are no recipes), default to "LiftBarrier". This is a
+    throwaway probe (dry_run only plans, doesn't advance physics) and is called once
+    per run, not per tick. ``render(WAIT, 0, task)`` is literally "wait" for every
+    known task, so the only thing this protects against is an unknown-task KeyError.
+    """
+    for arm, prog in sorted(programs.items()):
         if prog:
-            return prog[0].primitive.task
+            try:
+                return prog[0].recipe(planner, env, arm).task
+            except Exception:
+                break
     return "LiftBarrier"
 
 

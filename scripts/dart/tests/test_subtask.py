@@ -392,10 +392,24 @@ def test_filter_variants_keeps_groups_intact():
     assert S.filter_variants(specs, ["nope"]) == []
 
 
+def _prog_verbs(prog, planner, env):
+    """Build every recipe in a program (against the fakes) and collect verb ids.
+
+    The builders return {arm:[QueuedRecipe]} (structure only); the per-primitive
+    planning is deferred to each recipe. We invoke recipe(planner, env, arm) here
+    to inspect the verbs the program will emit. Safe off-GPU (fake planner)."""
+    verbs = set()
+    for arm, queue in prog.items():
+        for qr in queue:
+            verbs.add(qr.recipe(planner, env, arm).verb_id)
+    return verbs
+
+
 def test_sampler_builders_callable_against_fakes():
-    """The builders must produce a {arm:[QueuedPrimitive]} program when given a
-    live (planner, env). We drive them with the FAKE planner/env (no sim) so the
-    structure (gating, hold-while-other-works) is validated off-GPU."""
+    """The builders must produce a {arm:[QueuedRecipe]} program when given a
+    live (planner, env). We drive them (and build their recipes) with the FAKE
+    planner/env (no sim) so the structure (gating, hold-while-other-works) is
+    validated off-GPU."""
     specs = S.sample(7)
     for spec in specs:
         pl, env = FakePlanner(num_arms=2), FakeEnv()
@@ -403,17 +417,17 @@ def test_sampler_builders_callable_against_fakes():
         assert set(prog.keys()) == {0, 1}, spec.name
         for arm, queue in prog.items():
             assert len(queue) >= 1
-            for qp in queue:
-                assert isinstance(qp, I.QueuedPrimitive)
+            for qr in queue:
+                assert isinstance(qr, I.QueuedRecipe)
+                assert callable(qr.recipe)
+        verbs = _prog_verbs(prog, pl, env)
         # families that grasp must contain a close_gripper somewhere
         if spec.name in ("approach_grasp_lift", "arms_LR", "arms_RL",
                          "sequential", "simultaneous", "grasp_and_hold",
                          "grasp_and_release"):
-            verbs = {qp.primitive.verb_id for q in prog.values() for qp in q}
             assert vocab.CLOSE_GRIPPER in verbs, spec.name
         # approach_stop must NOT close
         if spec.name == "approach_stop":
-            verbs = {qp.primitive.verb_id for q in prog.values() for qp in q}
             assert vocab.CLOSE_GRIPPER not in verbs
 
 
@@ -424,7 +438,8 @@ def test_sampler_grasp_and_hold_has_long_closed_hold():
     pl, env = FakePlanner(num_arms=2), FakeEnv()
     prog = spec.build(pl, env)
     hold_arm = spec.meta["hold_arm"]
-    last = prog[hold_arm][-1].primitive
+    # build the last recipe (the long hold) against the fakes to inspect it
+    last = prog[hold_arm][-1].recipe(pl, env, hold_arm)
     assert last.verb_id == vocab.WAIT
     assert last.n_ticks == spec.meta["hold_n"]
     assert all(g == CLOSED for _, g in last.ticks)  # holding closed
@@ -535,8 +550,9 @@ def test_sim_idle_arm_wait_and_frozen():
         planner = _build_sim_planner(env, Solver, 0)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = {
-            0: [I.QueuedPrimitive(P.approach(planner, env, 0,
-                                             vocab.LB_TARGETS["left_end"], "LiftBarrier"))],
+            0: [I.QueuedRecipe(lambda pl, e, arm: P.approach(
+                pl, e, arm=arm, target_id=vocab.LB_TARGETS["left_end"],
+                task="LiftBarrier"))],
             1: [],  # idle
         }
         I.run_program(env, planner, prog, rec, max_steps=200,
@@ -626,10 +642,18 @@ def test_sim_matched_pair_atomic_drop_and_liar_label():
         planner = _build_sim_planner(env, Solver, spec.seed)
         rec = I.SubtaskRecorder(num_arms=2)
         prog = spec.build(planner, env)
-        # poison arm0's close-gripper success_check -> liar label
-        for qp in prog[0]:
-            if qp.primitive.verb_id == vocab.CLOSE_GRIPPER:
-                qp.primitive.success_check = lambda e, a, p: False
+        # poison arm0's close-gripper success_check -> liar label. Recipes are
+        # built JIT, so we WRAP the recipe: build the real primitive, then force
+        # its success_check to False (close_gripper builds verb CLOSE_GRIPPER).
+        def _poison(orig_recipe):
+            def wrapped(pl, e, arm):
+                prim = orig_recipe(pl, e, arm)
+                if prim.verb_id == vocab.CLOSE_GRIPPER:
+                    prim.success_check = lambda e, a, p: False
+                return prim
+            return wrapped
+        prog[0] = [I.QueuedRecipe(_poison(qr.recipe), wait_for=qr.wait_for)
+                   for qr in prog[0]]
         out = I.run_program(env, planner, prog, rec, max_steps=800,
                             control_mode=planner.control_mode)
         assert out["all_success"] is False  # group would be dropped
@@ -648,8 +672,9 @@ def test_sim_dart_object_perturb_compat():
         spec = next(m for m in S.sample(0) if m.name == "approach_grasp_lift")
         planner = _build_sim_planner(env, Solver, spec.seed)
         u = env.unwrapped
-        # jitter the barrier by a small xy offset BEFORE building the program so
-        # the approach re-resolves the moved actor's grasp pose.
+        # jitter the barrier by a small xy offset. With JIT building the first
+        # approach recipe is built at entry, so re-resolving the moved actor's grasp
+        # pose works whether the jitter is at reset (here) OR inside a boundary_hook.
         import sapien
         p = u.barrier.pose
         new_p = np.asarray(p.p).reshape(-1)[:3] + np.array([0.02, 0.0, 0.0])

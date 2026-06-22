@@ -58,6 +58,12 @@ class Primitive:
         interpreter AFTER the primitive's ticks to drop liar-labels (the crux:
         a labelled ``close_gripper`` that did not actually grasp is dropped).
     name : human label for debugging (e.g. "approach(right_end)").
+    target_pose : the PLANNED target xyz(+quat) this primitive drove toward, set
+        by the spatial builders (approach/lift/place) at plan time. Used by
+        ``check_tcp_near`` when no explicit target_pose_fn is given: the TCP
+        converges to the planned pose, so "TCP within tol of target_pose" is the
+        correct approach/lift success check (the barrier-CENTRE check was wrong —
+        each arm reaches an END ~0.37m off centre). None for non-spatial verbs.
     """
 
     verb_id: int
@@ -67,6 +73,7 @@ class Primitive:
     task: str = "LiftBarrier"
     success_check: Optional[Callable] = None
     name: str = ""
+    target_pose: Optional[np.ndarray] = None
 
     def __post_init__(self):
         if not self.name:
@@ -203,6 +210,7 @@ def approach(
         verb_id=vocab.APPROACH, target_id=target_id, text=text, ticks=ticks,
         task=task, success_check=success_check,
         name=f"approach({vocab.target_name(task, target_id)})",
+        target_pose=np.asarray(pose, dtype=np.float32).reshape(-1)[:3].copy(),
     )
 
 
@@ -283,6 +291,7 @@ def lift(
         verb_id=vocab.LIFT, target_id=target_id, text=text, ticks=ticks,
         task=task, success_check=success_check,
         name=f"lift({vocab.target_name(task, target_id)})",
+        target_pose=pose.reshape(-1)[:3].copy(),
     )
 
 
@@ -309,6 +318,7 @@ def place(
         verb_id=vocab.PLACE, target_id=target_id, text=text, ticks=ticks,
         task=task, success_check=success_check,
         name=f"place({vocab.target_name(task, target_id)})",
+        target_pose=np.asarray(target_pose, dtype=np.float32).reshape(-1)[:3].copy(),
     )
 
 

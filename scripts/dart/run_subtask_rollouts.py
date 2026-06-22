@@ -20,9 +20,13 @@ Each kept episode writes:
 
 DART / object-perturbation COMPOSES via ``boundary_hook``: the user plugs their
 arm-noise + object-pose perturbation in here later (default None). It runs on the
-UNWRAPPED env between primitives and is unrecorded; the next primitive re-plans
-from the perturbed state so labels stay correct. ``--dart-sigma`` is accepted as a
-PLACEHOLDER (wired to a no-op hook factory) so the CLI is forward-compatible.
+UNWRAPPED env between primitives and is unrecorded. Because primitives are now
+built JUST-IN-TIME (each ``QueuedRecipe`` is planned at the moment the arm enters
+it, AFTER the boundary_hook for that transition fires), the hook MAY perturb both
+arm joints AND object poses — the next recipe re-plans (fresh per-arm dry_run screw
+plan) from the perturbed state, re-resolving moved actors' grasp poses, so labels
+stay correct. ``--dart-sigma`` is accepted as a PLACEHOLDER (wired to a no-op hook
+factory) so the CLI is forward-compatible.
 
 HARD RULE: this script runs SAPIEN; do NOT run it on the login node (renders dark)
 or without a GPU. Author-only here — launch on an iris-hi a40 compute node.
@@ -81,9 +85,10 @@ def _make_boundary_hook(dart_sigma):
 
     PLACEHOLDER: the user is separately building the DART arm-noise + object-pose
     perturbation generator. When they wire it, it slots in HERE: a
-    ``hook(unwrapped_env, state)`` called between primitives, stepping the
-    UNWRAPPED env (unrecorded). The next primitive re-plans from the perturbed
-    state so labels stay correct.
+    ``hook(unwrapped_env, state)`` called between primitives, perturbing the
+    UNWRAPPED env (arm joints AND/OR object poses; unrecorded). The next primitive
+    is built JIT AFTER this hook, so its recipe re-plans (and re-resolves moved
+    actors' grasp poses) from the perturbed state — labels stay correct.
 
     Today, a non-zero ``dart_sigma`` only INSTALLS a no-op hook (so the wiring /
     call path is exercised) — it does NOT perturb anything. Returning None keeps
