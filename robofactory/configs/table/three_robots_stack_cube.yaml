@@ -144,9 +144,10 @@ cameras:
     - 
       uid: head_camera_agent2
       pose:
-        # FLAG-FOR-REVIEW: distinct per-agent view for panda-2 (base [0.8,0,0], +X side, cubeC@[0.185,-0.05]).
+        # v2 2026-06-22: moved off panda-2's -X reach line (old [0.55,-0.05,0.4] got arm-clipped at lift);
+        # now offset to -Y + raised (z0.55) for a steeper side-down view of panda-2's workspace.
         type: look_at
-        params: [[0.55, -0.05, 0.4], [0.185, -0.05, 0.05]]
+        params: [[0.5, -0.5, 0.55], [0.15, -0.05, 0.05]]
       width: 320
       height: 240
       fov: 1.5707963268
