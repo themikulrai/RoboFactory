@@ -91,7 +91,7 @@ from . import subtask_primitives as P
 from .subtask_interpreter import (
     QueuedRecipe,
     check_tcp_near,
-    check_barrier_lifted,
+    check_barrier_ends_held,
 )
 
 LB = "LiftBarrier"
@@ -164,9 +164,13 @@ def _close_qp(target_id: int, *, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _lift_qp(target_id: int, *, dz: float = 0.2, wait_for=None) -> QueuedRecipe:
+def _lift_qp(target_id: int, *, dz: float = 0.32, wait_for=None) -> QueuedRecipe:
+    """lift recipe. ``dz`` is the ARM-MOTION lift height (how far the screw plan
+    raises the grasp pose), raised from 0.2 to 0.32 so the strict +0.25 END height
+    is reachable. The success_check is the STRICT both-ends-held criterion
+    (check_barrier_ends_held(dz=0.25)) -- NOT the arm-motion dz."""
     def recipe(planner, env, arm: int) -> P.Primitive:
-        sc = check_barrier_lifted(dz=0.15)
+        sc = check_barrier_ends_held(dz=0.25)
         return P.lift(planner, env, arm=arm, target_id=target_id, task=LB, dz=dz,
                       grip=P.CLOSED, success_check=sc)
     return QueuedRecipe(recipe, wait_for=wait_for)

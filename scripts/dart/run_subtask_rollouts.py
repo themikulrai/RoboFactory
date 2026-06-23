@@ -94,13 +94,19 @@ class DartCfg:
     ``sigma <= 0`` disables the hook entirely (clean slice). All other fields are
     forwarded to ``dart_perturb.inject_joint_disturbance`` or used by the per-variant
     hook to decide WHEN / WHICH arm to perturb.
+
+    Defaults reduced (sigma 0.4->0.1, floor 0.15->0.05, k 5..15 -> 3..8) so the shove
+    PERTURBS a held bar rather than FLINGING an un-grasped one; ``shove_after_qi=2``
+    (== GRASP_IDX) restricts the shove to arms that have already SEATED their grasp
+    (on/past the lift), so we never knock a bar away pre-grasp.
     """
-    sigma: float = 0.0
-    floor: float = 0.15
-    k_min: int = 5
-    k_max: int = 15
+    sigma: float = 0.1
+    floor: float = 0.05
+    k_min: int = 3
+    k_max: int = 8
     p_inject: float = 0.5
     dart_seed: int = 0
+    shove_after_qi: int = 2
 
 
 def _make_boundary_hook(dart_cfg, env_seed, variant_id):
@@ -117,9 +123,14 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
         whole sequence of perturbations is a pure function of those four ints
         (reproducible) and NEVER touches the env reset RNG;
       * picks ONE arm to perturb from the arms that are about to ENTER a primitive
-        this transition (``a.current is not None and a.ti == 0 and a.built is None``);
-      * ALWAYS injects on the first transition (counter 0) and otherwise injects with
-        probability ``p_inject``;
+        this transition AND have already SEATED their grasp -- i.e. their program
+        progress ``a.qi >= shove_after_qi`` (default 2 == ``GRASP_IDX``, the index at
+        which an arm has finished approach+close and is on/at its lift). This is the
+        "shove only a HELD bar" rule: we no longer shove at the approach->close pickup
+        boundary (which flung the un-grasped bar away);
+      * FORCE-injects the FIRST time a post-grasp arm transitions (so every variant
+        gets at least one shove on a held bar), and otherwise injects with probability
+        ``p_inject``. If NO arm has grasped yet at a transition, it does NOT shove;
       * passes each arm's FROZEN grip (``state["arms"][i].frozen_grip``) so the carry-
         grip contract holds (the disturbance never changes a grasp's open/closed
         state), and forwards ``planner.control_mode`` so the action vector matches.
@@ -130,7 +141,9 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
     if not dart_cfg or dart_cfg.sigma <= 0:
         return None
 
-    counter = {"tc": 0}  # transition counter (closure state)
+    counter = {"tc": 0}            # transition counter (closure state)
+    forced = {"done": False}       # whether the force-first post-grasp shove has fired
+    shove_after_qi = int(getattr(dart_cfg, "shove_after_qi", 2))
 
     def hook(unwrapped_env, state):
         tc = counter["tc"]
@@ -153,14 +166,21 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
                 i for i, a in arms.items()
                 if a.current is not None and a.ti == 0 and a.built is None
             ]
+        # SHOVE ONLY a HELD bar: restrict to moving arms whose grasp is already seated
+        # (program progress qi >= shove_after_qi, i.e. on/at the lift). An arm that has
+        # not grasped yet is never a shove target (no flinging the un-grasped bar).
+        moving = [i for i in moving if int(getattr(arms[i], "qi", 0)) >= shove_after_qi]
         if not moving:
             return
 
         target_arm = int(rng.choice(np.array(sorted(moving))))
-        # ALWAYS inject on the FIRST transition; otherwise with prob p_inject. The
-        # arm choice consumed RNG first (so the decision draw is deterministic given
-        # the seed), matching the documented order.
-        inject = (tc == 0) or (rng.random() < dart_cfg.p_inject)
+        # FORCE-inject the FIRST time a post-grasp arm transitions; otherwise with prob
+        # p_inject. The arm choice consumed RNG first (so the decision draw is
+        # deterministic given the seed), matching the documented order.
+        force_first = not forced["done"]
+        inject = force_first or (rng.random() < dart_cfg.p_inject)
+        if force_first:
+            forced["done"] = True
         if not inject:
             return
 
@@ -523,7 +543,7 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
 def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         max_steps=600, dart_seed=0,
         per_attempt_timeout=300, override_seeds=None, save_video=False,
-        floor=0.15, k_min=5, k_max=15, p_inject=0.5, config_suffix="", mix=""):
+        floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix=""):
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
@@ -777,17 +797,22 @@ if __name__ == "__main__":
     ap.add_argument("--dart-sigma", type=float, default=0.0, dest="dart_sigma",
                     help="DART per-joint disturbance stddev. >0 installs the REAL "
                          "deterministic per-variant boundary_hook (arm-joint noise on "
-                         "the unwrapped env between primitives). 0 = no hook.")
-    ap.add_argument("--inject-floor", type=float, default=0.15, dest="inject_floor",
+                         "the unwrapped env between primitives). 0 = no hook. The hook "
+                         "shoves only AFTER the grasp is seated (qi>=GRASP_IDX). "
+                         "Reduced default magnitude (was 0.4) to perturb not fling.")
+    ap.add_argument("--inject-floor", type=float, default=0.05, dest="inject_floor",
                     help="minimum L2 norm of each DART joint offset (so a draw is "
-                         "never trivially small). Default 0.15.")
-    ap.add_argument("--k-min", type=int, default=5, dest="k_min",
-                    help="min number of unwrapped steps the disturbance is held.")
-    ap.add_argument("--k-max", type=int, default=15, dest="k_max",
-                    help="max number of unwrapped steps the disturbance is held.")
+                         "never trivially small). Default 0.05 (was 0.15).")
+    ap.add_argument("--k-min", type=int, default=3, dest="k_min",
+                    help="min number of unwrapped steps the disturbance is held "
+                         "(default 3, was 5).")
+    ap.add_argument("--k-max", type=int, default=8, dest="k_max",
+                    help="max number of unwrapped steps the disturbance is held "
+                         "(default 8, was 15).")
     ap.add_argument("--p-inject", type=float, default=0.5, dest="p_inject",
-                    help="probability of injecting a disturbance at a transition "
-                         "(the FIRST transition of each variant always injects).")
+                    help="probability of injecting a disturbance at a post-grasp "
+                         "transition (the FIRST post-grasp transition of each variant "
+                         "always injects; pre-grasp transitions never shove).")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="splice into the yaml stem, e.g. '_aug' maps "
                          "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")

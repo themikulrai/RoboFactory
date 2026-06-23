@@ -29,6 +29,7 @@ from __future__ import annotations
 import os.path as osp
 import sys
 
+import numpy as np
 import torch
 
 # make the repo root importable when pytest runs from elsewhere
@@ -40,6 +41,9 @@ if _ROOT not in sys.path:
 from robofactory.tasks.success_candidates import (  # noqa: E402
     lift_barrier_success_strict,
     tsc_success_fixed,
+    barrier_grasp_ends_world,
+    BARRIER_END_OFFSETS,
+    BARRIER_LIFT_DZ,
 )
 
 
@@ -47,14 +51,16 @@ from robofactory.tasks.success_candidates import (  # noqa: E402
 # Fakes
 # ===========================================================================
 class FakePose:
-    """Holds a (1,3) position tensor at .p (matches actor.pose.p batched layout)."""
-    def __init__(self, xyz):
-        self.p = torch.tensor([list(xyz)], dtype=torch.float32)  # shape (1,3)
+    """Holds a (1,3) position tensor at .p and a (1,4) wxyz quaternion at .q
+    (matches actor.pose.p / .q batched layout). Default quat is identity."""
+    def __init__(self, xyz, quat=(1.0, 0.0, 0.0, 0.0)):
+        self.p = torch.tensor([list(xyz)], dtype=torch.float32)   # shape (1,3)
+        self.q = torch.tensor([list(quat)], dtype=torch.float32)  # shape (1,4) wxyz
 
 
 class FakeActor:
-    def __init__(self, xyz):
-        self.pose = FakePose(xyz)
+    def __init__(self, xyz, quat=(1.0, 0.0, 0.0, 0.0)):
+        self.pose = FakePose(xyz, quat)
 
 
 class FakeRobot:
@@ -88,9 +94,16 @@ class FakeMultiAgent:
 
 # --- LiftBarrier fake env ---------------------------------------------------
 class FakeLiftBarrierEnv:
-    """Mimics LiftBarrierEnv just enough for lift_barrier_success_strict."""
-    def __init__(self, barrier_z, base_z, grasp0, grasp1):
-        self.barrier = FakeActor((0.0, 0.0, barrier_z))
+    """Mimics LiftBarrierEnv just enough for lift_barrier_success_strict.
+
+    ``barrier_z`` is the barrier CENTRE z; with the default identity quat the two
+    grasp ENDS sit at centre_z + 0.074 (the +z component of [+/-0.222, 0, 0.074]).
+    Pass ``barrier_p`` / ``barrier_q`` to place / rotate the barrier exactly.
+    """
+    def __init__(self, barrier_z, base_z, grasp0, grasp1,
+                 barrier_p=None, barrier_q=(1.0, 0.0, 0.0, 0.0)):
+        p = (0.0, 0.0, barrier_z) if barrier_p is None else tuple(barrier_p)
+        self.barrier = FakeActor(p, barrier_q)
         bid = id(self.barrier)
         self.agent = FakeMultiAgent([
             FakeAgent(base_z=base_z, grasping={bid: grasp0}, name="arm0"),
@@ -164,9 +177,9 @@ def _b(t):
 
 
 def test_lb_strict_high_but_one_gripper_open_is_false():
-    """z high (OLD check passes) but arm1 NOT grasping -> strict says False."""
+    """ends high (OLD centre check passes) but arm1 NOT grasping -> strict False."""
     env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=False)
-    # sanity: the OLD grasp-blind height check WOULD pass here
+    # sanity: the OLD grasp-blind CENTRE-height check WOULD pass here
     old_height = _b(env.barrier.pose.p[..., 2] > env.agent.agents[0].robot.pose.p[0, 2] + 0.15)
     assert old_height is True
     assert _b(lift_barrier_success_strict(env)) is False
@@ -178,24 +191,45 @@ def test_lb_strict_high_but_other_gripper_open_is_false():
 
 
 def test_lb_strict_both_grasping_and_high_is_true():
+    # centre 0.30 -> ends 0.374 > base+0.25=0.25, both grasping -> True
     env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=True)
     assert _b(lift_barrier_success_strict(env)) is True
 
 
 def test_lb_strict_both_grasping_but_low_is_false():
-    """Both grasping but barrier not lifted past threshold -> False."""
+    """Both grasping but ends not lifted past base+0.25 -> False."""
+    # centre 0.10 -> ends 0.174, < 0.25 -> False
     env = FakeLiftBarrierEnv(barrier_z=0.10, base_z=0.0, grasp0=True, grasp1=True)
     assert _b(lift_barrier_success_strict(env)) is False
 
 
 def test_lb_strict_respects_base_offset():
-    """Threshold is base_z + 0.15, not absolute 0.15."""
-    # barrier z 0.20, base z 0.10 -> 0.20 > 0.10+0.15=0.25 is False
+    """Threshold is base_z + 0.25, not absolute 0.25 (ends = centre + 0.074)."""
+    # centre 0.20, base 0.10 -> ends 0.274; 0.274 > 0.10+0.25=0.35 is False
     env = FakeLiftBarrierEnv(barrier_z=0.20, base_z=0.10, grasp0=True, grasp1=True)
     assert _b(lift_barrier_success_strict(env)) is False
-    # barrier z 0.30, base z 0.10 -> 0.30 > 0.25 True
+    # centre 0.30, base 0.10 -> ends 0.374 > 0.35 True
     env2 = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.10, grasp0=True, grasp1=True)
     assert _b(lift_barrier_success_strict(env2)) is True
+
+
+def test_lb_strict_tipped_bar_one_end_low_is_false():
+    """A TIPPED bar (one end high, other end low) must FAIL even though both arms
+    grasp and the CENTRE is above threshold -- this is the flung/tipped false-
+    positive the both-ends criterion closes.
+
+    Barrier rotated ~90deg about local-y (pitch) so the long axis (local-X) points
+    mostly along world-z: +x end goes up, -x end goes down. Centre placed high.
+    """
+    import transforms3d as t3d
+    # 80deg pitch about y: +x end -> +z (up), -x end -> -z (down).
+    q = t3d.quaternions.mat2quat(t3d.euler.euler2mat(0.0, np.deg2rad(80.0), 0.0))
+    env = FakeLiftBarrierEnv(
+        barrier_z=0.0, base_z=0.0, grasp0=True, grasp1=True,
+        barrier_p=(0.0, 0.0, 0.30), barrier_q=tuple(q.tolist()),
+    )
+    # one end is well below base+0.25 -> .all() over ends is False
+    assert _b(lift_barrier_success_strict(env)) is False
 
 
 def test_lb_strict_accepts_wrapped_env():
@@ -205,6 +239,88 @@ def test_lb_strict_accepts_wrapped_env():
             self.unwrapped = inner
     inner = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=True)
     assert _b(lift_barrier_success_strict(Wrapper(inner))) is True
+
+
+# ===========================================================================
+# Both-ends GEOMETRY: world-z of the two grasp ends for known poses, hand-checked.
+# ===========================================================================
+class _Barrier:
+    """A bare barrier with a pose carrying .p (1,3) and .q (1,4 wxyz)."""
+    def __init__(self, p, q):
+        self.pose = FakePose(p, q)
+
+
+def _ends_z(p, q):
+    ends = barrier_grasp_ends_world(_Barrier(p, q)).reshape(2, 3).numpy()
+    return ends
+
+
+def test_geom_offsets_are_pm_x_with_small_z():
+    off = BARRIER_END_OFFSETS.numpy()
+    assert np.allclose(off[0], [0.222, 0.0, 0.074])
+    assert np.allclose(off[1], [-0.222, 0.0, 0.074])
+    assert BARRIER_LIFT_DZ == 0.25
+
+
+def test_geom_identity_quat_ends_are_p_plus_offset():
+    """Identity quat: ends = p + [+/-0.222, 0, 0.074] exactly."""
+    p = (0.10, -0.20, 0.30)
+    ends = _ends_z(p, (1.0, 0.0, 0.0, 0.0))
+    assert np.allclose(ends[0], [0.10 + 0.222, -0.20, 0.30 + 0.074], atol=1e-5)
+    assert np.allclose(ends[1], [0.10 - 0.222, -0.20, 0.30 + 0.074], atol=1e-5)
+
+
+def test_geom_90deg_about_z():
+    """90deg yaw about z: local +x -> world +y; both ends keep z = p_z + 0.074."""
+    import transforms3d as t3d
+    q = t3d.quaternions.mat2quat(t3d.euler.euler2mat(0, 0, np.pi / 2))
+    p = (0.0, 0.0, 0.30)
+    ends = _ends_z(p, tuple(q.tolist()))
+    # +x end -> +y; -x end -> -y; z unchanged (= 0.30 + 0.074)
+    assert np.allclose(ends[0], [0.0, 0.222, 0.374], atol=1e-4)
+    assert np.allclose(ends[1], [0.0, -0.222, 0.374], atol=1e-4)
+
+
+def test_geom_90deg_about_y_sends_ends_to_z():
+    """90deg pitch about y: local +x -> world -z, local -x -> world +z.
+
+    Hand: R_y(90) maps [x,0,z] -> [z, 0, -x]. So +x end offset [0.222,0,0.074]
+    -> [0.074, 0, -0.222]; -x end [-0.222,0,0.074] -> [0.074, 0, +0.222].
+    With p=(0,0,0.30): +x end z = 0.30-0.222=0.078 ; -x end z = 0.30+0.222=0.522.
+    """
+    import transforms3d as t3d
+    q = t3d.quaternions.mat2quat(t3d.euler.euler2mat(0, np.pi / 2, 0))
+    p = (0.0, 0.0, 0.30)
+    ends = _ends_z(p, tuple(q.tolist()))
+    assert np.allclose(ends[0], [0.074, 0.0, 0.30 - 0.222], atol=1e-4)
+    assert np.allclose(ends[1], [0.074, 0.0, 0.30 + 0.222], atol=1e-4)
+
+
+def test_geom_45deg_about_z_matches_handcalc():
+    """45deg yaw about z: local +x -> (cos45, sin45, 0)*0.222 in xy; z unchanged."""
+    import transforms3d as t3d
+    q = t3d.quaternions.mat2quat(t3d.euler.euler2mat(0, 0, np.pi / 4))
+    p = (0.0, 0.0, 0.30)
+    ends = _ends_z(p, tuple(q.tolist()))
+    c = 0.222 / np.sqrt(2.0)
+    assert np.allclose(ends[0], [c, c, 0.374], atol=1e-4)
+    assert np.allclose(ends[1], [-c, -c, 0.374], atol=1e-4)
+
+
+def test_geom_batched_two_envs():
+    """barrier_grasp_ends_world keeps the leading batch dim: (B,2,3)."""
+    class _BatchBarrier:
+        def __init__(self):
+            class _P:
+                p = torch.tensor([[0.0, 0.0, 0.30], [1.0, 2.0, 0.50]])
+                q = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+            self.pose = _P()
+    ends = barrier_grasp_ends_world(_BatchBarrier())
+    assert tuple(ends.shape) == (2, 2, 3)
+    # env0 +x end
+    assert np.allclose(ends[0, 0].numpy(), [0.222, 0.0, 0.374], atol=1e-5)
+    # env1 -x end
+    assert np.allclose(ends[1, 1].numpy(), [1.0 - 0.222, 2.0, 0.574], atol=1e-5)
 
 
 # ===========================================================================

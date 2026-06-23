@@ -38,14 +38,22 @@ from robofactory.planner import dart_perturb  # noqa: E402
 class _FakeArm:
     """Minimal stand-in for subtask_interpreter._ArmState exposing only what the
     hook reads: ``.current`` (truthy=has a queued recipe / None=done), ``.ti``
-    (tick index), ``.built`` (None until built), ``.frozen_grip`` (last grip)."""
+    (tick index), ``.built`` (None until built), ``.frozen_grip`` (last grip), and
+    ``.qi`` (program-progress index; the hook shoves only an arm with
+    ``qi >= shove_after_qi`` == grasp seated).
+
+    Default ``qi=2`` (== GRASP_IDX) so the arm is POST-GRASP by default: the existing
+    "always inject" / determinism tests exercise the shove path. Pass ``qi=0`` (or 1)
+    to model a pre-grasp arm the new rule must NOT shove.
+    """
 
     def __init__(self, current=True, ti=0, built=None, frozen_grip=1.0,
-                 frozen_qpos=None):
+                 frozen_qpos=None, qi=2):
         self.current = current
         self.ti = ti
         self.built = built
         self.frozen_grip = frozen_grip
+        self.qi = qi
         # last-commanded setpoint the hook holds non-move arms at (the real
         # _ArmState carries this); default to a fixed 7-vector so the fake works.
         self.frozen_qpos = (
@@ -61,17 +69,25 @@ class _FakePlanner:
         self.robot = [object() for _ in range(num_arms)]
 
 
-def _entering_state(moving_arms, num_arms=2, grips=None):
+def _entering_state(moving_arms, num_arms=2, grips=None, qi=2):
     """Build a fake interpreter ``state`` where ``moving_arms`` are about to ENTER a
-    primitive (current truthy, ti==0, built is None) and the rest are done."""
+    primitive (current truthy, ti==0, built is None) and the rest are done.
+
+    ``qi`` (default 2 = post-grasp) is the program-progress index given to the moving
+    arms; pass qi<2 to model pre-grasp arms the shove rule must skip. ``qi`` may be an
+    int (applied to all moving arms) or a {arm: qi} dict.
+    """
     grips = grips if grips is not None else [1.0] * num_arms
     arms = {}
     for i in range(num_arms):
+        qi_i = qi[i] if isinstance(qi, dict) else qi
         if i in moving_arms:
-            arms[i] = _FakeArm(current=True, ti=0, built=None, frozen_grip=grips[i])
+            arms[i] = _FakeArm(current=True, ti=0, built=None, frozen_grip=grips[i],
+                               qi=qi_i)
         else:
             # a "done"/non-entering arm: current None so it is NOT in `moving`.
-            arms[i] = _FakeArm(current=None, ti=0, built=None, frozen_grip=grips[i])
+            arms[i] = _FakeArm(current=None, ti=0, built=None, frozen_grip=grips[i],
+                               qi=qi_i)
     return {"step": 0, "arms": arms, "planner": _FakePlanner(num_arms)}
 
 
@@ -116,18 +132,79 @@ def test_hook_none_when_cfg_falsy_or_sigma_nonpositive():
 
 
 # ===========================================================================
-# HOOK: first transition ALWAYS injects (force-first).
+# HOOK: first POST-GRASP transition ALWAYS injects (force-first).
 # ===========================================================================
 def test_hook_first_transition_always_injects(monkeypatch):
     calls = _install_recorder(monkeypatch)
-    # p_inject=0 -> only the forced first call should ever inject.
+    # p_inject=0 -> only the forced first (post-grasp) call should ever inject.
     cfg = R.DartCfg(sigma=0.3, p_inject=0.0, dart_seed=7)
     hook = R._make_boundary_hook(cfg, env_seed=11, variant_id=0)
-    state = _entering_state(moving_arms=[0, 1])
-    hook(object(), state)               # transition counter 0 -> forced inject
+    state = _entering_state(moving_arms=[0, 1])  # qi=2 default -> post-grasp
+    hook(object(), state)               # first post-grasp transition -> forced inject
     assert len(calls) == 1
     # a second transition with p_inject=0 must NOT inject.
     hook(object(), _entering_state(moving_arms=[0, 1]))
+    assert len(calls) == 1
+
+
+# ===========================================================================
+# HOOK (NEW timing rule): shove ONLY a post-grasp arm (qi >= shove_after_qi).
+# ===========================================================================
+def test_hook_no_shove_pre_grasp_arm(monkeypatch):
+    """An arm that has NOT grasped yet (qi < shove_after_qi) must NOT be shoved,
+    even though it is genuinely transitioning. This is the 'don't fling the
+    un-grasped bar' rule (replaces the old approach->close pickup-boundary shove)."""
+    calls = _install_recorder(monkeypatch)
+    cfg = R.DartCfg(sigma=0.4, p_inject=1.0, dart_seed=0)  # shove_after_qi=2 default
+    hook = R._make_boundary_hook(cfg, env_seed=3, variant_id=0)
+    # both arms transitioning but PRE-grasp (qi=0 = on approach, qi=1 = on close)
+    hook(object(), _entering_state(moving_arms=[0, 1], qi={0: 0, 1: 1}))
+    assert calls == [], "must not shove a pre-grasp arm"
+    # still pre-grasp on a later transition -> still no shove
+    hook(object(), _entering_state(moving_arms=[0, 1], qi={0: 1, 1: 0}))
+    assert calls == []
+
+
+def test_hook_force_first_fires_only_once_a_post_grasp_arm_transitions(monkeypatch):
+    """The FORCED first inject is deferred until a POST-GRASP arm transitions:
+    pre-grasp transitions do nothing; the first qi>=2 transition force-injects."""
+    calls = _install_recorder(monkeypatch)
+    cfg = R.DartCfg(sigma=0.4, p_inject=0.0, dart_seed=5)  # p_inject 0 -> only forced
+    hook = R._make_boundary_hook(cfg, env_seed=8, variant_id=1)
+    # tc0, tc1: pre-grasp -> no shove (and the force-first has NOT been spent)
+    hook(object(), _entering_state(moving_arms=[0], qi={0: 0, 1: 0}))
+    hook(object(), _entering_state(moving_arms=[1], qi={0: 1, 1: 1}))
+    assert calls == []
+    # tc2: arm0 now entering its LIFT (qi=2) -> the forced first inject FINALLY fires
+    hook(object(), _entering_state(moving_arms=[0], qi={0: 2, 1: 1}))
+    assert len(calls) == 1
+    assert calls[0]["move_ids"] == [0]
+    # tc3: another post-grasp transition but p_inject=0 and force already spent -> none
+    hook(object(), _entering_state(moving_arms=[1], qi={0: 2, 1: 2}))
+    assert len(calls) == 1
+
+
+def test_hook_only_post_grasp_arm_is_shoved_when_mixed(monkeypatch):
+    """When one arm is pre-grasp and one is post-grasp in the SAME transition, only
+    the post-grasp arm is eligible -> the shove targets it."""
+    calls = _install_recorder(monkeypatch)
+    cfg = R.DartCfg(sigma=0.4, p_inject=1.0, dart_seed=0)
+    hook = R._make_boundary_hook(cfg, env_seed=2, variant_id=0)
+    # arm0 pre-grasp (qi=1), arm1 post-grasp (qi=2) -> only arm1 eligible
+    hook(object(), _entering_state(moving_arms=[0, 1], qi={0: 1, 1: 2}))
+    assert len(calls) == 1
+    assert calls[0]["move_ids"] == [1], "only the post-grasp arm should be shoved"
+
+
+def test_hook_respects_custom_shove_after_qi(monkeypatch):
+    """shove_after_qi is configurable: with shove_after_qi=3 a qi=2 arm is NOT yet
+    eligible."""
+    calls = _install_recorder(monkeypatch)
+    cfg = R.DartCfg(sigma=0.4, p_inject=1.0, dart_seed=0, shove_after_qi=3)
+    hook = R._make_boundary_hook(cfg, env_seed=4, variant_id=0)
+    hook(object(), _entering_state(moving_arms=[0, 1], qi=2))  # below threshold 3
+    assert calls == []
+    hook(object(), _entering_state(moving_arms=[0, 1], qi=3))  # at threshold
     assert len(calls) == 1
 
 
@@ -164,6 +241,32 @@ def test_hook_determinism_same_ids_identical_calls(monkeypatch):
 
     assert len(calls_a) == len(calls_b) > 0
     assert calls_a == calls_b, "identical (env_seed,variant_id) must replay exactly"
+
+
+def test_hook_determinism_with_grasp_progression(monkeypatch):
+    """Determinism holds across the pre->post-grasp progression: two identical-id
+    hooks driven through the SAME qi schedule replay the SAME inject stream
+    (force-first deferred to the first post-grasp transition, then p_inject draws)."""
+    cfg = R.DartCfg(sigma=0.4, p_inject=0.5, k_min=3, k_max=8, floor=0.05,
+                    dart_seed=9)
+    # qi schedule per transition: 2 pre-grasp ticks, then post-grasp.
+    schedule = [{0: 0, 1: 0}, {0: 1, 1: 1}, {0: 2, 1: 1},
+                {0: 2, 1: 2}, {0: 2, 1: 2}, {0: 2, 1: 2}]
+
+    def run():
+        calls = _install_recorder(monkeypatch)
+        hook = R._make_boundary_hook(cfg, env_seed=42, variant_id=1)
+        for qi in schedule:
+            hook(object(), _entering_state(moving_arms=[0, 1], qi=qi))
+        return calls
+
+    a = run()
+    b = run()
+    assert len(a) == len(b) > 0
+    assert a == b, "identical ids + schedule must replay exactly"
+    # the FIRST inject must be the first POST-GRASP transition (tc index 2), so no
+    # inject was recorded for the two pre-grasp transitions.
+    assert all(c["move_ids"][0] in (0, 1) for c in a)
 
 
 def test_hook_different_variant_ids_diverge(monkeypatch):

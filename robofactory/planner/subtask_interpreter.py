@@ -273,12 +273,67 @@ def check_tcp_near(target_pose_fn: Optional[Callable] = None, tol: float = 0.05)
 
 
 def check_barrier_lifted(dz: float = 0.15) -> Callable:
-    """lift success (LiftBarrier): barrier z > arm0 base z + dz (matches env.evaluate)."""
+    """lift success (LiftBarrier): barrier CENTRE z > arm0 base z + dz.
+
+    LEGACY grasp-blind centre check (kept for back-compat / reference). The strict
+    success now used by the scenarios is :func:`check_barrier_ends_held`.
+    """
     def _check(env, arm: int, primitive: Primitive) -> bool:
         u = _unwrap(env)
         bz = _scalar(u.barrier.pose.p[..., 2])
         base_z = _scalar(u.agent.agents[0].robot.pose.p[0, 2])
         return bz > base_z + dz
+    return _check
+
+
+# Barrier grasp-end offsets in the barrier's LOCAL frame (long axis = local-X).
+# [+/-0.222, 0, +0.074] -- the annotation contact points (local-X +/-0.37) scaled by
+# the actor scale [0.6, 0.6, 0.2]. See robofactory.tasks.success_candidates
+# (BARRIER_END_OFFSETS) for the full derivation; kept duplicated here so the
+# numpy-only interpreter does not import torch / the tasks package.
+_BARRIER_END_OFFSETS_NP = np.array(
+    [[0.222, 0.0, 0.074], [-0.222, 0.0, 0.074]], dtype=np.float64
+)
+
+
+def _quat_rotate_wxyz_np(q, v):
+    """Rotate vector ``v`` by quaternion ``q`` (wxyz), numpy single-env.
+
+    q: (4,) wxyz ; v: (3,) or (N, 3) -> same shape as v. Standard
+    v' = v + 2*w*(u x v) + 2*(u x (u x v)) form.
+    """
+    q = np.asarray(q, dtype=np.float64).reshape(-1)[:4]
+    w, u = q[0], q[1:4]
+    v = np.asarray(v, dtype=np.float64)
+    t = 2.0 * np.cross(u, v)
+    return v + w * t + np.cross(u, t)
+
+
+def check_barrier_ends_held(dz: float = 0.25) -> Callable:
+    """STRICT lift success (LiftBarrier), single-env / numpy.
+
+    Mirrors ``LiftBarrierEnv.evaluate`` / ``lift_barrier_success_strict``:
+    returns True iff BOTH grasp ENDS of the barrier have world-z > base_z + ``dz``
+    AND BOTH arms are grasping the barrier. base_z = arm-0 robot base z. The two
+    grasp ends are ``barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]``
+    (barrier.pose.q is wxyz). Replaces the grasp-blind centre check
+    (:func:`check_barrier_lifted`) so a flung / tipped / one-end-up bar no longer
+    passes. (``arm``/``primitive`` are unused -- this is a whole-bar predicate.)
+    """
+    def _check(env, arm: int, primitive: Primitive) -> bool:
+        u = _unwrap(env)
+        p = u.barrier.pose.p
+        p = p.detach().cpu().numpy() if hasattr(p, "detach") else np.asarray(p)
+        p = np.asarray(p).reshape(-1)[:3]
+        q = u.barrier.pose.q
+        q = q.detach().cpu().numpy() if hasattr(q, "detach") else np.asarray(q)
+        q = np.asarray(q).reshape(-1)[:4]
+        ends = p[None, :] + _quat_rotate_wxyz_np(q, _BARRIER_END_OFFSETS_NP)  # (2,3)
+        base_z = _scalar(u.agent.agents[0].robot.pose.p[0, 2])
+        ends_high = bool(np.all(ends[:, 2] > base_z + dz))
+        g0 = bool(np.asarray(_grasp_bool(u.agent.agents[0], u.barrier)).reshape(-1)[0])
+        g1 = bool(np.asarray(_grasp_bool(u.agent.agents[1], u.barrier)).reshape(-1)[0])
+        return ends_high and g0 and g1
     return _check
 
 

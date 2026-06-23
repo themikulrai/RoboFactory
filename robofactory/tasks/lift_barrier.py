@@ -115,8 +115,24 @@ class LiftBarrierEnv(BaseEnv):
 
 
     def evaluate(self):
-        success = self.barrier.pose.p[..., 2] > self.agent.agents[0].robot.pose.p[0, 2] + 0.15
-        # print(self.barrier.pose.p[..., 2])
+        # STRICT success (replaces the grasp-blind centre-height check, which let
+        # flung / tipped / un-grasped bars false-positive): BOTH grasp ENDS of the
+        # barrier must clear base_z + 0.25 AND BOTH arms must be grasping it. The
+        # grasp ends are barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]
+        # (long axis = local-X; offsets verified against model_data.json + the
+        # annotation grasp pipeline). Shared with success_candidates so the two stay
+        # in lock-step. Runs on the env's BATCHED GPU torch tensors (batch dim kept).
+        from robofactory.tasks.success_candidates import (
+            barrier_grasp_ends_world,
+            BARRIER_LIFT_DZ,
+        )
+        ends = barrier_grasp_ends_world(self.barrier)            # (..., 2, 3)
+        base_z = self.agent.agents[0].robot.pose.p[0, 2]
+        ends_z = ends[..., 2]                                    # (..., 2)
+        height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (...,) both ends
+        grasp0 = self.agent.agents[0].is_grasping(self.barrier)
+        grasp1 = self.agent.agents[1].is_grasping(self.barrier)
+        success = (height_ok & grasp0 & grasp1).bool()
         return {
             "success": success,
         }
