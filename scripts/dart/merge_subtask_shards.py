@@ -38,7 +38,10 @@ def _shard_dirs(shards_root, task):
     return dirs
 
 
-def merge(shard_dirs, task, out_dir):
+def merge(shard_dirs, task, out_dir, slice_filter=None):
+    """Merge kept episodes from ``shard_dirs`` into ``out_dir``. If ``slice_filter``
+    is set (e.g. "recovery"), only episodes whose meta ``slice`` matches are merged
+    (used to build per-slice datasets for curriculum training)."""
     os.makedirs(out_dir, exist_ok=True)
     out_h5_path = os.path.join(out_dir, f"{task}.h5")
     out_stream_path = os.path.join(out_dir, f"{task}_subtask_stream.h5")
@@ -84,6 +87,8 @@ def merge(shard_dirs, task, out_dir):
             with h5py.File(sh_h5, "r") as in_h5, h5py.File(sh_stream, "r") as in_stream:
                 # iterate the kept set in meta order (authoritative for subtask data)
                 for mrow in md.get("episodes", []):
+                    if slice_filter is not None and mrow.get("slice") != slice_filter:
+                        continue
                     old = int(mrow["episode_id"])
                     tk_old = f"traj_{old}"
                     if tk_old not in in_h5 or tk_old not in in_stream:
@@ -178,7 +183,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shards-root", help="dir containing shard_*/<task>/")
     ap.add_argument("--task", default="LiftBarrier")
-    ap.add_argument("--out", help="combined output dir (e.g. <root>/LiftBarrier)")
+    ap.add_argument("--out", help="combined output dir; with --by-slice, the parent "
+                    "under which <slice>/<task>/ dirs are written")
+    ap.add_argument("--by-slice", action="store_true",
+                    help="emit 3 per-slice datasets (recovery/merged/clean) for curriculum "
+                    "training instead of one combined dataset")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -188,7 +197,12 @@ def main():
         ap.error("--shards-root and --out required (or --selftest)")
     dirs = _shard_dirs(a.shards_root, a.task)
     print(f"[merge] {len(dirs)} shards: {dirs}")
-    merge(dirs, a.task, a.out)
+    if a.by_slice:
+        for s in ("recovery", "merged", "clean"):
+            print(f"\n[merge] === slice '{s}' ===")
+            merge(dirs, a.task, os.path.join(a.out, s, a.task), slice_filter=s)
+    else:
+        merge(dirs, a.task, a.out)
 
 
 if __name__ == "__main__":
