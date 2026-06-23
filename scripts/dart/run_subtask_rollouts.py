@@ -230,11 +230,21 @@ def _run_one_variant(env, spec, max_steps, dart_cfg):
         print(f"    [variant {spec.name}] BUILD/PLAN failed: "
               f"{type(e).__name__}: {e}", flush=True)
         return None, None
-    out = run_program(
-        env, planner, programs, rec, max_steps=max_steps,
-        boundary_hook=boundary_hook,
-        control_mode=planner.control_mode,
-    )
+    try:
+        out = run_program(
+            env, planner, programs, rec, max_steps=max_steps,
+            boundary_hook=boundary_hook,
+            control_mode=planner.control_mode,
+        )
+    except Exception as e:
+        # JIT plan failures fire DURING the rollout, not at build (primitives plan
+        # screw paths lazily from live pose). The most common is mplib TOPP's
+        # "Fail to parameterize path". Honour this fn's contract -> (None, None) so
+        # _process_group drops just this variant (and discards its open buffer);
+        # an uncaught raise here would propagate up and kill the WHOLE shard.
+        print(f"    [variant {spec.name}] ROLLOUT/PLAN failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None, None
     return rec, out
 
 
