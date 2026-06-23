@@ -85,3 +85,10 @@ scripts/feasibility_wrist_replay/rollouts_out
 *.hdf5
 *.zarr
 wandb/
+
+# Local run artifacts (root-level, agent/eval generated)
+.claude/
+.slurm_scripts/
+slurm/
+eval_results/
+images/tsc_camera_verify/
