@@ -51,21 +51,21 @@ The full program is [approach(0), close(1), lift(2), place(3), open(4), retreat_
     at index 4, retreat-done at qi >= 5) — the gate index must track the ACTUAL
     previous-arm program length, never a hardcoded 6.
 
-CONTRAST FAMILIES (matched pairs, SAME seed; placing serial in BOTH members):
-  1. ``pickcoord``: simultaneous_pick (all 3 approach+close+lift UNGATED together)
-     VS staggered_pick (arm0 leads ungated; arm1 & arm2's approach gated on arm0
-     GRASPED (qi >= GRASP_IDX) -> they WAIT at home at frame 0). Both then place
-     serially A->B->C with retreats. Frame-0 counterfactual: arm1/arm2 WAIT vs
-     APPROACH.
-  2. ``raisedirect``: for the FIRST placer (arm0, rank0): simultaneous_pick (arm0
-     does lift(0.5) then place — it raises HIGH first; the SHARED baseline, the
-     SAME behaviour/builder as the pickcoord baseline) VS direct_place (arm0 SKIPS
-     the lift(0.5) and places directly from the grasp, since the region is clear and
-     it is FIRST). The others ALWAYS raise. Counterfactual: arm0 after grasp -> LIFT
-     (raise/wait-at-top) vs PLACE (descend directly). Both stay collision-free (arm0
-     places first into the empty region; the others wait HIGH). The baseline is
-     RE-EMITTED here (once per group) exactly as the LB sampler re-emits
-     ``simultaneous`` — no misleading ``raise_and_wait`` duplicate.
+CONTRAST FAMILIES (ONE group per seed; a SINGLE shared simultaneous_pick baseline
+emitted ONCE; placing serial in EVERY member):
+  baseline ``simultaneous_pick``: all 3 approach+close+lift UNGATED together, then
+     place serially A->B->C with retreats; arm0 raises HIGH (+0.5) before placing.
+     Emitted ONCE — both contrasts below branch off it (NO duplicate baseline; the
+     old per-pair re-emit produced a byte-identical redundant episode).
+  1. ``pickcoord`` (staggered_pick): arm0 leads grasp ungated; arm1 & arm2's
+     approach gated on arm0 GRASPED (qi >= GRASP_IDX) -> they WAIT at home at frame
+     0. Frame-0 counterfactual vs baseline: arm1/arm2 WAIT vs APPROACH.
+  2. ``raisedirect`` (direct_place): for the FIRST placer (arm0, rank0) arm0 SKIPS
+     the lift(0.5) and places directly from the grasp (region clear, it is FIRST);
+     the others ALWAYS raise. Counterfactual vs baseline: arm0 after grasp -> PLACE
+     (descend directly) vs LIFT (raise/wait-at-top). Both stay collision-free (arm0
+     places first into the empty region; the others wait HIGH). There is no
+     misleading ``raise_and_wait`` duplicate.
 
 GATE MECHANISM / GUARDS (inherited from the LB module):
 gates are DETERMINISTIC predicates on another arm's ``_ArmState.qi``, never a
@@ -501,15 +501,16 @@ def sample(seed: int) -> List[ProgramSpec]:
     identical across variants). Structure is fixed (gating only), so the RNG draw is
     reserved for forward-compat / reproducibility.
 
-    Returns a flat list of ProgramSpec, two matched contrastive PAIRS:
-      * ``pickcoord``  : simultaneous_pick  vs  staggered_pick
-      * ``raisedirect``: simultaneous_pick  vs  direct_place
-    The ``simultaneous_pick`` baseline appears once PER GROUP as the shared baseline
-    behaviour (same builder), so both contrast groups branch off identical baseline
-    behaviour — mirroring the LB sampler. There is no ``raise_and_wait``.
-    Both members of each pair place STRICTLY SERIALLY (A->B->C) with retreats and so
-    are collision-free; they differ only at the contrast axis (frame-0 pick timing
-    for pickcoord; arm0's raise-vs-descend for raisedirect).
+    Returns a flat list of 3 ProgramSpec in ONE contrast group sharing a SINGLE
+    ``simultaneous_pick`` baseline (emitted ONCE, NOT re-emitted per pair — so no
+    duplicate baseline trajectory; the old `raisedirect` baseline was byte-identical
+    to the `pickcoord` baseline). The two contrasts branch off the shared baseline:
+      * ``pickcoord``  (staggered_pick): frame-0 pick timing — arm1/arm2 WAIT vs
+        APPROACH.
+      * ``raisedirect`` (direct_place): arm0's raise-then-place vs descend-directly.
+    There is no ``raise_and_wait``. All members place STRICTLY SERIALLY (A->B->C)
+    with retreats and so are collision-free; ``family`` tags each variant's contrast
+    axis. The shared baseline keeps each variant a clean A/B from the same reset.
     """
     rng = np.random.default_rng(int(seed))
     _reserved = int(rng.integers(2, 5))  # reserved structural draw (forward-compat)
@@ -526,32 +527,25 @@ def sample(seed: int) -> List[ProgramSpec]:
         ))
         vid += 1
 
-    # (0) pickcoord: simultaneous_pick  vs  staggered_pick
-    #   simultaneous_pick: all 3 grasp+lift ungated together; serial place A->B->C.
-    #   staggered_pick:    arm0 leads grasp ungated; arm1,arm2 wait for arm0 grasped.
-    emit("simultaneous_pick", "pickcoord", gid,
+    # ONE contrast group per seed sharing a SINGLE simultaneous_pick baseline
+    # (frame-0 identical across all members). The baseline is emitted ONCE — NOT
+    # re-emitted once per contrast pair — so the dataset never stores a duplicate
+    # baseline trajectory (the old `raisedirect` baseline was byte-identical to the
+    # `pickcoord` baseline, producing a redundant episode). The two contrasts branch
+    # off this shared baseline:
+    #   * pickcoord  : staggered_pick  (arm0 leads grasp; arm1,arm2 WAIT at frame 0)
+    #   * raisedirect: direct_place    (arm0 SKIPS lift, places directly from grasp)
+    # Each variant keeps its own ``family`` tag so the (baseline, variant) contrast
+    # axis stays recoverable for analysis. ALL members place STRICTLY SERIALLY
+    # (A->B->C) with retreats, so every member is collision-free and complete.
+    emit("simultaneous_pick", "baseline", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
-         {"pick": "simultaneous", "lead_arm": None, "complete": True,
-          "assignment": "base"})
+         {"pick": "simultaneous", "lead_arm": None, "first_placer": 0,
+          "arm0": "raise_then_place", "complete": True, "assignment": "base"})
     emit("staggered_pick", "pickcoord", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=0),
          {"pick": "staggered", "lead_arm": 0, "follow_arms": [1, 2],
           "complete": True, "assignment": "base"})
-    gid += 1
-
-    # (1) raisedirect: simultaneous_pick (baseline)  vs  direct_place (arm0 only)
-    #   simultaneous_pick: arm0 lifts(0.5) then places (raises high first) — the
-    #                   SHARED baseline behaviour, byte-identical to the pickcoord
-    #                   baseline (same builder), RE-EMITTED here as the raisedirect
-    #                   baseline (cf. the LB sampler re-emitting `simultaneous` per
-    #                   group). No misleading `raise_and_wait` duplicate name.
-    #   direct_place:   arm0 SKIPS the lift, places directly from the grasp (region
-    #                   clear, it is first). The others ALWAYS raise.
-    #   Both use a SIMULTANEOUS pick so the ONLY contrast is arm0's raise-vs-descend.
-    emit("simultaneous_pick", "raisedirect", gid,
-         _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
-         {"first_placer": 0, "arm0": "raise_then_place", "complete": True,
-          "assignment": "base"})
     emit("direct_place", "raisedirect", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None, direct_place_arm=0),
          {"first_placer": 0, "arm0": "direct_place_no_lift", "complete": True,
@@ -572,11 +566,11 @@ if __name__ == "__main__":
     print(f"sampled {len(s)} specs in {len(by_group)} contrast groups")
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
-        assert len(members) == 2, (gid_, names)
-        assert "simultaneous_pick" in names, (gid_, names)  # shared baseline per group
-        print(f"  group {gid_} [{members[0].family}]: {names}")
-    assert len(s) == 4 and len(by_group) == 2, (len(s), len(by_group))
-    assert {m.family for m in s} == {"pickcoord", "raisedirect"}
+        assert len(members) == 3, (gid_, names)  # baseline + two contrast variants
+        assert "simultaneous_pick" in names, (gid_, names)  # single shared baseline
+        print(f"  group {gid_}: {names}")
+    assert len(s) == 3 and len(by_group) == 1, (len(s), len(by_group))
+    assert {m.family for m in s} == {"baseline", "pickcoord", "raisedirect"}
     assert {m.name for m in s} == {
         "simultaneous_pick", "staggered_pick", "direct_place"}
     assert len({m.variant_id for m in s}) == len(s)

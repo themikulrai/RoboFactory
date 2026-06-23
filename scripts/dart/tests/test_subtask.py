@@ -325,26 +325,26 @@ def test_dry_run_pose_list_returns_single_plan_stub():
 # ===========================================================================
 # PURE: contrastive scenario sampler (all-complete-rollout coordination contrast)
 #
-# New family set (2 matched pairs, 4 variants). Every pair is {simultaneous, X}
-# from ONE seed; the contrast is COORDINATION (who waits/leads), NOT truncation —
-# every variant ends with BOTH arms lifting (a complete rollout). seq_lift was
-# DROPPED: a rigid barrier needs both ends to rise together, so a lift-timing-only
-# contrast is a physical null (frame-0 identical to simultaneous).
+# Family set (3 variants in ONE contrast group sharing a SINGLE simultaneous
+# baseline emitted once — no duplicate re-emit). The contrast is COORDINATION (who
+# waits/leads), NOT truncation — every variant ends with BOTH arms lifting (a
+# complete rollout). seq_lift was DROPPED: a rigid barrier needs both ends to rise
+# together, so a lift-timing-only contrast is a physical null (frame-0 identical to
+# simultaneous).
 # ===========================================================================
-def test_sampler_emits_two_matched_pairs():
+def test_sampler_emits_one_group_single_baseline():
     specs = S.sample(7)
     groups = S.group_specs(specs)
-    assert len(specs) == 4
-    assert len(groups) == 2
-    for gid, members in groups.items():
-        assert len(members) == 2, (gid, [m.name for m in members])
-        # both members share family + contrast_group_id
-        assert members[0].family == members[1].family
-        assert members[0].contrast_group_id == members[1].contrast_group_id == gid
-        # the simultaneous baseline is in EVERY pair (clean A/B)
-        assert "simultaneous" in {m.name for m in members}, [m.name for m in members]
+    assert len(specs) == 3
+    assert len(groups) == 1
+    (gid, members), = groups.items()
+    assert len(members) == 3, (gid, [m.name for m in members])
+    # all members share the ONE contrast_group_id
+    assert all(m.contrast_group_id == gid for m in members)
+    # EXACTLY ONE simultaneous baseline (the dedup: no per-pair re-emit duplicate)
+    assert [m.name for m in members].count("simultaneous") == 1
     families = {m.family for m in specs}
-    assert families == {"stagger_a", "stagger_b"}
+    assert families == {"baseline", "stagger_a", "stagger_b"}
     names = {m.name for m in specs}
     assert names == {"simultaneous", "stagger_a_leads", "stagger_b_leads"}
     # the OLD families/variants are GONE (incl. the dropped seq_lift / sequential_lift)
@@ -391,15 +391,17 @@ def test_sampler_arm_assignment_fixed_no_swap():
         assert a1.target_id == vocab.LB_TARGETS["right_end"], spec.name
 
 
-def test_filter_variants_keeps_groups_intact():
+def test_filter_variants_keeps_group_intact():
     specs = S.sample(7)
-    # ask for ONE member by name; the WHOLE matched group must come back
+    # ask for ONE member by name; the WHOLE group (shared baseline + both variants)
+    # must come back, since all variants share one contrast group now.
     out = S.filter_variants(specs, ["stagger_a_leads"])
-    names = sorted(m.name for m in out)
-    assert names == ["simultaneous", "stagger_a_leads"]
-    # ask by family
+    assert sorted(m.name for m in out) == [
+        "simultaneous", "stagger_a_leads", "stagger_b_leads"]
+    # ask by family -> same whole group
     out2 = S.filter_variants(specs, ["stagger_b"])
-    assert sorted(m.name for m in out2) == ["simultaneous", "stagger_b_leads"]
+    assert sorted(m.name for m in out2) == [
+        "simultaneous", "stagger_a_leads", "stagger_b_leads"]
     # None -> everything
     assert len(S.filter_variants(specs, None)) == len(specs)
     # unknown -> nothing

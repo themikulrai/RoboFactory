@@ -31,8 +31,9 @@ Matched variants are sampled from the SAME seed with an INDEPENDENT
 env's reset RNG — frame-0 of every variant in a contrast group is byte-identical
 (same env reset); they diverge only because the *program* (its gating) differs.
 
-NEW FAMILY SET (all complete rollouts; the baseline ``simultaneous`` is the shared
-reference, re-emitted in each matched pair so each contrast is a clean A/B):
+FAMILY SET (all complete rollouts; the baseline ``simultaneous`` is the shared
+reference, emitted ONCE per seed — both coordination variants branch off it, so
+each is a clean A/B without storing a duplicate baseline):
 
   * ``simultaneous`` (baseline): arm0 [approach(left)->close->lift(left)],
     arm1 [approach(right)->close->lift(right)], NO gates. Both lift together.
@@ -68,9 +69,10 @@ DEADLOCK GUARD: exactly ONE arm has an UNGATED first primitive in every variant
 ends with BOTH arms holding a lift primitive (no permanent-hold variant).
 
 Every emitted spec carries ``variant_id`` (unique within the sample) and
-``contrast_group_id`` (shared by a matched pair). ``sample(seed)`` returns the flat
-list; ``group_specs(specs)`` buckets them by ``contrast_group_id`` so the rollout
-driver can drop a whole matched group atomically if any member fails its checks.
+``contrast_group_id`` (ALL of a seed's variants share ONE group). ``sample(seed)``
+returns the flat list; ``group_specs(specs)`` buckets them by ``contrast_group_id``
+so the rollout driver can drop the whole group atomically if any member fails its
+checks (keeping the shared-baseline contrast balanced).
 
 IMPORT-CLEAN-ish: imports numpy + the (numpy-only) primitive/interpreter modules;
 NO sapien / gym / robofactory.tasks at module top, so the sampler's structure and
@@ -342,10 +344,12 @@ def sample(seed: int) -> List[ProgramSpec]:
     and to keep reproducibility tests meaningful; it does NOT change which variants
     are emitted.
 
-    Returns a flat list of ProgramSpec. Each matched contrastive pair
-    ``{simultaneous, <variant>}`` shares a ``contrast_group_id`` (use
-    ``group_specs`` to bucket them). The ``simultaneous`` baseline is RE-EMITTED in
-    each pair so every contrast is a clean A/B from the same reset.
+    Returns a flat list of ProgramSpec. ALL variants for a seed share ONE
+    ``contrast_group_id`` (use ``group_specs`` to bucket them) and a SINGLE
+    ``simultaneous`` baseline (emitted once, NOT re-emitted per pair — so no
+    duplicate baseline trajectory). Every member shares frame-0 (same reset), so
+    each coordination variant is still a clean A/B against the shared baseline;
+    ``family`` tags the contrast axis (``stagger_a`` / ``stagger_b``).
     """
     rng = np.random.default_rng(int(seed))
     # reserved structural draw (kept for reproducibility tests / forward-compat).
@@ -363,20 +367,17 @@ def sample(seed: int) -> List[ProgramSpec]:
         ))
         vid += 1
 
-    # Each contrast group is a matched PAIR: the simultaneous baseline + one
-    # coordination variant, from the SAME seed (frame-0 identical). The contrast is
-    # who waits / who leads, NOT truncation — every member completes the lift.
-
-    # (0) simultaneous  vs  stagger_a_leads (arm0 leads)
-    emit("simultaneous", "stagger_a", gid, _make_simultaneous_builder(),
+    # ONE contrast group per seed sharing a SINGLE simultaneous baseline (frame-0
+    # identical across all members). The baseline is emitted ONCE — NOT re-emitted
+    # once per pair — so the dataset never stores a duplicate baseline trajectory;
+    # the two coordination contrasts (arm0-leads / arm1-leads) branch off this one
+    # shared baseline. Each variant keeps its own ``family`` tag so the
+    # (baseline, variant) contrast axis stays recoverable for analysis. The contrast
+    # is who waits / who leads, NOT truncation — every member completes the lift.
+    emit("simultaneous", "baseline", gid, _make_simultaneous_builder(),
          {"lead_arm": None, "gated": False, "complete": True})
     emit("stagger_a_leads", "stagger_a", gid, _make_stagger_builder(lead_arm=0),
          {"lead_arm": 0, "follow_arm": 1, "complete": True})
-    gid += 1
-
-    # (1) simultaneous  vs  stagger_b_leads (arm1 leads, the mirror)
-    emit("simultaneous", "stagger_b", gid, _make_simultaneous_builder(),
-         {"lead_arm": None, "gated": False, "complete": True})
     emit("stagger_b_leads", "stagger_b", gid, _make_stagger_builder(lead_arm=1),
          {"lead_arm": 1, "follow_arm": 0, "complete": True})
     gid += 1
@@ -417,11 +418,11 @@ if __name__ == "__main__":
     print(f"sampled {len(s)} specs in {len(by_group)} contrast groups")
     for gid, members in sorted(by_group.items()):
         names = [m.name for m in members]
-        assert len(members) == 2, (gid, names)  # every group is a matched pair
-        assert "simultaneous" in names, (gid, names)  # baseline in every pair
-        print(f"  group {gid} [{members[0].family}]: {names}")
-    assert len(s) == 4 and len(by_group) == 2, (len(s), len(by_group))
-    assert {m.family for m in s} == {"stagger_a", "stagger_b"}
+        assert len(members) == 3, (gid, names)  # baseline + two coordination variants
+        assert "simultaneous" in names, (gid, names)  # single shared baseline
+        print(f"  group {gid}: {names}")
+    assert len(s) == 3 and len(by_group) == 1, (len(s), len(by_group))
+    assert {m.family for m in s} == {"baseline", "stagger_a", "stagger_b"}
     # variant ids unique
     assert len({m.variant_id for m in s}) == len(s)
     # seed reproducible (same structural draws)
