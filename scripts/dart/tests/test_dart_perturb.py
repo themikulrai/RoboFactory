@@ -333,6 +333,155 @@ def test_no_sink_is_ok():
     assert len(env.steps) == 2
 
 
+# ---- (f) grasp-protection SETTLE window (pre_hold_steps) -------------------
+
+
+# hold setpoints DISTINCT from the live q0 so a hold step (== hold_qpos, no offset)
+# is unmistakably different from a shove step (== q0 + floored offset).
+HOLD_A = np.array([5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6])  # arm0 frozen setpoint
+HOLD_B = np.array([6.0, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6])  # arm1 frozen setpoint
+
+
+def test_pre_hold_default_zero_is_legacy_behavior():
+    """pre_hold_steps defaults to 0 -> exactly K steps, no settle phase (legacy)."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(0),
+        sigma=0.3, K=4, floor=0.2,
+    )
+    assert len(env.steps) == 4  # no pre-hold steps prepended
+
+
+@pytest.mark.parametrize("G,K", [(10, 5), (1, 1), (3, 8)])
+def test_settle_then_shove_step_count_and_order(G, K):
+    """With pre_hold_steps=G: env gets G hold steps (ALL arms at hold_qpos, NO offset)
+    FOLLOWED BY K shove steps (move arm = q0+offset), in that order."""
+    env, robots = _make()
+    grips = [0.037, -0.021]
+    hold_qpos = [HOLD_A.copy(), HOLD_B.copy()]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(7),
+        sigma=0.3, K=K, floor=0.2, hold_qpos=hold_qpos, pre_hold_steps=G,
+    )
+    assert len(env.steps) == G + K, "total steps must be pre_hold_steps + K"
+
+    # phase 1: the FIRST G steps hold BOTH arms at hold_qpos with NO offset.
+    for s in env.steps[:G]:
+        np.testing.assert_allclose(s["panda-0"][:7], HOLD_A)  # move arm: NO offset
+        np.testing.assert_allclose(s["panda-1"][:7], HOLD_B)  # non-move arm held
+        assert s["panda-0"][-1] == grips[0]  # grip carried in settle
+        assert s["panda-1"][-1] == grips[1]
+
+    # phase 2: the LAST K steps shove the move arm (q0 + offset, != hold AND != q0
+    # is not required, but it must DIFFER from the settle hold) and hold arm1.
+    for s in env.steps[G:]:
+        assert not np.allclose(s["panda-0"][:7], HOLD_A), \
+            "shove step must differ from the settle hold (offset applied)"
+        # move arm shove target = live q0 (Q0_A) + floored offset -> differs from q0 too
+        assert not np.allclose(s["panda-0"][:7], Q0_A[:7])
+        np.testing.assert_allclose(s["panda-1"][:7], HOLD_B)  # arm1 still held
+        assert s["panda-0"][-1] == grips[0]  # grip carried through the shove
+        assert s["panda-1"][-1] == grips[1]
+
+
+def test_settle_holds_move_arm_at_setpoint_no_offset():
+    """Specifically: during the settle window the MOVE arm holds its setpoint with
+    NO offset (the whole point of the grasp-protection window)."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    hold_qpos = [HOLD_A.copy(), HOLD_B.copy()]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(3),
+        sigma=1.0, K=2, floor=0.5, hold_qpos=hold_qpos, pre_hold_steps=4,
+    )
+    # every one of the 4 settle steps holds the move arm exactly at HOLD_A.
+    for s in env.steps[:4]:
+        np.testing.assert_allclose(s["panda-0"][:7], HOLD_A)
+
+
+def test_settle_uses_live_qpos_when_no_hold_qpos():
+    """If hold_qpos is None, the settle phase holds each arm at its LIVE qpos."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[1], rng=np.random.default_rng(1),
+        sigma=0.3, K=1, floor=0.2, hold_qpos=None, pre_hold_steps=3,
+    )
+    for s in env.steps[:3]:
+        np.testing.assert_allclose(s["panda-0"][:7], Q0_A[:7])  # held at live qpos
+        np.testing.assert_allclose(s["panda-1"][:7], Q0_B[:7])  # move arm: no offset yet
+
+
+def test_settle_grip_carried_pd_joint_pos_vel():
+    """Grip carried (and vel block zeroed) through BOTH settle and shove under
+    pd_joint_pos_vel."""
+    env, robots = _make()
+    grips = [0.05, -0.05]
+    hold_qpos = [HOLD_A.copy(), HOLD_B.copy()]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(0),
+        sigma=0.3, K=2, floor=0.2, hold_qpos=hold_qpos, pre_hold_steps=2,
+        control_mode="pd_joint_pos_vel",
+    )
+    assert len(env.steps) == 4
+    for s in env.steps:  # all settle + shove steps
+        assert s["panda-0"].shape == (15,)
+        np.testing.assert_allclose(s["panda-0"][7:14], 0.0)  # vel block zeroed
+        assert s["panda-0"][-1] == grips[0]
+        assert s["panda-1"][-1] == grips[1]
+
+
+def test_settle_sink_orders_holds_then_shoves():
+    """sink captures pre_hold_steps hold dicts FIRST, then K shove dicts, in order,
+    matching what was actually stepped."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    hold_qpos = [HOLD_A.copy(), HOLD_B.copy()]
+    sink = []
+    G, K = 3, 4
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(0),
+        sigma=0.3, K=K, floor=0.2, hold_qpos=hold_qpos, pre_hold_steps=G, sink=sink,
+    )
+    assert len(sink) == G + K
+    # sink mirrors env.steps exactly (order + content)
+    for cap, st in zip(sink, env.steps):
+        np.testing.assert_allclose(cap["panda-0"], st["panda-0"])
+        np.testing.assert_allclose(cap["panda-1"], st["panda-1"])
+    # the first G sink entries are the settle holds (move arm at HOLD_A, no offset)
+    for cap in sink[:G]:
+        np.testing.assert_allclose(cap["panda-0"][:7], HOLD_A)
+    # the last K differ (offset applied)
+    for cap in sink[G:]:
+        assert not np.allclose(cap["panda-0"][:7], HOLD_A)
+
+
+def test_settle_does_not_consume_extra_rng():
+    """The settle phase consumes NO rng: the SHOVE offset is identical whether the
+    settle window is 0 or G (callers' per-transition RNG streams stay unchanged)."""
+    # run A: no settle window
+    envA, robotsA = _make()
+    inject_joint_disturbance(
+        envA, robotsA, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(123),
+        sigma=0.4, K=3, floor=0.2, hold_qpos=[HOLD_A.copy(), HOLD_B.copy()],
+        pre_hold_steps=0,
+    )
+    # run B: settle window of 5; SAME seed
+    envB, robotsB = _make()
+    inject_joint_disturbance(
+        envB, robotsB, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(123),
+        sigma=0.4, K=3, floor=0.2, hold_qpos=[HOLD_A.copy(), HOLD_B.copy()],
+        pre_hold_steps=5,
+    )
+    # the SHOVE target (the move arm in the post-settle steps) must be identical:
+    # run A's first shove step vs run B's first POST-settle shove step.
+    shove_A = envA.steps[0]["panda-0"][:7]
+    shove_B = envB.steps[5]["panda-0"][:7]
+    np.testing.assert_allclose(shove_A, shove_B,
+                               err_msg="settle window must not perturb the rng stream")
+
+
 # ---- misc: action_prefix + torch-tensor / batched qpos tolerance ----------
 
 

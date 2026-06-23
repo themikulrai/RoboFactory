@@ -99,6 +99,13 @@ class DartCfg:
     PERTURBS a held bar rather than FLINGING an un-grasped one; ``shove_after_qi=2``
     (== GRASP_IDX) restricts the shove to arms that have already SEATED their grasp
     (on/past the lift), so we never knock a bar away pre-grasp.
+
+    GRASP-PROTECTION SETTLE WINDOW: ``grasp_settle_steps`` (default 10) UNRECORDED
+    hold-at-setpoint steps run BEFORE the K shove steps (see
+    ``dart_perturb.inject_joint_disturbance(pre_hold_steps=...)``). Combined with the
+    qi gate (nothing before/at grasp) this guarantees the gentle shove lands a full
+    settle window AFTER the grasp has seated and the lift has begun -- never within
+    the grasp window (a shove at/near the grasp breaks it and the episode fails).
     """
     sigma: float = 0.1
     floor: float = 0.05
@@ -107,6 +114,7 @@ class DartCfg:
     p_inject: float = 0.5
     dart_seed: int = 0
     shove_after_qi: int = 2
+    grasp_settle_steps: int = 10
 
 
 def _make_boundary_hook(dart_cfg, env_seed, variant_id):
@@ -201,6 +209,10 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
             dart_cfg.floor,
             hold_qpos=hold_qpos,
             control_mode=planner.control_mode,
+            # grasp-protection settle window: hold (no offset) for grasp_settle_steps
+            # BEFORE the K shove steps so the just-seated grasp + lift start are clear
+            # of the disturbance (a shove at/near the grasp breaks it).
+            pre_hold_steps=int(getattr(dart_cfg, "grasp_settle_steps", 0)),
         )
 
     return hook
@@ -543,7 +555,8 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
 def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         max_steps=600, dart_seed=0,
         per_attempt_timeout=300, override_seeds=None, save_video=False,
-        floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix=""):
+        floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix="",
+        grasp_settle_steps=10):
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
@@ -622,7 +635,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     base_dart_cfg = DartCfg(
         sigma=float(dart_sigma), floor=float(floor),
         k_min=int(k_min), k_max=int(k_max), p_inject=float(p_inject),
-        dart_seed=int(dart_seed),
+        dart_seed=int(dart_seed), grasp_settle_steps=int(grasp_settle_steps),
     )
 
     # --- slice plan ---
@@ -651,6 +664,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                     sigma=0.0, floor=base_dart_cfg.floor,
                     k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
                     p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
+                    grasp_settle_steps=base_dart_cfg.grasp_settle_steps,
                 )
                 plan.append(("clean", False, clean_cfg, budgets[name], False))
     else:
@@ -691,6 +705,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             "k_min": int(k_min),
             "k_max": int(k_max),
             "p_inject": float(p_inject),
+            "grasp_settle_steps": int(grasp_settle_steps),
             "config_suffix": config_suffix,
             "mix": mix,
             "num": int(num),
@@ -813,6 +828,11 @@ if __name__ == "__main__":
                     help="probability of injecting a disturbance at a post-grasp "
                          "transition (the FIRST post-grasp transition of each variant "
                          "always injects; pre-grasp transitions never shove).")
+    ap.add_argument("--grasp-settle", type=int, default=10, dest="grasp_settle_steps",
+                    help="grasp-protection SETTLE window: unrecorded hold-at-setpoint "
+                         "steps run BEFORE the K shove steps so the just-seated grasp + "
+                         "lift start are clear of the disturbance (a shove at/near the "
+                         "grasp breaks it). Default 10; 0 disables the settle window.")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="splice into the yaml stem, e.g. '_aug' maps "
                          "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")
@@ -848,4 +868,5 @@ if __name__ == "__main__":
         k_max=args.k_max,
         p_inject=args.p_inject,
         config_suffix=args.config_suffix,
-        mix=args.mix)
+        mix=args.mix,
+        grasp_settle_steps=args.grasp_settle_steps)

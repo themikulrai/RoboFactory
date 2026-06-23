@@ -71,6 +71,13 @@ def _arm_qpos7(robot):
     return q[:7].copy()
 
 
+def _assemble_action(target, grip, control_mode):
+    """Pack one arm's 7-joint target + grip into an action vector for control_mode."""
+    if control_mode == "pd_joint_pos_vel":
+        return np.hstack([target, target * 0, grip])
+    return np.hstack([target, grip])  # pd_joint_pos (default)
+
+
 def inject_joint_disturbance(
     base_env,
     robots,
@@ -84,48 +91,87 @@ def inject_joint_disturbance(
     control_mode="pd_joint_pos",
     action_prefix="panda",
     sink=None,
+    pre_hold_steps=0,
 ):
-    """Step the UNWRAPPED env ``K`` times with a noisy joint target so selected
-    arms drift off-path. NOT recorded (the unwrapped env bypasses any
-    RecordEpisode wrapper), so the noise never becomes a training label.
+    """Step the UNWRAPPED env with a noisy joint target so selected arms drift
+    off-path. NOT recorded (the unwrapped env bypasses any RecordEpisode wrapper),
+    so the noise never becomes a training label.
 
-    For each arm ``i`` in ``range(len(robots))`` we capture ``q0`` = first 7
-    joints of ``robots[i].get_qpos()`` ONCE. Arms whose index is in
-    ``move_ids`` get a single floored random offset added to ``q0`` (see
-    :func:`sample_floored_offset`); all other arms HOLD ``q0``. That same
-    drifted/held target is then commanded for all ``K`` steps.
+    Two phases (total unrecorded steps = ``pre_hold_steps + K``):
 
-    The gripper channel for arm ``i`` is taken verbatim from ``grips[i]`` --
-    the caller MUST pass the live/frozen grip (e.g. ``frozen_grip``). This
-    function never reads ``planner.gripper_state``.
+      1. SETTLE / pre-hold (``pre_hold_steps`` steps): EVERY arm -- including the
+         move arms -- holds its setpoint with NO offset applied. This is the
+         grasp-protection window: after a just-completed grasp it lets the grasp
+         firmly seat and the lift begin BEFORE any disturbance, so the subsequent
+         shove lands clear of the grasp moment (a shove at/near the grasp would
+         break it and fail the episode for certain). The hold target for arm ``i``
+         is ``hold_qpos[i][:7]`` if supplied, else its live qpos.
+      2. SHOVE (``K`` steps): arms in ``move_ids`` get a single floored random
+         offset added to their captured ``q0`` (see :func:`sample_floored_offset`);
+         all other arms hold their setpoint. That same drifted/held target is
+         commanded for all ``K`` steps.
+
+    The grips are carried verbatim from ``grips[i]`` through BOTH phases -- the
+    caller MUST pass the live/frozen grip (e.g. ``frozen_grip``). This function
+    never reads ``planner.gripper_state``, so the disturbance (and the settle hold)
+    never changes a grasp's open/closed state.
+
+    The random offset is drawn ONCE, AFTER the pre-hold phase is set up but using
+    the same ``q0`` capture; the pre-hold phase consumes NO rng, so callers' per-
+    transition RNG streams are unchanged whether or not a settle window is used.
 
     Args:
         base_env: the UNWRAPPED env; ``base_env.step(action_dict)`` is called.
         robots: list of robot handles, each exposing ``get_qpos()`` (array-like
             or torch tensor; first 7 entries are arm joints).
         grips: list of current gripper commands, one float per arm. Indexed by
-            arm id and emitted verbatim as the gripper channel.
+            arm id and emitted verbatim as the gripper channel in BOTH phases.
         move_ids: int or list[int] of arm indices to perturb. Arms not listed
             hold ``hold_qpos[i]`` (or their live qpos if ``hold_qpos`` is None).
         rng: a ``numpy.random.Generator``.
         hold_qpos: optional list of per-arm hold targets (e.g. the interpreter's
-            ``frozen_qpos`` setpoints). Non-move arms are commanded to
-            ``hold_qpos[i][:7]`` for all K steps so a concurrently moving arm keeps
-            tracking instead of stalling at its lagging live qpos. None -> live qpos.
+            ``frozen_qpos`` setpoints). Used for the pre-hold of ALL arms and the
+            shove-phase hold of non-move arms. None -> live qpos.
         sigma: stddev of the per-joint normal offset.
-        K: number of (identical) unwrapped steps to hold the drifted target.
+        K: number of (identical) unwrapped SHOVE steps to hold the drifted target.
         floor: minimum L2 norm of each perturbing offset.
         control_mode: "pd_joint_pos" -> action = [target(7), grip];
             "pd_joint_pos_vel" -> action = [target(7), zeros(7), grip].
         action_prefix: action-dict key prefix; key is f"{action_prefix}-{i}".
-        sink: optional list; if not None, a DEEP COPY of the action dict is
-            appended once per step (K copies total) for introspection/testing.
+        sink: optional list; if not None, a DEEP COPY of the action dict stepped is
+            appended once per step (``pre_hold_steps + K`` copies total, in order:
+            the pre-hold dicts first, then the shove dicts) for introspection/testing.
+        pre_hold_steps: number of SETTLE steps (all arms hold, no offset) to run
+            BEFORE the K shove steps. Default 0 (no settle window -> exact legacy
+            behavior). The grasp-protection settle guard passes a positive value.
 
     Returns:
-        None. (Side effect: ``K`` calls to ``base_env.step``.)
+        None. (Side effect: ``pre_hold_steps + K`` calls to ``base_env.step``.)
     """
     move_ids = move_ids if isinstance(move_ids, list) else [move_ids]
 
+    def _hold_target(i):
+        """The no-offset setpoint arm i holds (frozen_qpos if given, else live)."""
+        if hold_qpos is not None:
+            return np.asarray(hold_qpos[i], dtype=np.float64).reshape(-1)[:7]
+        return _arm_qpos7(robots[i])  # fallback: live qpos
+
+    # capture each arm's hold target ONCE (same target reused in both phases for
+    # non-move arms; the move arms hold here in the settle phase, then drift).
+    holds = [_hold_target(i) for i in range(len(robots))]
+
+    # --- phase 1: SETTLE -- every arm holds, NO offset (grasp-protection window) ---
+    if pre_hold_steps > 0:
+        hold_dict = {
+            f"{action_prefix}-{i}": _assemble_action(holds[i], grips[i], control_mode)
+            for i in range(len(robots))
+        }
+        for _ in range(int(pre_hold_steps)):
+            if sink is not None:
+                sink.append(copy.deepcopy(hold_dict))
+            base_env.step(hold_dict)  # UNWRAPPED -> unrecorded
+
+    # --- phase 2: SHOVE -- move arms drift, others hold (same target across K) ---
     action_dict = {}
     for i in range(len(robots)):
         if i in move_ids:
@@ -137,16 +183,9 @@ def inject_joint_disturbance(
             # non-move arm is mid-trajectory (PD controller behind its target); pinning
             # it at live qpos for K steps STALLS it (a corruption path that fails the
             # arm's success check). Holding its commanded setpoint keeps it tracking.
-            if hold_qpos is not None:
-                target = np.asarray(hold_qpos[i], dtype=np.float64).reshape(-1)[:7]
-            else:
-                target = _arm_qpos7(robots[i])  # fallback: live qpos
+            target = holds[i]
         grip = grips[i]  # caller-supplied (frozen) grip -- NOT planner state
-        if control_mode == "pd_joint_pos_vel":
-            action = np.hstack([target, target * 0, grip])
-        else:  # pd_joint_pos (default)
-            action = np.hstack([target, grip])
-        action_dict[f"{action_prefix}-{i}"] = action
+        action_dict[f"{action_prefix}-{i}"] = _assemble_action(target, grip, control_mode)
 
     for _ in range(K):  # HOLD the same target for all K steps
         if sink is not None:
