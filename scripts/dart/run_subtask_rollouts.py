@@ -44,6 +44,7 @@ import json
 import os.path as osp
 import signal
 import sys
+from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
@@ -66,6 +67,7 @@ from robofactory.planner.subtask_interpreter import (  # noqa: E402
     SubtaskRecorder,
     run_program,
 )
+from robofactory.planner import dart_perturb  # noqa: E402
 from robofactory.utils.wrappers.record import RecordEpisodeMA  # noqa: E402
 from robofactory import CONFIG_DIR  # noqa: E402
 
@@ -83,30 +85,96 @@ TASK_MAP = {
 
 
 # ----------------------------------------------------------------------------
-# boundary_hook factory (DART / object-perturbation plug point)
+# DART config + REAL deterministic boundary_hook factory (per variant)
 # ----------------------------------------------------------------------------
-def _make_boundary_hook(dart_sigma):
-    """Return the optional boundary_hook, or None.
+@dataclass
+class DartCfg:
+    """DART joint-disturbance knobs for the boundary_hook.
 
-    PLACEHOLDER: the user is separately building the DART arm-noise + object-pose
-    perturbation generator. When they wire it, it slots in HERE: a
-    ``hook(unwrapped_env, state)`` called between primitives, perturbing the
-    UNWRAPPED env (arm joints AND/OR object poses; unrecorded). The next primitive
-    is built JIT AFTER this hook, so its recipe re-plans (and re-resolves moved
-    actors' grasp poses) from the perturbed state — labels stay correct.
-
-    Today, a non-zero ``dart_sigma`` only INSTALLS a no-op hook (so the wiring /
-    call path is exercised) — it does NOT perturb anything. Returning None keeps
-    the interpreter on its fast path (no hook calls).
+    ``sigma <= 0`` disables the hook entirely (clean slice). All other fields are
+    forwarded to ``dart_perturb.inject_joint_disturbance`` or used by the per-variant
+    hook to decide WHEN / WHICH arm to perturb.
     """
-    if not dart_sigma:
+    sigma: float = 0.0
+    floor: float = 0.15
+    k_min: int = 5
+    k_max: int = 15
+    p_inject: float = 0.5
+    dart_seed: int = 0
+
+
+def _make_boundary_hook(dart_cfg, env_seed, variant_id):
+    """Build a REAL, DETERMINISTIC per-variant boundary_hook (or None).
+
+    Returns None if ``dart_cfg`` is falsy or ``dart_cfg.sigma <= 0`` (no hook ->
+    interpreter fast path, no perturbation).
+
+    The returned ``hook(unwrapped_env, state)`` is called by the interpreter BETWEEN
+    primitives (after one completes, BEFORE the next is BUILT). It:
+
+      * derives a FRESH ``np.random.default_rng`` seeded ONLY from
+        ``SeedSequence([env_seed, variant_id, transition_counter, dart_seed])`` so the
+        whole sequence of perturbations is a pure function of those four ints
+        (reproducible) and NEVER touches the env reset RNG;
+      * picks ONE arm to perturb from the arms that are about to ENTER a primitive
+        this transition (``a.current is not None and a.ti == 0 and a.built is None``);
+      * ALWAYS injects on the first transition (counter 0) and otherwise injects with
+        probability ``p_inject``;
+      * passes each arm's FROZEN grip (``state["arms"][i].frozen_grip``) so the carry-
+        grip contract holds (the disturbance never changes a grasp's open/closed
+        state), and forwards ``planner.control_mode`` so the action vector matches.
+
+    The disturbance steps the UNWRAPPED env K times (K ~ U[k_min, k_max]); those
+    steps are unrecorded, then the next primitive re-plans JIT from the drifted state.
+    """
+    if not dart_cfg or dart_cfg.sigma <= 0:
         return None
 
-    def _noop_hook(unwrapped_env, state):
-        # Intentionally does nothing: real DART perturbation plugs in here.
-        return None
+    counter = {"tc": 0}  # transition counter (closure state)
 
-    return _noop_hook
+    def hook(unwrapped_env, state):
+        tc = counter["tc"]
+        rng = np.random.default_rng(
+            np.random.SeedSequence(
+                [int(env_seed), int(variant_id), int(tc), int(dart_cfg.dart_seed)]
+            )
+        )
+        counter["tc"] += 1
+
+        planner = state["planner"]
+        arms = state["arms"]
+        # arms ABOUT TO ENTER a primitive this transition (the JIT entries the hook
+        # precedes). Same predicate the interpreter uses to detect a transition.
+        moving = [
+            i for i, a in arms.items()
+            if a.current is not None and a.ti == 0 and a.built is None
+        ]
+        if not moving:
+            return
+
+        target_arm = int(rng.choice(np.array(sorted(moving))))
+        # ALWAYS inject on the FIRST transition; otherwise with prob p_inject. The
+        # arm choice consumed RNG first (so the decision draw is deterministic given
+        # the seed), matching the documented order.
+        inject = (tc == 0) or (rng.random() < dart_cfg.p_inject)
+        if not inject:
+            return
+
+        K = int(rng.integers(dart_cfg.k_min, dart_cfg.k_max + 1))
+        grips = [float(arms[i].frozen_grip) for i in range(len(arms))]
+        dart_perturb.inject_joint_disturbance(
+            unwrapped_env,
+            planner.robot,
+            grips,
+            [target_arm],
+            rng,
+            dart_cfg.sigma,
+            K,
+            dart_cfg.floor,
+            control_mode=planner.control_mode,
+        )
+
+    return hook
 
 
 # ----------------------------------------------------------------------------
@@ -133,14 +201,20 @@ def _build_planner(env, seed):
     return planner
 
 
-def _run_one_variant(env, spec, max_steps, boundary_hook):
+def _run_one_variant(env, spec, max_steps, dart_cfg):
     """Reset to the spec's seed, build the program, run it, return the result.
+
+    The DART boundary_hook is built PER VARIANT here from ``dart_cfg`` keyed on
+    ``(spec.seed, spec.variant_id)`` so each variant's perturbation stream is a
+    deterministic function of its identity (and never touches the env reset RNG).
+    When ``dart_cfg`` is None / sigma<=0 the hook is None (clean slice).
 
     Returns (recorder, run_out) on a clean run, or (None, None) if planning or the
     rollout raised (treated as a failed variant -> its whole group is dropped).
     """
     planner = _build_planner(env, spec.seed)
     rec = SubtaskRecorder(num_arms=spec.num_arms)
+    boundary_hook = _make_boundary_hook(dart_cfg, spec.seed, spec.variant_id)
     try:
         programs = spec.build(planner, env)
     except Exception as e:  # a plan failure (e.g. -1) drops this variant
@@ -218,14 +292,200 @@ def _group_all_passed(results):
     return True
 
 
+def _delete_episodes(episode_ids, traj_h5, stream_h5, json_data=None,
+                     json_path=None, meta_list=None):
+    """Delete already-written artifacts for ``episode_ids`` (a single-pass-delete
+    rollback for an atomically-dropped contrast group).
+
+    For each id we remove ``traj_{id}`` from BOTH the trajectory H5 (``traj_h5``)
+    and the sibling subtask-stream H5 (``stream_h5``), drop the matching row from the
+    RecordEpisode JSON sidecar (``json_data["episodes"]`` + re-dump to ``json_path``)
+    so the dataset's episode index never references a deleted trajectory, and drop the
+    matching rows from the in-memory subtask meta list (``meta_list``).
+
+    NOTE: ``del`` only unlinks the H5 group; HDF5 does NOT reclaim the freed bytes
+    (the file size is unchanged, the data is orphaned). This is intentional and safe:
+    the loaders key off the JSON / present traj_ keys, so an orphaned blob is inert.
+
+    Returns the number of trajectory groups actually unlinked.
+    """
+    ids = {int(e) for e in episode_ids}
+    deleted = 0
+    for eid in ids:
+        key = f"traj_{eid}"
+        for h5 in (traj_h5, stream_h5):
+            if h5 is not None and key in h5:
+                del h5[key]
+                if h5 is traj_h5:
+                    deleted += 1
+    if json_data is not None and "episodes" in json_data:
+        json_data["episodes"] = [
+            ep for ep in json_data["episodes"]
+            if int(ep.get("episode_id", -1)) not in ids
+        ]
+        if json_path is not None:
+            try:
+                from mani_skill.utils.io_utils import dump_json
+                dump_json(json_path, json_data, indent=2)
+            except Exception:
+                pass
+    if meta_list is not None:
+        meta_list[:] = [
+            row for row in meta_list if int(row.get("episode_id", -1)) not in ids
+        ]
+    return deleted
+
+
+def _splice_suffix(yaml_rel, config_suffix):
+    """Splice ``config_suffix`` before the .yaml extension.
+
+    e.g. ``table/lift_barrier.yaml`` + ``_aug`` -> ``table/lift_barrier_aug.yaml``.
+    Empty suffix -> unchanged.
+    """
+    if not config_suffix:
+        return yaml_rel
+    root, ext = osp.splitext(yaml_rel)
+    return f"{root}{config_suffix}{ext}"
+
+
+def _parse_mix(mix_str):
+    """Parse a ``--mix`` spec like ``recovery=0.3,merged=0.4,clean=0.3`` into an
+    ordered list of (slice_name, fraction). Empty / falsy -> []. Fractions are used
+    to split the ``--num`` episode budget across slices. Unknown slice names raise.
+    """
+    if not mix_str:
+        return []
+    valid = {"recovery", "merged", "clean"}
+    out = []
+    for part in mix_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            sys.exit(f"[ERROR] bad --mix entry {part!r} (want name=frac)")
+        name, frac = part.split("=", 1)
+        name = name.strip()
+        if name not in valid:
+            sys.exit(f"[ERROR] unknown --mix slice {name!r} (valid: {sorted(valid)})")
+        out.append((name, float(frac)))
+    return out
+
+
+def _split_budget(num, mix):
+    """Split ``num`` episodes across mix slices by fraction (largest-remainder so
+    they sum to exactly ``num``). Returns {slice_name: int_budget}."""
+    total = sum(f for _, f in mix) or 1.0
+    raw = {name: num * frac / total for name, frac in mix}
+    floors = {name: int(v) for name, v in raw.items()}
+    rem = num - sum(floors.values())
+    # hand out the remainder to the largest fractional parts
+    order = sorted(raw, key=lambda n: raw[n] - floors[n], reverse=True)
+    for i in range(rem):
+        floors[order[i % len(order)]] += 1
+    return floors
+
+
+def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
+                   stream_h5, episodes_meta, slice_tag, seed, gid,
+                   kept_so_far):
+    """Run ONE contrast group SINGLE-PASS-WITH-DELETE.
+
+    For each member: run ONCE; on pass flush the trajectory (writes
+    ``traj_{env._episode_id}``) and remember it; on fail (or SIGALRM timeout) discard
+    the in-progress buffer and mark the group failed. After the loop, if ANY member
+    failed, DELETE every already-written artifact for this group (trajectory H5 group,
+    subtask-stream H5 group, JSON-sidecar row, in-memory meta row) so the dataset never
+    references a half-written group. On full success, write each member's aligned
+    subtask stream and append its meta row (tagged with ``slice_tag``).
+
+    Returns (kept_count, group_ok). ``kept_count`` is the number of episodes added to
+    ``episodes_meta`` (0 if the group dropped).
+    """
+    written = []   # [(episode_id, recorder, T, spec)] flushed so far this group
+    group_ok = True
+    for spec in members:
+        # run the WHOLE group member-by-member; the atomic keep/drop decision (and the
+        # rollback of anything already flushed) happens AFTER the loop.
+        signal.alarm(int(per_attempt_timeout))
+        try:
+            rec, out = _run_one_variant(env, spec, max_steps, dart_cfg)
+        except _SolverTimeout:
+            print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
+                  f"TIMEOUT after {per_attempt_timeout}s", flush=True)
+            rec, out = None, None
+        finally:
+            signal.alarm(0)
+
+        if rec is None or not _member_passes(out):
+            group_ok = False
+            try:
+                env.flush_trajectory(save=False)  # discard this member's buffer
+            except Exception:
+                pass
+            break
+
+        T = out["steps"]
+        env.flush_trajectory()  # writes traj_{env._episode_id}
+        episode_id = int(getattr(env, "_episode_id", kept_so_far))
+        written.append((episode_id, rec, T, spec))
+        try:
+            env._h5_file.flush()
+        except AttributeError:
+            pass
+
+    if not group_ok:
+        # roll back EVERYTHING this group already wrote (atomic matched-pair drop).
+        if written:
+            _delete_episodes(
+                [w[0] for w in written],
+                getattr(env, "_h5_file", None),
+                stream_h5,
+                json_data=getattr(env, "_json_data", None),
+                json_path=getattr(env, "_json_path", None),
+                meta_list=episodes_meta,
+            )
+            try:
+                env._h5_file.flush()
+            except AttributeError:
+                pass
+        print(f"  [{slice_tag}] seed {seed} group {gid} "
+              f"[{members[0].family}]: DROPPED "
+              f"({[m.name for m in members]})", flush=True)
+        return 0, False
+
+    # group fully passed: write the aligned subtask streams + meta rows.
+    for episode_id, rec, T, spec in written:
+        rec.flush(episode_id=episode_id, h5_group=stream_h5, expected_T=T)
+        stream_h5.flush()
+        episodes_meta.append({
+            "episode_id": episode_id,
+            "env_seed": int(seed),
+            "variant": spec.name,
+            "family": spec.family,
+            "contrast_group_id": int(spec.contrast_group_id),
+            "T": int(T),
+            "slice": slice_tag,
+        })
+    print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
+          f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",
+          flush=True)
+    return len(written), True
+
+
 def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         max_steps=600, dart_seed=0,
-        per_attempt_timeout=300, override_seeds=None, save_video=False):
+        per_attempt_timeout=300, override_seeds=None, save_video=False,
+        floor=0.15, k_min=5, k_max=15, p_inject=0.5, config_suffix="", mix=""):
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
     env_id, yaml_rel, n_agents, sampler = TASK_MAP[task_name]
+    yaml_rel = _splice_suffix(yaml_rel, config_suffix)
     config_path = osp.join(CONFIG_DIR, yaml_rel)
+    if not osp.exists(config_path):
+        sys.exit(f"[ERROR] config {config_path} does not exist "
+                 f"(config_suffix={config_suffix!r}).")
+    mix_slices = _parse_mix(mix)
 
     # --- output paths (mirror hf_download layout) ---
     output_dir = osp.join(record_dir, task_name)
@@ -271,13 +531,47 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         record_observation=True,
     )
 
-    boundary_hook = _make_boundary_hook(dart_sigma)
+    # --- DART config (a single object reused by every active slice) ---
+    base_dart_cfg = DartCfg(
+        sigma=float(dart_sigma), floor=float(floor),
+        k_min=int(k_min), k_max=int(k_max), p_inject=float(p_inject),
+        dart_seed=int(dart_seed),
+    )
+
+    # --- slice plan ---
+    # No --mix: a SINGLE slice governed by --dart-sigma (today's behavior), tagged
+    # "default". With --mix: three sub-runs into ONE combined dataset dir:
+    #   recovery -> baseline-only specs, hook ON  (DART recovery data)
+    #   merged   -> full contrast groups, hook ON (DART on the contrast)
+    #   clean    -> full contrast groups, hook OFF (object-noise only; sigma forced 0)
+    # Each slice gets a portion of the --num episode budget.
+    if mix_slices:
+        budgets = _split_budget(num, mix_slices)
+        plan = []  # (slice_tag, baseline_only, dart_cfg, budget)
+        for name, _frac in mix_slices:
+            if name == "recovery":
+                plan.append(("recovery", True, base_dart_cfg, budgets[name]))
+            elif name == "merged":
+                plan.append(("merged", False, base_dart_cfg, budgets[name]))
+            elif name == "clean":
+                # object noise (aug config) stays ON; arm-disturbance hook OFF.
+                clean_cfg = DartCfg(
+                    sigma=0.0, floor=base_dart_cfg.floor,
+                    k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
+                    p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
+                )
+                plan.append(("clean", False, clean_cfg, budgets[name]))
+    else:
+        plan = [("default", False, base_dart_cfg, num)]
 
     print(f"[subtask] task={task_name}  env_id={env_id}  n_agents={n_agents}")
+    print(f"[subtask] config={config_path} (suffix={config_suffix!r})")
     print(f"[subtask] output_h5={out_h5}")
     print(f"[subtask] subtask_stream_h5={stream_h5_path}")
     print(f"[subtask] variants_filter={variants}  dart_sigma={dart_sigma} "
-          f"(hook={'on' if boundary_hook else 'off'})  max_steps={max_steps}")
+          f"floor={floor} k=[{k_min},{k_max}] p_inject={p_inject}  max_steps={max_steps}")
+    print(f"[subtask] slice plan: "
+          f"{[(t, 'baseline-only' if bo else 'full', 'hookON' if c.sigma > 0 else 'hookOFF', b) for t, bo, c, b in plan]}")
 
     seeds = override_seeds if override_seeds is not None else _load_seeds(task_name, num)
     print(f"[subtask] per_attempt_timeout={per_attempt_timeout}s (SIGALRM per variant)",
@@ -288,9 +582,10 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     stream_h5 = h5py.File(stream_h5_path, "w")
 
     episodes_meta = []
-    kept = 0           # episodes (variants) written
+    kept = 0           # episodes (variants) written across ALL slices
     kept_groups = 0    # contrast groups fully kept
     total_groups = 0
+    slice_kept = {}    # per-slice kept counts
     pbar = tqdm(total=num, desc=task_name)
     meta_path = osp.join(output_dir, "subtask_meta.json")
 
@@ -300,116 +595,52 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             "variants_filter": variants,
             "dart_sigma": float(dart_sigma),
             "dart_seed": int(dart_seed),
+            "floor": float(floor),
+            "k_min": int(k_min),
+            "k_max": int(k_max),
+            "p_inject": float(p_inject),
+            "config_suffix": config_suffix,
+            "mix": mix,
             "num": int(num),
             "kept_episodes": int(kept),
             "kept_groups": int(kept_groups),
             "total_groups_attempted": int(total_groups),
+            "slice_kept": dict(slice_kept),
             "episodes": episodes_meta,
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
     try:
-        for seed in seeds:
-            if kept >= num:
-                break
-            specs = sampler(int(seed))
-            specs = scenarios.filter_variants(specs, variants)
-            groups = scenarios.group_specs(specs)
-            for gid, members in sorted(groups.items()):
-                if kept >= num:
+        for slice_tag, baseline_only, dart_cfg, slice_budget in plan:
+            this_slice_kept = 0
+            print(f"[subtask] === slice {slice_tag!r}: budget={slice_budget} "
+                  f"(baseline_only={baseline_only}, "
+                  f"hook={'on' if dart_cfg.sigma > 0 else 'off'}) ===", flush=True)
+            for seed in seeds:
+                if this_slice_kept >= slice_budget:
                     break
-                total_groups += 1
-
-                # --- PROBE: run every member to decide the group atomically ---
-                # The wrapper holds ONE trajectory buffer, so we cannot keep two
-                # members pending. We first PROBE all members (clearing the buffer
-                # after each), make the atomic keep/drop decision, then RE-RUN the
-                # kept members to flush clean trajectories. Re-runs are
-                # deterministic: same reset seed + seed-derived sampler RNG.
-                results = []  # [(recorder, run_out), ...] aligned with members
-                timed_out = False
-                for spec in members:
-                    signal.alarm(int(per_attempt_timeout))
-                    try:
-                        rec, out = _run_one_variant(env, spec, max_steps, boundary_hook)
-                    except _SolverTimeout:
-                        print(f"  seed {seed} group {gid} variant {spec.name}: "
-                              f"TIMEOUT after {per_attempt_timeout}s", flush=True)
-                        timed_out = True
-                        rec, out = None, None
-                    finally:
-                        signal.alarm(0)
-                    results.append((rec, out))
-                    # MUST clear the in-progress wrapper buffer after EVERY variant:
-                    # only members that pass the group check are flushed below.
-                    try:
-                        env.flush_trajectory(save=False)
-                    except Exception:
-                        pass
-
-                # --- atomic matched-pair decision ---
-                if timed_out or not _group_all_passed(results):
-                    print(f"  seed {seed} group {gid} "
-                          f"[{members[0].family}]: DROPPED "
-                          f"({[m.name for m in members]})", flush=True)
-                    continue
-
-                # --- group passed: RE-RUN each member to flush a CLEAN trajectory ---
-                # (the buffer was cleared after each probe run so we can't keep the
-                # buffered episode; re-running from the same seed reproduces it
-                # deterministically because the sampler RNG is seed-derived.)
-                group_ok = True
-                pending = []  # [(episode_id, recorder, T)]
-                for spec in members:
-                    rec, out = _run_one_variant(env, spec, max_steps, boundary_hook)
-                    # Re-run must reproduce the SAME keep criterion as the probe:
-                    # all_success AND (env-success OR completed). The LiftBarrier env
-                    # auto-terminates on the barrier lift BEFORE the queues empty, so
-                    # ``completed`` alone would wrongly drop a real success; env_success
-                    # confirms the lift. (Every variant lifts; completed is the
-                    # fallback when gating delays the lift past queue-drain.)
-                    # A failed lift (no env-success, completed, lift check ran False)
-                    # has all_success False -> dropped. See _member_passes.
-                    if rec is None or not _member_passes(out):
-                        group_ok = False
-                        try:
-                            env.flush_trajectory(save=False)
-                        except Exception:
-                            pass
+                specs = sampler(int(seed))
+                specs = scenarios.filter_variants(specs, variants)
+                if baseline_only:
+                    # recovery slice: keep ONLY the single baseline member so each
+                    # group is a 1-member group (no contrast variants).
+                    specs = [s for s in specs if s.family == "baseline"]
+                groups = scenarios.group_specs(specs)
+                for gid, members in sorted(groups.items()):
+                    if this_slice_kept >= slice_budget:
                         break
-                    T = out["steps"]
-                    env.flush_trajectory()  # writes traj_{env._episode_id}
-                    episode_id = int(getattr(env, "_episode_id", kept))
-                    pending.append((episode_id, rec, T, spec))
-                    try:
-                        env._h5_file.flush()
-                    except AttributeError:
-                        pass
-
-                if not group_ok:
-                    print(f"  seed {seed} group {gid}: re-run diverged -> DROPPED",
-                          flush=True)
-                    continue
-
-                # --- both flushed: now write the aligned subtask streams ---
-                for episode_id, rec, T, spec in pending:
-                    rec.flush(episode_id=episode_id, h5_group=stream_h5, expected_T=T)
-                    stream_h5.flush()
-                    episodes_meta.append({
-                        "episode_id": episode_id,
-                        "env_seed": int(seed),
-                        "variant": spec.name,
-                        "family": spec.family,
-                        "contrast_group_id": int(spec.contrast_group_id),
-                        "T": int(T),
-                    })
-                    kept += 1
-                    pbar.update(1)
-                kept_groups += 1
-                print(f"  seed {seed} group {gid} [{members[0].family}]: KEPT "
-                      f"{[m.name for m in members]} "
-                      f"-> traj_{[p[0] for p in pending]}", flush=True)
+                    total_groups += 1
+                    added, ok = _process_group(
+                        env, members, max_steps, per_attempt_timeout, dart_cfg,
+                        stream_h5, episodes_meta, slice_tag, seed, gid, kept,
+                    )
+                    if ok:
+                        kept += added
+                        this_slice_kept += added
+                        kept_groups += 1
+                        pbar.update(added)
+            slice_kept[slice_tag] = this_slice_kept
     finally:
         try:
             stream_h5.close()
@@ -425,7 +656,8 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     env.close()
 
     print()
-    print(f"[subtask] kept {kept} episodes in {kept_groups}/{total_groups} groups")
+    print(f"[subtask] kept {kept} episodes in {kept_groups}/{total_groups} groups "
+          f"(per-slice: {slice_kept})")
     print(f"[subtask] h5: {out_h5}")
     print(f"[subtask] subtask_stream: {stream_h5_path}")
     print(f"[subtask] meta: {meta_path}")
@@ -467,9 +699,27 @@ if __name__ == "__main__":
                     help="explicit comma-separated env seed list; bypasses --num "
                          "seed selection (still stops once --num episodes kept)")
     ap.add_argument("--dart-sigma", type=float, default=0.0, dest="dart_sigma",
-                    help="PLACEHOLDER for the user's DART perturbation strength; a "
-                         "non-zero value installs a NO-OP boundary_hook (wiring "
-                         "only). Real perturbation plugs into _make_boundary_hook.")
+                    help="DART per-joint disturbance stddev. >0 installs the REAL "
+                         "deterministic per-variant boundary_hook (arm-joint noise on "
+                         "the unwrapped env between primitives). 0 = no hook.")
+    ap.add_argument("--inject-floor", type=float, default=0.15, dest="inject_floor",
+                    help="minimum L2 norm of each DART joint offset (so a draw is "
+                         "never trivially small). Default 0.15.")
+    ap.add_argument("--k-min", type=int, default=5, dest="k_min",
+                    help="min number of unwrapped steps the disturbance is held.")
+    ap.add_argument("--k-max", type=int, default=15, dest="k_max",
+                    help="max number of unwrapped steps the disturbance is held.")
+    ap.add_argument("--p-inject", type=float, default=0.5, dest="p_inject",
+                    help="probability of injecting a disturbance at a transition "
+                         "(the FIRST transition of each variant always injects).")
+    ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
+                    help="splice into the yaml stem, e.g. '_aug' maps "
+                         "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")
+    ap.add_argument("--mix", type=str, default="", dest="mix",
+                    help="combined dataset mix, e.g. "
+                         "'recovery=0.3,merged=0.4,clean=0.3'. Splits --num across "
+                         "three slices into ONE dataset dir (each meta row tagged with "
+                         "its slice). Empty = single slice governed by --dart-sigma.")
     ap.add_argument("--max-steps", type=int, default=600, dest="max_steps",
                     help="hard cap on env.steps per variant rollout")
     ap.add_argument("--per-attempt-timeout", type=int, default=300,
@@ -491,4 +741,10 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         per_attempt_timeout=args.per_attempt_timeout,
         override_seeds=override_seeds,
-        save_video=args.save_video)
+        save_video=args.save_video,
+        floor=args.inject_floor,
+        k_min=args.k_min,
+        k_max=args.k_max,
+        p_inject=args.p_inject,
+        config_suffix=args.config_suffix,
+        mix=args.mix)
