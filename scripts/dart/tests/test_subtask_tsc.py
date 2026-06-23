@@ -8,7 +8,9 @@ parked HIGH; each placer RETREATS UP before the next descends.
 
 PURE tests (no sim, always run): the sampler emits the two matched contrast pairs
 (``pickcoord`` simultaneous_pick/staggered_pick; ``raisedirect``
-raise_and_wait/direct_place); names/families; deadlock-acyclic; every arm ends with
+simultaneous_pick/direct_place — simultaneous_pick is the SHARED baseline re-emitted
+once per group, so there is NO ``raise_and_wait``); names/families; deadlock-acyclic;
+every arm ends with
 a retreat_up after place+open; the SERIAL-place gates chain on the PREVIOUS rank's
 RETREAT-done (rank1 waits rank0 retreated, rank2 waits rank1 retreated) — NOT merely
 on place-done; staggered_pick followers WAIT at frame 0; direct_place arm0 has NO
@@ -145,8 +147,10 @@ def _fakes():
     return FakePlanner(num_arms=3), FakeEnv(num_arms=3)
 
 
-# Canonical names for convenience.
-_NAMES = {"simultaneous_pick", "staggered_pick", "raise_and_wait", "direct_place"}
+# Canonical DISTINCT behaviours (3): simultaneous_pick is the SHARED baseline,
+# re-emitted once per contrast group (cf. the LB sampler), so it is one behaviour
+# even though it appears in both groups. No `raise_and_wait` (was a duplicate).
+_NAMES = {"simultaneous_pick", "staggered_pick", "direct_place"}
 
 
 # ===========================================================================
@@ -259,10 +263,30 @@ def test_sampler_emits_two_matched_pairs():
         assert len(members) == 2, (gid, [m.name for m in members])
         assert members[0].family == members[1].family
         assert members[0].contrast_group_id == members[1].contrast_group_id == gid
+        # the SHARED baseline (simultaneous_pick) is present in EVERY group.
+        assert "simultaneous_pick" in {m.name for m in members}, (gid, members)
         for m in members:
             assert m.num_arms == 3
     assert {m.family for m in specs} == {"pickcoord", "raisedirect"}
+    # 3 distinct behaviours; no `raise_and_wait` (it was a byte-identical duplicate).
     assert {m.name for m in specs} == _NAMES
+    assert "raise_and_wait" not in {m.name for m in specs}
+    # both contrast groups' baselines are the SAME behaviour: simultaneous_pick
+    # with grasp_lead_arm=None (every arm raises), so their built programs match.
+    base_names = [
+        members[0].name if members[0].name == "simultaneous_pick" else members[1].name
+        for members in groups.values()]
+    assert base_names == ["simultaneous_pick", "simultaneous_pick"], base_names
+    # verify the two baselines build IDENTICAL per-arm verb sequences (same behaviour).
+    sim_specs = [m for m in specs if m.name == "simultaneous_pick"]
+    assert len(sim_specs) == 2
+    progs = []
+    for sp in sim_specs:
+        pl, env = _fakes()
+        p = sp.build(pl, env)
+        progs.append({arm: [qr.recipe(pl, env, arm).verb_id for qr in p[arm]]
+                      for arm in (0, 1, 2)})
+    assert progs[0] == progs[1], progs
 
 
 def test_sampler_variant_ids_unique_and_reproducible():
@@ -431,16 +455,23 @@ def test_simultaneous_pick_followers_approach_at_frame0():
 
 
 # ===========================================================================
-# PURE: raisedirect — direct_place arm0 has NO lift; raise_and_wait does
+# PURE: raisedirect — direct_place arm0 has NO lift; the raisedirect BASELINE
+# (simultaneous_pick, re-emitted as the shared baseline) raises arm0.
 # ===========================================================================
-def test_raise_and_wait_arm0_has_lift():
-    spec = next(m for m in STSC.sample(7) if m.name == "raise_and_wait")
+def test_raisedirect_baseline_arm0_has_lift():
+    # the raisedirect baseline is the shared simultaneous_pick behaviour (arm0
+    # lifts(0.5) then places — "raise then place"). Select the raisedirect-group
+    # instance by family so we exercise the actual raisedirect baseline.
+    spec = next(m for m in STSC.sample(7)
+                if m.family == "raisedirect" and m.name == "simultaneous_pick")
     pl, env = _fakes()
     prog = spec.build(pl, env)
     verbs = [qr.recipe(pl, env, 0).verb_id for qr in prog[0]]
     assert vocab.LIFT in verbs[:3]  # the lift sits at index 2 (before place)
     assert verbs[2] == vocab.LIFT
     assert len(prog[0]) == 6
+    # the meta records the raise-then-place baseline behaviour for arm0.
+    assert spec.meta["arm0"] == "raise_then_place"
 
 
 def test_direct_place_arm0_has_no_lift():
@@ -467,7 +498,8 @@ def test_filter_variants_keeps_groups_intact():
     out = STSC.filter_variants(specs, ["staggered_pick"])
     assert sorted(m.name for m in out) == ["simultaneous_pick", "staggered_pick"]
     out2 = STSC.filter_variants(specs, ["direct_place"])
-    assert sorted(m.name for m in out2) == ["direct_place", "raise_and_wait"]
+    # raisedirect group is now {simultaneous_pick (shared baseline), direct_place}.
+    assert sorted(m.name for m in out2) == ["direct_place", "simultaneous_pick"]
     # filter by family keeps the whole pair
     out3 = STSC.filter_variants(specs, ["pickcoord"])
     assert sorted(m.name for m in out3) == ["simultaneous_pick", "staggered_pick"]

@@ -57,12 +57,15 @@ CONTRAST FAMILIES (matched pairs, SAME seed; placing serial in BOTH members):
      GRASPED (qi >= GRASP_IDX) -> they WAIT at home at frame 0). Both then place
      serially A->B->C with retreats. Frame-0 counterfactual: arm1/arm2 WAIT vs
      APPROACH.
-  2. ``raisedirect``: for the FIRST placer (arm0, rank0): raise_and_wait (arm0 does
-     lift(0.5) then place — it raises HIGH first) VS direct_place (arm0 SKIPS the
-     lift(0.5) and places directly from the grasp, since the region is clear and it
-     is FIRST). The others ALWAYS raise. Counterfactual: arm0 after grasp -> LIFT
+  2. ``raisedirect``: for the FIRST placer (arm0, rank0): simultaneous_pick (arm0
+     does lift(0.5) then place — it raises HIGH first; the SHARED baseline, the
+     SAME behaviour/builder as the pickcoord baseline) VS direct_place (arm0 SKIPS
+     the lift(0.5) and places directly from the grasp, since the region is clear and
+     it is FIRST). The others ALWAYS raise. Counterfactual: arm0 after grasp -> LIFT
      (raise/wait-at-top) vs PLACE (descend directly). Both stay collision-free (arm0
-     places first into the empty region; the others wait HIGH).
+     places first into the empty region; the others wait HIGH). The baseline is
+     RE-EMITTED here (once per group) exactly as the LB sampler re-emits
+     ``simultaneous`` — no misleading ``raise_and_wait`` duplicate.
 
 GATE MECHANISM / GUARDS (inherited from the LB module):
 gates are DETERMINISTIC predicates on another arm's ``_ArmState.qi``, never a
@@ -500,7 +503,10 @@ def sample(seed: int) -> List[ProgramSpec]:
 
     Returns a flat list of ProgramSpec, two matched contrastive PAIRS:
       * ``pickcoord``  : simultaneous_pick  vs  staggered_pick
-      * ``raisedirect``: raise_and_wait     vs  direct_place
+      * ``raisedirect``: simultaneous_pick  vs  direct_place
+    The ``simultaneous_pick`` baseline appears once PER GROUP as the shared baseline
+    behaviour (same builder), so both contrast groups branch off identical baseline
+    behaviour — mirroring the LB sampler. There is no ``raise_and_wait``.
     Both members of each pair place STRICTLY SERIALLY (A->B->C) with retreats and so
     are collision-free; they differ only at the contrast axis (frame-0 pick timing
     for pickcoord; arm0's raise-vs-descend for raisedirect).
@@ -533,12 +539,16 @@ def sample(seed: int) -> List[ProgramSpec]:
           "complete": True, "assignment": "base"})
     gid += 1
 
-    # (1) raisedirect: raise_and_wait  vs  direct_place (FIRST placer arm0 only)
-    #   raise_and_wait: arm0 lifts(0.5) then places (raises high first).
+    # (1) raisedirect: simultaneous_pick (baseline)  vs  direct_place (arm0 only)
+    #   simultaneous_pick: arm0 lifts(0.5) then places (raises high first) — the
+    #                   SHARED baseline behaviour, byte-identical to the pickcoord
+    #                   baseline (same builder), RE-EMITTED here as the raisedirect
+    #                   baseline (cf. the LB sampler re-emitting `simultaneous` per
+    #                   group). No misleading `raise_and_wait` duplicate name.
     #   direct_place:   arm0 SKIPS the lift, places directly from the grasp (region
     #                   clear, it is first). The others ALWAYS raise.
     #   Both use a SIMULTANEOUS pick so the ONLY contrast is arm0's raise-vs-descend.
-    emit("raise_and_wait", "raisedirect", gid,
+    emit("simultaneous_pick", "raisedirect", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
          {"first_placer": 0, "arm0": "raise_then_place", "complete": True,
           "assignment": "base"})
@@ -563,11 +573,12 @@ if __name__ == "__main__":
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
         assert len(members) == 2, (gid_, names)
+        assert "simultaneous_pick" in names, (gid_, names)  # shared baseline per group
         print(f"  group {gid_} [{members[0].family}]: {names}")
     assert len(s) == 4 and len(by_group) == 2, (len(s), len(by_group))
     assert {m.family for m in s} == {"pickcoord", "raisedirect"}
     assert {m.name for m in s} == {
-        "simultaneous_pick", "staggered_pick", "raise_and_wait", "direct_place"}
+        "simultaneous_pick", "staggered_pick", "direct_place"}
     assert len({m.variant_id for m in s}) == len(s)
     assert [m.name for m in sample(7)] == [m.name for m in s]
     print("subtask_scenarios_tsc inline OK")
