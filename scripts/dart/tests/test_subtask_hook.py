@@ -102,7 +102,8 @@ def _install_recorder(monkeypatch):
 
     def _fake_inject(base_env, robots, grips, move_ids, rng, sigma, K, floor,
                      hold_qpos=None, control_mode="pd_joint_pos",
-                     action_prefix="panda", sink=None, pre_hold_steps=0):
+                     action_prefix="panda", sink=None, pre_hold_steps=0,
+                     shove_joints=None):
         # snapshot the RNG state-consuming draw so two identical streams are
         # provably identical (capture a deterministic sample from the SAME rng).
         probe = float(rng.random())
@@ -115,6 +116,7 @@ def _install_recorder(monkeypatch):
             "control_mode": control_mode,
             "hold_qpos": None if hold_qpos is None else [np.asarray(h).tolist() for h in hold_qpos],
             "pre_hold_steps": int(pre_hold_steps),
+            "shove_joints": shove_joints,
             "rng_probe": probe,
         })
 
@@ -337,6 +339,23 @@ def test_hook_forwards_grasp_settle_steps(monkeypatch):
     assert calls0[0]["pre_hold_steps"] == 0
 
 
+def test_hook_forwards_shove_joints(monkeypatch):
+    """The hook must pass DartCfg.shove_joints through to inject (proximal default,
+    and any custom set)."""
+    calls = _install_recorder(monkeypatch)
+    cfg = R.DartCfg(sigma=0.4, p_inject=1.0, dart_seed=0)  # default shove_joints
+    hook = R._make_boundary_hook(cfg, env_seed=5, variant_id=0)
+    hook(object(), _entering_state(moving_arms=[0, 1]))
+    assert len(calls) == 1
+    assert calls[0]["shove_joints"] == (0, 1, 2, 3)  # proximal default forwarded
+    # a custom shove set is forwarded verbatim
+    calls2 = _install_recorder(monkeypatch)
+    hook2 = R._make_boundary_hook(
+        R.DartCfg(sigma=0.4, p_inject=1.0, shove_joints=(1, 5)), 5, 0)
+    hook2(object(), _entering_state(moving_arms=[0, 1]))
+    assert calls2[0]["shove_joints"] == (1, 5)
+
+
 def test_hook_control_mode_follows_planner(monkeypatch):
     calls = _install_recorder(monkeypatch)
     cfg = R.DartCfg(sigma=0.4, p_inject=1.0, dart_seed=0)
@@ -538,9 +557,11 @@ def test_hook_uses_transitioning_set_not_looser_moving(monkeypatch):
 
     def _fake_inject(base_env, robots, grips, move_ids, rng, sigma, K, floor,
                      hold_qpos=None, control_mode="pd_joint_pos",
-                     action_prefix="panda", sink=None, pre_hold_steps=0):
+                     action_prefix="panda", sink=None, pre_hold_steps=0,
+                     shove_joints=None):
         calls.append({"move_ids": list(move_ids), "hold_qpos": hold_qpos,
-                      "pre_hold_steps": int(pre_hold_steps)})
+                      "pre_hold_steps": int(pre_hold_steps),
+                      "shove_joints": shove_joints})
 
     monkeypatch.setattr(dart_perturb, "inject_joint_disturbance", _fake_inject)
     cfg = R.DartCfg(sigma=0.4, floor=0.15, k_min=5, k_max=15, p_inject=1.0, dart_seed=0)

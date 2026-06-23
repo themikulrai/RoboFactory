@@ -115,6 +115,10 @@ class DartCfg:
     dart_seed: int = 0
     shove_after_qi: int = 2
     grasp_settle_steps: int = 10
+    # PROXIMAL-ONLY shove: Panda joints 0-3 (base/shoulder/elbow) are perturbed; the
+    # wrist joints 4,5,6 are left at their setpoint so the hand keeps its grip
+    # geometry (a wrist shove twists the fingers off the held bar and fails the grasp).
+    shove_joints: tuple = (0, 1, 2, 3)
 
 
 def _make_boundary_hook(dart_cfg, env_seed, variant_id):
@@ -213,6 +217,9 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
             # BEFORE the K shove steps so the just-seated grasp + lift start are clear
             # of the disturbance (a shove at/near the grasp breaks it).
             pre_hold_steps=int(getattr(dart_cfg, "grasp_settle_steps", 0)),
+            # PROXIMAL-only shove: perturb base/shoulder/elbow, leave the wrist (4,5,6)
+            # holding its setpoint so the hand keeps its grip geometry on the bar.
+            shove_joints=getattr(dart_cfg, "shove_joints", None),
         )
 
     return hook
@@ -455,7 +462,7 @@ def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T,
 
 def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
                    stream_h5, episodes_meta, slice_tag, seed, gid,
-                   kept_so_far, per_member=False):
+                   kept_so_far, per_member=False, variant_kept=None):
     """Run ONE contrast group.
 
     per_member=False (default): ATOMIC single-pass-with-delete. Each member runs ONCE;
@@ -472,8 +479,18 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
     where atomic-over-N collapses the yield (~p^N; e.g. 0.4^3 ~ 6%) -- the deterministic
     'clean' slice already supplies the matched contrast.
 
+    ``variant_kept`` (optional): a dict that, when supplied, accumulates the count of
+    KEPT episodes PER VARIANT NAME (``spec.name``, e.g. 'simultaneous',
+    'stagger_a_leads', 'baseline') so per-variant skew is visible. Incremented at the
+    exact commit sites (the per-member inline commit and the atomic full-group commit)
+    so it counts only episodes actually written, never rolled-back atomic members.
+
     Returns (kept_count, group_fully_passed).
     """
+    def _bump_variant(spec):
+        if variant_kept is not None:
+            variant_kept[spec.name] = variant_kept.get(spec.name, 0) + 1
+
     written = []   # [(episode_id, recorder, T, spec)] with traj flushed this group
     group_ok = True
     for spec in members:
@@ -512,6 +529,7 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
             # NOT roll it back.
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
                           episode_id, rec, T, spec)
+            _bump_variant(spec)
             print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
                   f"KEPT (per-member) -> traj_{episode_id}", flush=True)
 
@@ -540,6 +558,7 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
         for episode_id, rec, T, spec in written:
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
                           episode_id, rec, T, spec)
+            _bump_variant(spec)
         print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
               f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",
               flush=True)
@@ -556,7 +575,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         max_steps=600, dart_seed=0,
         per_attempt_timeout=300, override_seeds=None, save_video=False,
         floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix="",
-        grasp_settle_steps=10):
+        grasp_settle_steps=10, shove_joints=(0, 1, 2, 3)):
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
@@ -636,6 +655,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         sigma=float(dart_sigma), floor=float(floor),
         k_min=int(k_min), k_max=int(k_max), p_inject=float(p_inject),
         dart_seed=int(dart_seed), grasp_settle_steps=int(grasp_settle_steps),
+        shove_joints=tuple(int(j) for j in shove_joints),
     )
 
     # --- slice plan ---
@@ -658,15 +678,19 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                 # deterministic 'clean' slice supplies the guaranteed matched contrast.
                 plan.append(("merged", False, base_dart_cfg, budgets[name], True))
             elif name == "clean":
-                # object noise (aug config) stays ON; arm-disturbance hook OFF. ATOMIC so
-                # the matched contrast (frame-0-identical A/B/C) is guaranteed complete.
+                # object noise (aug config) stays ON; arm-disturbance hook OFF.
+                # PER-MEMBER keep: atomic-over-3 collapsed the clean yield (one weak
+                # member dropped its whole matched group -> near-zero clean kept). Keep
+                # each passing variant independently; per-variant skew is now tracked
+                # (meta["variant_kept"]) so we can SEE if the contrast drifts.
                 clean_cfg = DartCfg(
                     sigma=0.0, floor=base_dart_cfg.floor,
                     k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
                     p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
                     grasp_settle_steps=base_dart_cfg.grasp_settle_steps,
+                    shove_joints=base_dart_cfg.shove_joints,
                 )
-                plan.append(("clean", False, clean_cfg, budgets[name], False))
+                plan.append(("clean", False, clean_cfg, budgets[name], True))
     else:
         plan = [("default", False, base_dart_cfg, num, False)]
 
@@ -692,6 +716,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     kept_groups = 0    # contrast groups fully kept
     total_groups = 0
     slice_kept = {}    # per-slice kept counts
+    variant_kept = {}  # per-variant-NAME kept counts (skew tracking, across all slices)
     pbar = tqdm(total=num, desc=task_name)
     meta_path = osp.join(output_dir, "subtask_meta.json")
 
@@ -713,6 +738,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             "kept_groups": int(kept_groups),
             "total_groups_attempted": int(total_groups),
             "slice_kept": dict(slice_kept),
+            "variant_kept": dict(variant_kept),
             "episodes": episodes_meta,
         }
         with open(meta_path, "w") as f:
@@ -741,7 +767,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                     added, ok = _process_group(
                         env, members, max_steps, per_attempt_timeout, dart_cfg,
                         stream_h5, episodes_meta, slice_tag, seed, gid, kept,
-                        per_member=per_member,
+                        per_member=per_member, variant_kept=variant_kept,
                     )
                     # count kept episodes regardless of full-group success (per-member
                     # slices keep partial groups); kept_groups counts only complete groups.
@@ -769,6 +795,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     print()
     print(f"[subtask] kept {kept} episodes in {kept_groups}/{total_groups} groups "
           f"(per-slice: {slice_kept})")
+    print(f"[subtask] per-variant kept (skew): {variant_kept}")
     print(f"[subtask] h5: {out_h5}")
     print(f"[subtask] subtask_stream: {stream_h5_path}")
     print(f"[subtask] meta: {meta_path}")
@@ -833,6 +860,13 @@ if __name__ == "__main__":
                          "steps run BEFORE the K shove steps so the just-seated grasp + "
                          "lift start are clear of the disturbance (a shove at/near the "
                          "grasp breaks it). Default 10; 0 disables the settle window.")
+    ap.add_argument("--shove-joints", type=str, default="0,1,2,3",
+                    dest="shove_joints",
+                    help="comma-separated Panda arm-joint indices (0-6) the DART "
+                         "shove perturbs; all other arm joints hold their setpoint. "
+                         "Default '0,1,2,3' (proximal base/shoulder/elbow) leaves the "
+                         "wrist (4,5,6) holding its grip geometry. Pass '0,1,2,3,4,5,6' "
+                         "to shove all joints (legacy).")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="splice into the yaml stem, e.g. '_aug' maps "
                          "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")
@@ -856,6 +890,10 @@ if __name__ == "__main__":
     if args.seeds_csv:
         override_seeds = [int(s) for s in args.seeds_csv.split(",") if s.strip()]
 
+    shove_joints = tuple(
+        int(j) for j in args.shove_joints.split(",") if j.strip()
+    )
+
     run(args.task, args.num, args.record_dir,
         variants=variants,
         dart_sigma=args.dart_sigma,
@@ -869,4 +907,5 @@ if __name__ == "__main__":
         p_inject=args.p_inject,
         config_suffix=args.config_suffix,
         mix=args.mix,
-        grasp_settle_steps=args.grasp_settle_steps)
+        grasp_settle_steps=args.grasp_settle_steps,
+        shove_joints=shove_joints)

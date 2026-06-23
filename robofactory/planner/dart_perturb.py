@@ -92,6 +92,7 @@ def inject_joint_disturbance(
     action_prefix="panda",
     sink=None,
     pre_hold_steps=0,
+    shove_joints=None,
 ):
     """Step the UNWRAPPED env with a noisy joint target so selected arms drift
     off-path. NOT recorded (the unwrapped env bypasses any RecordEpisode wrapper),
@@ -109,7 +110,11 @@ def inject_joint_disturbance(
       2. SHOVE (``K`` steps): arms in ``move_ids`` get a single floored random
          offset added to their captured ``q0`` (see :func:`sample_floored_offset`);
          all other arms hold their setpoint. That same drifted/held target is
-         commanded for all ``K`` steps.
+         commanded for all ``K`` steps. When ``shove_joints`` is given the offset is
+         applied ONLY at those joint indices (the rest of the move arm holds ``q0``);
+         the floored offset is still drawn over all 7 joints (so the rng stream and
+         floor magnitude are unchanged) but masked to the selected indices before it
+         is added.
 
     The grips are carried verbatim from ``grips[i]`` through BOTH phases -- the
     caller MUST pass the live/frozen grip (e.g. ``frozen_grip``). This function
@@ -144,6 +149,12 @@ def inject_joint_disturbance(
         pre_hold_steps: number of SETTLE steps (all arms hold, no offset) to run
             BEFORE the K shove steps. Default 0 (no settle window -> exact legacy
             behavior). The grasp-protection settle guard passes a positive value.
+        shove_joints: optional iterable of arm-joint indices (0-6) at which the
+            sampled offset is applied for each move arm. ALL other arm-joint indices
+            get ZERO offset (hold ``q0``). None (default) -> exact legacy behavior:
+            the offset is applied at all 7 joints. Use e.g. ``(0, 1, 2, 3)`` to shove
+            the proximal joints (base/shoulder/elbow) while the wrist (4,5,6) holds
+            its grip geometry.
 
     Returns:
         None. (Side effect: ``pre_hold_steps + K`` calls to ``base_env.step``.)
@@ -176,7 +187,16 @@ def inject_joint_disturbance(
     for i in range(len(robots)):
         if i in move_ids:
             q0 = _arm_qpos7(robots[i])  # captured ONCE (live pose of the shoved arm)
-            target = q0 + sample_floored_offset(rng, sigma, q0.shape[0], floor)
+            # Draw the floored offset over ALL 7 joints (keeps the rng stream + floor
+            # magnitude unchanged whether or not we mask). If shove_joints is given,
+            # zero the offset everywhere except those indices so the masked joints
+            # (e.g. the wrist) hold q0 and keep their grip geometry.
+            offset = sample_floored_offset(rng, sigma, q0.shape[0], floor)
+            if shove_joints is not None:
+                mask = np.zeros(q0.shape[0], dtype=bool)
+                mask[list(shove_joints)] = True
+                offset = np.where(mask, offset, 0.0)
+            target = q0 + offset
         else:
             # HOLD the interpreter's last-commanded setpoint (frozen_qpos) if the
             # caller supplied one -- NOT the lagging live qpos. A concurrently moving

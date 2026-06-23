@@ -230,3 +230,97 @@ def test_loop_survives_failure_no_propagation(monkeypatch):
         _FakeEnv(), [_FakeSpec()], 600, 5, None, {}, [], "merged", 7, 0, 0,
         per_member=True)
     assert kept == 0 and ok is False  # the lone member was dropped, not committed
+
+
+# ---------------------------------------------------------------------------
+# DartCfg defaults (shove_joints)
+# ---------------------------------------------------------------------------
+def test_dartcfg_shove_joints_default_is_proximal():
+    """DartCfg defaults to the proximal base/shoulder/elbow joints (wrist untouched)."""
+    assert R.DartCfg().shove_joints == (0, 1, 2, 3)
+
+
+# ---------------------------------------------------------------------------
+# per-variant skew tracking (variant_kept)
+# ---------------------------------------------------------------------------
+def test_variant_kept_accumulates_per_member(monkeypatch):
+    """per-member: variant_kept counts each COMMITTED variant by spec.name; a dropped
+    (None,None) member does NOT increment its name."""
+    written, deleted = [], []
+    _patch_group_deps(monkeypatch, written, deleted)
+    env = _FakeEnv()
+
+    outcomes = iter([
+        (("REC", 2), {"ok": True, "steps": 5}),   # 'a' kept
+        (None, None),                              # 'b' dropped (no bump)
+        (("REC", 2), {"ok": True, "steps": 5}),   # 'c' kept
+    ])
+    monkeypatch.setattr(R, "_run_one_variant", lambda *a, **k: next(outcomes))
+
+    members = [_FakeSpec(name=n) for n in ("a", "b", "c")]
+    variant_kept = {}
+    R._process_group(
+        env, members, max_steps=600, per_attempt_timeout=5, dart_cfg=None,
+        stream_h5={}, episodes_meta=[], slice_tag="merged", seed=7, gid=0,
+        kept_so_far=0, per_member=True, variant_kept=variant_kept)
+
+    assert variant_kept == {"a": 1, "c": 1}  # 'b' dropped -> absent
+
+
+def test_variant_kept_accumulates_atomic_only_on_full_group(monkeypatch):
+    """atomic: variant_kept increments ONLY when the WHOLE group passes (a rolled-back
+    atomic member must never be counted)."""
+    written, deleted = [], []
+    _patch_group_deps(monkeypatch, written, deleted)
+
+    # Case 1: full group passes -> both names counted once.
+    env = _FakeEnv()
+    ok_outcomes = iter([
+        (("REC", 2), {"ok": True, "steps": 5}),
+        (("REC", 2), {"ok": True, "steps": 5}),
+    ])
+    monkeypatch.setattr(R, "_run_one_variant", lambda *a, **k: next(ok_outcomes))
+    vk = {}
+    R._process_group(
+        env, [_FakeSpec(name="x"), _FakeSpec(name="y")], 600, 5, None,
+        {}, [], "clean", 7, 0, 0, per_member=False, variant_kept=vk)
+    assert vk == {"x": 1, "y": 1}
+
+    # Case 2: one member fails -> whole group rolled back -> NOTHING counted.
+    env2 = _FakeEnv()
+    fail_outcomes = iter([
+        (("REC", 2), {"ok": True, "steps": 5}),   # x flushes then gets rolled back
+        (None, None),                              # y fails -> atomic drop
+    ])
+    monkeypatch.setattr(R, "_run_one_variant", lambda *a, **k: next(fail_outcomes))
+    vk2 = {}
+    R._process_group(
+        env2, [_FakeSpec(name="x"), _FakeSpec(name="y")], 600, 5, None,
+        {}, [], "clean", 7, 0, 0, per_member=False, variant_kept=vk2)
+    assert vk2 == {}  # atomic rollback -> no variant counted
+
+
+def test_variant_kept_accumulates_across_groups(monkeypatch):
+    """The SAME dict, reused across groups, sums repeated variant names."""
+    written, deleted = [], []
+    _patch_group_deps(monkeypatch, written, deleted)
+    monkeypatch.setattr(R, "_run_one_variant",
+                        lambda *a, **k: (("REC", 2), {"ok": True, "steps": 5}))
+    vk = {}
+    for _ in range(3):  # three single-member 'baseline' groups
+        R._process_group(
+            _FakeEnv(), [_FakeSpec(name="baseline")], 600, 5, None,
+            {}, [], "recovery", 7, 0, 0, per_member=False, variant_kept=vk)
+    assert vk == {"baseline": 3}
+
+
+def test_variant_kept_none_is_noop(monkeypatch):
+    """variant_kept=None (default) -> no tracking, no error (back-compat)."""
+    written, deleted = [], []
+    _patch_group_deps(monkeypatch, written, deleted)
+    monkeypatch.setattr(R, "_run_one_variant",
+                        lambda *a, **k: (("REC", 2), {"ok": True, "steps": 5}))
+    kept, ok = R._process_group(
+        _FakeEnv(), [_FakeSpec(name="a")], 600, 5, None, {}, [], "merged", 7, 0, 0,
+        per_member=True)  # no variant_kept passed
+    assert kept == 1 and ok is True

@@ -482,6 +482,114 @@ def test_settle_does_not_consume_extra_rng():
                                err_msg="settle window must not perturb the rng stream")
 
 
+# ---- (g) shove_joints: PROXIMAL-only offset mask --------------------------
+
+
+def test_shove_joints_proximal_masks_wrist():
+    """shove_joints=(0,1,2,3): the move arm's commanded target has an offset applied
+    ONLY at joints 0-3; joints 4,5,6 hold q0 EXACTLY (no offset). Non-move arm held."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(7),
+        sigma=0.5, K=1, floor=0.3, shove_joints=(0, 1, 2, 3),
+    )
+    arm0 = env.steps[0]["panda-0"][:7]
+    # joints 4,5,6 unchanged from q0 (wrist holds its grip geometry)
+    np.testing.assert_allclose(arm0[4:7], Q0_A[4:7])
+    # joints 0-3 perturbed (at least one differs from q0)
+    assert not np.allclose(arm0[:4], Q0_A[:4])
+    # non-move arm fully held
+    np.testing.assert_allclose(env.steps[0]["panda-1"][:7], Q0_B[:7])
+
+
+def test_shove_joints_offset_equals_full_offset_on_selected_indices():
+    """The masked offset at the SELECTED indices is bit-identical to the unmasked
+    offset there (same rng draw, just zeroed elsewhere). This pins that masking does
+    NOT renormalize or perturb the rng stream -- it only zeros the unselected joints."""
+    shove = (0, 1, 2, 3)
+    # masked run
+    envM, robotsM = _make()
+    inject_joint_disturbance(
+        envM, robotsM, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(99),
+        sigma=0.5, K=1, floor=0.3, shove_joints=shove,
+    )
+    # full (None) run, SAME seed -> same underlying offset draw
+    envF, robotsF = _make()
+    inject_joint_disturbance(
+        envF, robotsF, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(99),
+        sigma=0.5, K=1, floor=0.3, shove_joints=None,
+    )
+    offM = envM.steps[0]["panda-0"][:7] - Q0_A[:7]
+    offF = envF.steps[0]["panda-0"][:7] - Q0_A[:7]
+    # selected indices identical; unselected zeroed in the masked run
+    np.testing.assert_allclose(offM[list(shove)], offF[list(shove)])
+    np.testing.assert_allclose(offM[4:7], 0.0)
+    # the full run perturbs the wrist (so the mask genuinely changed something)
+    assert not np.allclose(offF[4:7], 0.0)
+
+
+def test_shove_joints_none_is_legacy_all_seven():
+    """shove_joints=None (default) -> all 7 joints get the offset (legacy behavior)."""
+    env, robots = _make()
+    inject_joint_disturbance(
+        env, robots, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(11),
+        sigma=1e-6, K=1, floor=0.7,  # tiny sigma -> floor kicks in, all 7 nonzero
+    )
+    off = env.steps[0]["panda-0"][:7] - Q0_A[:7]
+    # with shove_joints=None and the floor active, every joint carries some offset
+    assert np.all(np.abs(off) > 0.0)
+
+
+def test_shove_joints_single_index():
+    """A single-index shove_joints perturbs exactly that joint; all others hold q0."""
+    env, robots = _make()
+    inject_joint_disturbance(
+        env, robots, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(5),
+        sigma=0.5, K=1, floor=0.3, shove_joints=(2,),
+    )
+    off = env.steps[0]["panda-0"][:7] - Q0_A[:7]
+    assert abs(off[2]) > 0.0
+    mask = np.ones(7, dtype=bool)
+    mask[2] = False
+    np.testing.assert_allclose(off[mask], 0.0)
+
+
+def test_shove_joints_held_constant_across_K():
+    """The proximal-masked target is held identical for all K shove steps."""
+    env, robots = _make()
+    inject_joint_disturbance(
+        env, robots, [0.04, -0.02], move_ids=[0], rng=np.random.default_rng(13),
+        sigma=0.4, K=5, floor=0.2, shove_joints=(0, 1, 2, 3),
+    )
+    first = env.steps[0]["panda-0"]
+    for act in env.steps[1:]:
+        np.testing.assert_allclose(act["panda-0"], first)
+
+
+def test_shove_joints_with_settle_window():
+    """With a settle window: the G hold steps apply NO offset anywhere; the K shove
+    steps apply offset ONLY at the proximal indices of the move arm."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    hold_qpos = [HOLD_A.copy(), HOLD_B.copy()]
+    G, K = 3, 2
+    inject_joint_disturbance(
+        env, robots, grips, move_ids=[0], rng=np.random.default_rng(0),
+        sigma=0.5, K=K, floor=0.3, hold_qpos=hold_qpos, pre_hold_steps=G,
+        shove_joints=(0, 1, 2, 3),
+    )
+    assert len(env.steps) == G + K
+    # settle: move arm holds HOLD_A exactly (no offset at any joint)
+    for s in env.steps[:G]:
+        np.testing.assert_allclose(s["panda-0"][:7], HOLD_A)
+    # shove: wrist (4,5,6) holds the move arm's LIVE q0 (the shove target = q0+offset,
+    # offset masked to 0 on the wrist -> wrist == Q0_A[4:7]); proximal differs.
+    for s in env.steps[G:]:
+        np.testing.assert_allclose(s["panda-0"][4:7], Q0_A[4:7])
+        assert not np.allclose(s["panda-0"][:4], Q0_A[:4])
+
+
 # ---- misc: action_prefix + torch-tensor / batched qpos tolerance ----------
 
 
