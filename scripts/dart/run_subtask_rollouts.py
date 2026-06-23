@@ -143,12 +143,16 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
 
         planner = state["planner"]
         arms = state["arms"]
-        # arms ABOUT TO ENTER a primitive this transition (the JIT entries the hook
-        # precedes). Same predicate the interpreter uses to detect a transition.
-        moving = [
-            i for i, a in arms.items()
-            if a.current is not None and a.ti == 0 and a.built is None
-        ]
+        # arms GENUINELY entering a new primitive this transition, as computed by the
+        # interpreter (ti==0, not built, NOT blocked, qi changed). Use that exact set
+        # so we never shove a blocked/gated arm. Fall back to the looser local
+        # predicate only when the interpreter didn't annotate state (e.g. unit tests).
+        moving = state.get("transitioning")
+        if moving is None:
+            moving = [
+                i for i, a in arms.items()
+                if a.current is not None and a.ti == 0 and a.built is None
+            ]
         if not moving:
             return
 
@@ -162,6 +166,10 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
 
         K = int(rng.integers(dart_cfg.k_min, dart_cfg.k_max + 1))
         grips = [float(arms[i].frozen_grip) for i in range(len(arms))]
+        # hold targets for NON-move arms = their last commanded setpoint (frozen_qpos),
+        # so a concurrently moving arm keeps tracking during the K shove steps instead
+        # of stalling at its lagging live qpos.
+        hold_qpos = [np.asarray(arms[i].frozen_qpos, dtype=np.float64) for i in range(len(arms))]
         dart_perturb.inject_joint_disturbance(
             unwrapped_env,
             planner.robot,
@@ -171,6 +179,7 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
             dart_cfg.sigma,
             K,
             dart_cfg.floor,
+            hold_qpos=hold_qpos,
             control_mode=planner.control_mode,
         )
 
@@ -486,6 +495,18 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         sys.exit(f"[ERROR] config {config_path} does not exist "
                  f"(config_suffix={config_suffix!r}).")
     mix_slices = _parse_mix(mix)
+    # GUARD: the 'recovery'/'merged' slices are defined by an ACTIVE arm-disturbance
+    # hook; with dart_sigma<=0 the hook is a no-op and those slices silently collapse
+    # to the same object-noise-only recipe as 'clean' (but still tagged recovery/merged
+    # in meta -> invisible mislabel). Fail loudly instead.
+    if mix_slices and dart_sigma <= 0 and any(
+        name in ("recovery", "merged") for name, _ in mix_slices
+    ):
+        sys.exit(
+            "[ERROR] --mix includes recovery/merged (arm-disturbance slices) but "
+            f"--dart-sigma={dart_sigma} <= 0 -> the hook is a no-op and those slices "
+            "would be indistinguishable from 'clean'. Pass --dart-sigma>0."
+        )
 
     # --- output paths (mirror hf_download layout) ---
     output_dir = osp.join(record_dir, task_name)
@@ -529,6 +550,13 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         record_reward=False,
         record_env_state=True,
         record_observation=True,
+        # CRITICAL: do NOT let clean_trajectories() renumber surviving traj_{id}s to
+        # contiguous 0..N at env.close(). We delete dropped groups mid-run (single-pass
+        # -with-delete), leaving id gaps on PURPOSE; the sibling subtask_stream.h5 +
+        # subtask_meta.json are keyed by those exact ids. A close-time renumber would
+        # rewrite the traj H5 + JSON ids but NOT the stream/meta -> silent join-key
+        # desync (every action paired with the wrong subtask). Keep ids stable.
+        clean_on_close=False,
     )
 
     # --- DART config (a single object reused by every active slice) ---

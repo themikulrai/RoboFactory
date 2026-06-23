@@ -449,12 +449,16 @@ def run_program(
         # building so the next recipe's plan absorbs the perturbation. A blocked
         # (gated) arm does NOT count as a transition -> the hook is not re-fired
         # every waiting tick. ---
-        transition = any(
-            arms[i].current is not None and arms[i].ti == 0 and arms[i].built is None
+        transitioning = [
+            i for i in range(num_arms)
+            if arms[i].current is not None and arms[i].ti == 0 and arms[i].built is None
             and not blocked_this_tick[i] and entered[i] != arms[i].qi
-            for i in range(num_arms)
-        )
-        if transition and boundary_hook is not None:
+        ]
+        if transitioning and boundary_hook is not None:
+            # expose the EXACT transitioning-arm set so the hook only perturbs an arm
+            # that is genuinely entering a new primitive (never a blocked/gated arm
+            # that merely matches ti==0 & built is None while waiting on a gate).
+            state["transitioning"] = transitioning
             boundary_hook(_unwrap(env), state)
 
         # --- per-arm tick assembly ---

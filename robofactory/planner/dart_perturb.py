@@ -80,6 +80,7 @@ def inject_joint_disturbance(
     sigma,
     K,
     floor,
+    hold_qpos=None,
     control_mode="pd_joint_pos",
     action_prefix="panda",
     sink=None,
@@ -105,8 +106,12 @@ def inject_joint_disturbance(
         grips: list of current gripper commands, one float per arm. Indexed by
             arm id and emitted verbatim as the gripper channel.
         move_ids: int or list[int] of arm indices to perturb. Arms not listed
-            hold their current qpos.
+            hold ``hold_qpos[i]`` (or their live qpos if ``hold_qpos`` is None).
         rng: a ``numpy.random.Generator``.
+        hold_qpos: optional list of per-arm hold targets (e.g. the interpreter's
+            ``frozen_qpos`` setpoints). Non-move arms are commanded to
+            ``hold_qpos[i][:7]`` for all K steps so a concurrently moving arm keeps
+            tracking instead of stalling at its lagging live qpos. None -> live qpos.
         sigma: stddev of the per-joint normal offset.
         K: number of (identical) unwrapped steps to hold the drifted target.
         floor: minimum L2 norm of each perturbing offset.
@@ -123,11 +128,19 @@ def inject_joint_disturbance(
 
     action_dict = {}
     for i in range(len(robots)):
-        q0 = _arm_qpos7(robots[i])  # captured ONCE
         if i in move_ids:
+            q0 = _arm_qpos7(robots[i])  # captured ONCE (live pose of the shoved arm)
             target = q0 + sample_floored_offset(rng, sigma, q0.shape[0], floor)
         else:
-            target = q0  # HOLD current qpos
+            # HOLD the interpreter's last-commanded setpoint (frozen_qpos) if the
+            # caller supplied one -- NOT the lagging live qpos. A concurrently moving
+            # non-move arm is mid-trajectory (PD controller behind its target); pinning
+            # it at live qpos for K steps STALLS it (a corruption path that fails the
+            # arm's success check). Holding its commanded setpoint keeps it tracking.
+            if hold_qpos is not None:
+                target = np.asarray(hold_qpos[i], dtype=np.float64).reshape(-1)[:7]
+            else:
+                target = _arm_qpos7(robots[i])  # fallback: live qpos
         grip = grips[i]  # caller-supplied (frozen) grip -- NOT planner state
         if control_mode == "pd_joint_pos_vel":
             action = np.hstack([target, target * 0, grip])

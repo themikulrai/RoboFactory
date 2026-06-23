@@ -40,11 +40,18 @@ class _FakeArm:
     hook reads: ``.current`` (truthy=has a queued recipe / None=done), ``.ti``
     (tick index), ``.built`` (None until built), ``.frozen_grip`` (last grip)."""
 
-    def __init__(self, current=True, ti=0, built=None, frozen_grip=1.0):
+    def __init__(self, current=True, ti=0, built=None, frozen_grip=1.0,
+                 frozen_qpos=None):
         self.current = current
         self.ti = ti
         self.built = built
         self.frozen_grip = frozen_grip
+        # last-commanded setpoint the hook holds non-move arms at (the real
+        # _ArmState carries this); default to a fixed 7-vector so the fake works.
+        self.frozen_qpos = (
+            np.zeros(7, np.float64) if frozen_qpos is None
+            else np.asarray(frozen_qpos, np.float64)
+        )
 
 
 class _FakePlanner:
@@ -78,7 +85,8 @@ def _install_recorder(monkeypatch):
     calls = []
 
     def _fake_inject(base_env, robots, grips, move_ids, rng, sigma, K, floor,
-                     control_mode="pd_joint_pos", action_prefix="panda", sink=None):
+                     hold_qpos=None, control_mode="pd_joint_pos",
+                     action_prefix="panda", sink=None):
         # snapshot the RNG state-consuming draw so two identical streams are
         # provably identical (capture a deterministic sample from the SAME rng).
         probe = float(rng.random())
@@ -89,6 +97,7 @@ def _install_recorder(monkeypatch):
             "K": int(K),
             "floor": float(floor),
             "control_mode": control_mode,
+            "hold_qpos": None if hold_qpos is None else [np.asarray(h).tolist() for h in hold_qpos],
             "rng_probe": probe,
         })
 
@@ -397,3 +406,34 @@ def test_parse_mix_rejects_unknown_slice():
         R._parse_mix("bogus=1.0")
     with pytest.raises(SystemExit):
         R._parse_mix("recovery")  # no '='
+
+
+def test_hook_uses_transitioning_set_not_looser_moving(monkeypatch):
+    """DA #3 fix: when the interpreter annotates state['transitioning'], the hook must
+    shove ONLY a genuinely-transitioning arm -- never another arm that merely matches
+    the looser (current, ti==0, built is None) predicate (e.g. a blocked/gated arm)."""
+    calls = []
+
+    def _fake_inject(base_env, robots, grips, move_ids, rng, sigma, K, floor,
+                     hold_qpos=None, control_mode="pd_joint_pos",
+                     action_prefix="panda", sink=None):
+        calls.append({"move_ids": list(move_ids), "hold_qpos": hold_qpos})
+
+    monkeypatch.setattr(dart_perturb, "inject_joint_disturbance", _fake_inject)
+    cfg = R.DartCfg(sigma=0.4, floor=0.15, k_min=5, k_max=15, p_inject=1.0, dart_seed=0)
+    hook = R._make_boundary_hook(cfg, env_seed=3, variant_id=0)
+    # both arms LOOK moving by the looser predicate, but only arm 0 truly transitions
+    arms = {
+        0: _FakeArm(current=True, ti=0, built=None, frozen_grip=1.0,
+                    frozen_qpos=np.arange(7.0)),
+        1: _FakeArm(current=True, ti=0, built=None, frozen_grip=-1.0,
+                    frozen_qpos=np.ones(7)),
+    }
+    state = {"step": 5, "arms": arms, "planner": _FakePlanner(2),
+             "transitioning": [0]}
+    hook(None, state)  # base_env unused (inject faked)
+    assert len(calls) == 1
+    assert calls[0]["move_ids"] == [0], "must target the transitioning arm, not arm 1"
+    # DA #2 fix: hold targets supplied for ALL arms (non-move arm held at frozen_qpos)
+    assert calls[0]["hold_qpos"] is not None
+    assert len(calls[0]["hold_qpos"]) == 2
