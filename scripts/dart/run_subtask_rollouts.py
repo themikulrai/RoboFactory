@@ -394,27 +394,47 @@ def _split_budget(num, mix):
     return floors
 
 
+def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T, spec):
+    """Write one member's aligned subtask stream (keyed ``traj_{episode_id}``) + its
+    meta row (tagged with ``slice_tag``). Shared by the atomic + per-member paths so
+    they cannot drift."""
+    rec.flush(episode_id=episode_id, h5_group=stream_h5, expected_T=T)
+    stream_h5.flush()
+    episodes_meta.append({
+        "episode_id": episode_id,
+        "env_seed": int(seed),
+        "variant": spec.name,
+        "family": spec.family,
+        "contrast_group_id": int(spec.contrast_group_id),
+        "T": int(T),
+        "slice": slice_tag,
+    })
+
+
 def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
                    stream_h5, episodes_meta, slice_tag, seed, gid,
-                   kept_so_far):
-    """Run ONE contrast group SINGLE-PASS-WITH-DELETE.
+                   kept_so_far, per_member=False):
+    """Run ONE contrast group.
 
-    For each member: run ONCE; on pass flush the trajectory (writes
-    ``traj_{env._episode_id}``) and remember it; on fail (or SIGALRM timeout) discard
-    the in-progress buffer and mark the group failed. After the loop, if ANY member
-    failed, DELETE every already-written artifact for this group (trajectory H5 group,
-    subtask-stream H5 group, JSON-sidecar row, in-memory meta row) so the dataset never
-    references a half-written group. On full success, write each member's aligned
-    subtask stream and append its meta row (tagged with ``slice_tag``).
+    per_member=False (default): ATOMIC single-pass-with-delete. Each member runs ONCE;
+    on pass its trajectory is flushed + remembered; on fail (or SIGALRM timeout) the
+    buffer is discarded and, after the loop, EVERY already-written artifact for the group
+    (trajectory H5 group, subtask-stream group, JSON row, in-memory meta row) is DELETED
+    so the dataset never references a half-written group. On full success all members'
+    aligned streams + meta rows are written. Preserves the guaranteed-complete matched
+    contrast (used for the 'clean' slice and the no-mix 'default').
 
-    Returns (kept_count, group_ok). ``kept_count`` is the number of episodes added to
-    ``episodes_meta`` (0 if the group dropped).
+    per_member=True: each member that passes is kept INDEPENDENTLY -- its trajectory +
+    aligned subtask stream + meta row are written immediately, and a failing member is
+    discarded WITHOUT rolling back the others. Used for the perturbed 'merged' slice,
+    where atomic-over-N collapses the yield (~p^N; e.g. 0.4^3 ~ 6%) -- the deterministic
+    'clean' slice already supplies the matched contrast.
+
+    Returns (kept_count, group_fully_passed).
     """
-    written = []   # [(episode_id, recorder, T, spec)] flushed so far this group
+    written = []   # [(episode_id, recorder, T, spec)] with traj flushed this group
     group_ok = True
     for spec in members:
-        # run the WHOLE group member-by-member; the atomic keep/drop decision (and the
-        # rollback of anything already flushed) happens AFTER the loop.
         signal.alarm(int(per_attempt_timeout))
         try:
             rec, out = _run_one_variant(env, spec, max_steps, dart_cfg)
@@ -431,19 +451,30 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
                 env.flush_trajectory(save=False)  # discard this member's buffer
             except Exception:
                 pass
-            break
+            if per_member:
+                print(f"  [{slice_tag}] seed {seed} group {gid} variant "
+                      f"{spec.name}: DROPPED (per-member)", flush=True)
+                continue  # keep the other members; no rollback
+            break         # atomic: stop and roll back below
 
         T = out["steps"]
         env.flush_trajectory()  # writes traj_{env._episode_id}
-        episode_id = int(getattr(env, "_episode_id", kept_so_far))
-        written.append((episode_id, rec, T, spec))
+        episode_id = int(getattr(env, "_episode_id", kept_so_far + len(written)))
         try:
             env._h5_file.flush()
         except AttributeError:
             pass
+        written.append((episode_id, rec, T, spec))
+        if per_member:
+            # commit this variant NOW (independent keep); a later member failing will
+            # NOT roll it back.
+            _write_member(stream_h5, episodes_meta, slice_tag, seed,
+                          episode_id, rec, T, spec)
+            print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
+                  f"KEPT (per-member) -> traj_{episode_id}", flush=True)
 
-    if not group_ok:
-        # roll back EVERYTHING this group already wrote (atomic matched-pair drop).
+    if not per_member and not group_ok:
+        # ATOMIC rollback: delete everything this group already wrote (matched-pair drop).
         if written:
             _delete_episodes(
                 [w[0] for w in written],
@@ -462,23 +493,21 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
               f"({[m.name for m in members]})", flush=True)
         return 0, False
 
-    # group fully passed: write the aligned subtask streams + meta rows.
-    for episode_id, rec, T, spec in written:
-        rec.flush(episode_id=episode_id, h5_group=stream_h5, expected_T=T)
-        stream_h5.flush()
-        episodes_meta.append({
-            "episode_id": episode_id,
-            "env_seed": int(seed),
-            "variant": spec.name,
-            "family": spec.family,
-            "contrast_group_id": int(spec.contrast_group_id),
-            "T": int(T),
-            "slice": slice_tag,
-        })
-    print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
-          f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",
-          flush=True)
-    return len(written), True
+    if not per_member:
+        # ATOMIC: all members passed -> write aligned streams + meta rows now.
+        for episode_id, rec, T, spec in written:
+            _write_member(stream_h5, episodes_meta, slice_tag, seed,
+                          episode_id, rec, T, spec)
+        print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
+              f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",
+              flush=True)
+        return len(written), True
+
+    # PER-MEMBER: members already committed as we went.
+    print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: "
+          f"per-member kept {len(written)}/{len(members)} -> "
+          f"traj_{[w[0] for w in written]}", flush=True)
+    return len(written), group_ok
 
 
 def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
@@ -575,22 +604,27 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     # Each slice gets a portion of the --num episode budget.
     if mix_slices:
         budgets = _split_budget(num, mix_slices)
-        plan = []  # (slice_tag, baseline_only, dart_cfg, budget)
+        plan = []  # (slice_tag, baseline_only, dart_cfg, budget, per_member)
         for name, _frac in mix_slices:
             if name == "recovery":
-                plan.append(("recovery", True, base_dart_cfg, budgets[name]))
+                # baseline-only -> 1-member groups; atomic==per-member, keep atomic.
+                plan.append(("recovery", True, base_dart_cfg, budgets[name], False))
             elif name == "merged":
-                plan.append(("merged", False, base_dart_cfg, budgets[name]))
+                # PER-MEMBER keep: atomic-over-N collapses the yield once the arm-shove is
+                # on (~p^N, e.g. 0.4^3~6%). Keep each passing variant independently; the
+                # deterministic 'clean' slice supplies the guaranteed matched contrast.
+                plan.append(("merged", False, base_dart_cfg, budgets[name], True))
             elif name == "clean":
-                # object noise (aug config) stays ON; arm-disturbance hook OFF.
+                # object noise (aug config) stays ON; arm-disturbance hook OFF. ATOMIC so
+                # the matched contrast (frame-0-identical A/B/C) is guaranteed complete.
                 clean_cfg = DartCfg(
                     sigma=0.0, floor=base_dart_cfg.floor,
                     k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
                     p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
                 )
-                plan.append(("clean", False, clean_cfg, budgets[name]))
+                plan.append(("clean", False, clean_cfg, budgets[name], False))
     else:
-        plan = [("default", False, base_dart_cfg, num)]
+        plan = [("default", False, base_dart_cfg, num, False)]
 
     print(f"[subtask] task={task_name}  env_id={env_id}  n_agents={n_agents}")
     print(f"[subtask] config={config_path} (suffix={config_suffix!r})")
@@ -599,7 +633,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     print(f"[subtask] variants_filter={variants}  dart_sigma={dart_sigma} "
           f"floor={floor} k=[{k_min},{k_max}] p_inject={p_inject}  max_steps={max_steps}")
     print(f"[subtask] slice plan: "
-          f"{[(t, 'baseline-only' if bo else 'full', 'hookON' if c.sigma > 0 else 'hookOFF', b) for t, bo, c, b in plan]}")
+          f"{[(t, 'baseline-only' if bo else 'full', 'hookON' if c.sigma > 0 else 'hookOFF', 'per-member' if pm else 'atomic', b) for t, bo, c, b, pm in plan]}")
 
     seeds = override_seeds if override_seeds is not None else _load_seeds(task_name, num)
     print(f"[subtask] per_attempt_timeout={per_attempt_timeout}s (SIGALRM per variant)",
@@ -640,7 +674,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             json.dump(meta, f, indent=2)
 
     try:
-        for slice_tag, baseline_only, dart_cfg, slice_budget in plan:
+        for slice_tag, baseline_only, dart_cfg, slice_budget, per_member in plan:
             this_slice_kept = 0
             print(f"[subtask] === slice {slice_tag!r}: budget={slice_budget} "
                   f"(baseline_only={baseline_only}, "
@@ -662,12 +696,16 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                     added, ok = _process_group(
                         env, members, max_steps, per_attempt_timeout, dart_cfg,
                         stream_h5, episodes_meta, slice_tag, seed, gid, kept,
+                        per_member=per_member,
                     )
-                    if ok:
+                    # count kept episodes regardless of full-group success (per-member
+                    # slices keep partial groups); kept_groups counts only complete groups.
+                    if added:
                         kept += added
                         this_slice_kept += added
-                        kept_groups += 1
                         pbar.update(added)
+                    if ok:
+                        kept_groups += 1
             slice_kept[slice_tag] = this_slice_kept
     finally:
         try:
