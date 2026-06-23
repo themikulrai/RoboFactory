@@ -112,27 +112,53 @@ class LiftBarrierEnv(BaseEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self.scene_builder.initialize(env_idx)
+            # Per-env consecutive-hold counter for the SUSTAINED success criterion
+            # (see evaluate). Create on first reset (full num_envs), then reset ONLY
+            # the env_idx rows so a partial reset (some envs mid-episode) does not wipe
+            # the others' progress. env_idx is a 1-D long tensor of the envs being
+            # (re)initialized this call.
+            if getattr(self, "_lift_hold", None) is None:
+                self._lift_hold = torch.zeros(self.num_envs, dtype=torch.long)
+            self._lift_hold[env_idx] = 0
 
 
     def evaluate(self):
-        # STRICT success (replaces the grasp-blind centre-height check, which let
-        # flung / tipped / un-grasped bars false-positive): BOTH grasp ENDS of the
-        # barrier must clear base_z + 0.25 AND BOTH arms must be grasping it. The
-        # grasp ends are barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]
-        # (long axis = local-X; offsets verified against model_data.json + the
-        # annotation grasp pipeline). Shared with success_candidates so the two stay
-        # in lock-step. Runs on the env's BATCHED GPU torch tensors (batch dim kept).
+        # SUSTAINED GEOMETRIC success (replaces the grasp-blind centre-height check AND
+        # the fragile is_grasping contact gate): a PER-FRAME condition C must hold for
+        # HOLD_FRAMES_K CONSECUTIVE frames. C = BOTH grasp ENDS of the barrier clear
+        # base_z + 0.25  AND  BOTH arms' grippers are closed (each arm's 2 finger joints
+        # sum < GRIPPER_CLOSE_MAX). The grasp ends are
+        # barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074] (long axis =
+        # local-X; offsets verified against model_data.json + the annotation grasp
+        # pipeline). is_grasping is DROPPED: the contact-force probe UNRELIABLY
+        # registers a real load-bearing grasp on the thin (~0.09 m) bar ends (one arm
+        # read False for 25 consecutive frames on a genuine clean held lift). The
+        # sustained counter kills transient flings (single-frame z-teleports) and tips
+        # (don't sustain BOTH ends). Shared with success_candidates so the two stay in
+        # lock-step. Runs on the env's BATCHED GPU torch tensors (batch dim kept).
         from robofactory.tasks.success_candidates import (
             barrier_grasp_ends_world,
+            arm_gripper_closed,
             BARRIER_LIFT_DZ,
+            GRIPPER_CLOSE_MAX,  # noqa: F401  (documents the gripper-closed threshold)
+            HOLD_FRAMES_K,
         )
-        ends = barrier_grasp_ends_world(self.barrier)            # (..., 2, 3)
+        ends = barrier_grasp_ends_world(self.barrier)            # (num_envs, 2, 3)
         base_z = self.agent.agents[0].robot.pose.p[0, 2]
-        ends_z = ends[..., 2]                                    # (..., 2)
-        height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (...,) both ends
-        grasp0 = self.agent.agents[0].is_grasping(self.barrier)
-        grasp1 = self.agent.agents[1].is_grasping(self.barrier)
-        success = (height_ok & grasp0 & grasp1).bool()
+        ends_z = ends[..., 2]                                    # (num_envs, 2)
+        height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (num_envs,)
+        closed0 = arm_gripper_closed(self.agent.agents[0])       # (num_envs,)
+        closed1 = arm_gripper_closed(self.agent.agents[1])       # (num_envs,)
+        c = (height_ok & closed0 & closed1).bool()               # (num_envs,) per-frame
+        # lazy-init the counter (evaluate can fire before _initialize_episode in some
+        # harness paths); match c's batch shape / device.
+        if getattr(self, "_lift_hold", None) is None:
+            self._lift_hold = torch.zeros_like(c, dtype=torch.long)
+        hold = self._lift_hold.to(c.device)
+        # increment where C is True this frame, RESET to 0 where False.
+        hold = torch.where(c, hold + 1, torch.zeros_like(hold))
+        self._lift_hold = hold
+        success = (hold >= HOLD_FRAMES_K)
         return {
             "success": success,
         }

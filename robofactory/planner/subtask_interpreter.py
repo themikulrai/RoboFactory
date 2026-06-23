@@ -295,6 +295,28 @@ def check_barrier_lifted(dz: float = 0.15) -> Callable:
 _BARRIER_END_OFFSETS_NP = np.array(
     [[0.222, 0.0, 0.074], [-0.222, 0.0, 0.074]], dtype=np.float64
 )
+# Sustained-criterion constants, kept in lock-step with
+# robofactory.tasks.success_candidates (HOLD_FRAMES_K, GRIPPER_CLOSE_MAX). Duplicated
+# here so the numpy-only interpreter does not import torch / the tasks package.
+_HOLD_FRAMES_K = 8
+_GRIPPER_CLOSE_MAX = 0.06
+
+
+def _arm_gripper_closed_np(agent) -> bool:
+    """Single-env: is this arm's gripper CLOSED (finger-sum < _GRIPPER_CLOSE_MAX)?
+
+    The Panda arm's qpos is 9-dim (7 arm + 2 fingers); "closed" means the LAST 2
+    entries (finger joints) sum below the threshold (open ~0.08 each, closed ~0.00).
+    Reads ``agent.robot.get_qpos()`` (obs-mode-agnostic), tolerating a torch tensor
+    and a leading batch dim, and takes the first env's last 2 qpos entries.
+    """
+    q = agent.robot.get_qpos()
+    if hasattr(q, "detach"):
+        q = q.detach().cpu().numpy()
+    q = np.asarray(q, dtype=np.float64)
+    if q.ndim > 1:
+        q = q[0]  # first env (single-env generation path)
+    return float(q[-2:].sum()) < _GRIPPER_CLOSE_MAX
 
 
 def _quat_rotate_wxyz_np(q, v):
@@ -310,17 +332,40 @@ def _quat_rotate_wxyz_np(q, v):
     return v + w * t + np.cross(u, t)
 
 
-def check_barrier_ends_held(dz: float = 0.25) -> Callable:
-    """STRICT lift success (LiftBarrier), single-env / numpy.
+def check_barrier_ends_held(dz: float = 0.25, k: int = _HOLD_FRAMES_K) -> Callable:
+    """GEOMETRIC lift success PER-FRAME predicate C (LiftBarrier), single-env / numpy.
 
-    Mirrors ``LiftBarrierEnv.evaluate`` / ``lift_barrier_success_strict``:
-    returns True iff BOTH grasp ENDS of the barrier have world-z > base_z + ``dz``
-    AND BOTH arms are grasping the barrier. base_z = arm-0 robot base z. The two
-    grasp ends are ``barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]``
-    (barrier.pose.q is wxyz). Replaces the grasp-blind centre check
-    (:func:`check_barrier_lifted`) so a flung / tipped / one-end-up bar no longer
-    passes. (``arm``/``primitive`` are unused -- this is a whole-bar predicate.)
+    Mirrors ``lift_barrier_success_strict`` (the per-frame predicate) and the C used by
+    ``LiftBarrierEnv.evaluate``'s sustained counter. Returns True iff, AT THE FRAME IT
+    IS CALLED:
+      * BOTH grasp ENDS of the barrier have world-z > base_z + ``dz``  AND
+      * BOTH arms' grippers are CLOSED (each arm's last-2 finger-joint qpos sum <
+        ``_GRIPPER_CLOSE_MAX``).
+    base_z = arm-0 robot base z. The two grasp ends are
+    ``barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]`` (barrier.pose.q is
+    wxyz). ``is_grasping`` is DROPPED: the contact-force probe UNRELIABLY registers a
+    real load-bearing grasp on the thin (~0.09 m) bar ends (one arm read False for 25
+    consecutive frames on a genuine clean held lift), so it wrongly rejects genuine
+    held lifts. The gripper-closed check is the robust geometric stand-in.
+    (``arm``/``primitive`` are unused -- this is a whole-bar predicate.)
+
+    WHY SINGLE-FRAME HERE (not a K-consecutive counter): the interpreter calls a
+    primitive's ``success_check`` EXACTLY ONCE, at end-of-primitive (after the lift's
+    last tick -- see ``run_program``), NOT once per frame. A stateful K-consecutive
+    closure called once could only reach count 1 and would FALSE-DROP every genuine
+    lift (poisoning ``all_success`` -> the keep-predicate drops the trajectory). The
+    SUSTAINED guarantee (kills transient single-frame flings) is enforced ONCE, in the
+    AUTHORITATIVE place: the env's batched ``LiftBarrierEnv._lift_hold`` counter, which
+    requires ``HOLD_FRAMES_K`` consecutive frames before ``info['success']`` flips. The
+    keep-predicate already requires env-success, so the sustain is honored regardless
+    of this check; this check is the per-arm liar-label guard ("did the lift actually
+    raise its end while gripping?"), for which the representative end-of-lift frame is
+    the right thing to test. ``k`` is accepted for signature/lock-step parity but is
+    NOT used here (the env owns the counter); it is documented to avoid implying this
+    function sustains on its own.
     """
+    del k  # the env's _lift_hold owns the K-consecutive sustain; see docstring.
+
     def _check(env, arm: int, primitive: Primitive) -> bool:
         u = _unwrap(env)
         p = u.barrier.pose.p
@@ -332,9 +377,10 @@ def check_barrier_ends_held(dz: float = 0.25) -> Callable:
         ends = p[None, :] + _quat_rotate_wxyz_np(q, _BARRIER_END_OFFSETS_NP)  # (2,3)
         base_z = _scalar(u.agent.agents[0].robot.pose.p[0, 2])
         ends_high = bool(np.all(ends[:, 2] > base_z + dz))
-        g0 = bool(np.asarray(_grasp_bool(u.agent.agents[0], u.barrier)).reshape(-1)[0])
-        g1 = bool(np.asarray(_grasp_bool(u.agent.agents[1], u.barrier)).reshape(-1)[0])
-        return ends_high and g0 and g1
+        closed0 = _arm_gripper_closed_np(u.agent.agents[0])
+        closed1 = _arm_gripper_closed_np(u.agent.agents[1])
+        return ends_high and closed0 and closed1
+
     return _check
 
 

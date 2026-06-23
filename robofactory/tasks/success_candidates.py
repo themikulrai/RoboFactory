@@ -10,9 +10,15 @@ Why this lives apart from the task files:
   * ``robofactory/tasks/lift_barrier.py`` -- the OLD LiftBarrier success was
     purely a CENTRE-height check (barrier.z > base.z + 0.15); it was GRASP-BLIND, so
     a barrier flung / tipped past the threshold (no held grasp) counted as a success
-    (a known false-positive source). The strict criterion (now ALSO live in the task
-    ``evaluate()``) requires BOTH grasp ENDS to clear base_z + 0.25 AND BOTH arms to
-    be grasping the barrier. See ``barrier_grasp_ends_world`` for the end geometry.
+    (a known false-positive source). The criterion is now a SUSTAINED GEOMETRIC check:
+    a PER-FRAME condition C = (BOTH grasp ENDS clear base_z + 0.25 AND BOTH arms'
+    grippers closed) that must hold for HOLD_FRAMES_K CONSECUTIVE frames (the env owns
+    the counter). is_grasping is DROPPED: the contact-force probe UNRELIABLY registers
+    a real load-bearing grasp on the thin (~0.09 m) bar ends, wrongly rejecting genuine
+    held lifts. ``lift_barrier_success_strict`` here is the PER-FRAME predicate C; the
+    consecutive-frame count lives in ``LiftBarrierEnv.evaluate``. See
+    ``barrier_grasp_ends_world`` for the end geometry and ``arm_gripper_closed`` for the
+    gripper check.
   * ``robofactory/tasks/three_robots_stack_cube.py:125-165`` -- the TSC
     ``evaluate()`` computes ``is_cubeC_grasped`` from ``self.left_agent`` (arm 0)
     at line 153, but cube C is handled by the MIDDLE arm (arm 2). The fixed
@@ -63,6 +69,15 @@ BARRIER_END_OFFSETS = torch.tensor(
 )
 # strict-success lift threshold above the arm-0 robot base z.
 BARRIER_LIFT_DZ = 0.25
+# Number of CONSECUTIVE frames the per-frame geometric condition must hold for the
+# env's sustained counter to declare success (the env owns the counter; this is the
+# REQUIRED run length). Kills transient flings (single-frame z-teleports) without the
+# fragile contact check.
+HOLD_FRAMES_K = 8
+# A Panda arm's gripper is "closed" when its two finger joints (the LAST 2 entries of
+# that arm's 9-dim qpos = 7 arm + 2 fingers) sum below this. Open ~0.08, closed ~0.00,
+# so a sum < 0.06 means BOTH fingers are well off the open stop (clamping the bar).
+GRIPPER_CLOSE_MAX = 0.06
 
 
 def _quat_rotate_wxyz(q, v):
@@ -97,36 +112,59 @@ def barrier_grasp_ends_world(barrier):
     return p.unsqueeze(-2) + ends_local_rot                # (..., 2, 3)
 
 
+def arm_gripper_closed(agent):
+    """Batched bool: is this arm's gripper CLOSED (finger-sum < GRIPPER_CLOSE_MAX)?
+
+    The Panda arm's qpos is 9-dim (7 arm + 2 fingers); the gripper is "closed" when
+    the LAST 2 entries (the finger joints) sum below ``GRIPPER_CLOSE_MAX`` (open
+    ~0.08 each, closed ~0.00). ``agent.robot.get_qpos()`` is the batched (num_envs,
+    9) tensor (GPU) -- we take the last 2 columns and sum. Returns a (num_envs,) bool
+    tensor (kept batch-safe). This is the GEOMETRIC stand-in for is_grasping, which
+    UNRELIABLY registers a real load-bearing grasp on the thin (~0.09 m) bar ends.
+    """
+    q = torch.as_tensor(agent.robot.get_qpos())     # (..., 9)  (num_envs, 9) on GPU
+    finger_sum = q[..., -2:].sum(dim=-1)             # (...,)  last 2 = finger joints
+    return finger_sum < GRIPPER_CLOSE_MAX
+
+
 def lift_barrier_success_strict(env):
-    """Strict LiftBarrier success: BOTH grasp ends lifted AND held by BOTH arms.
+    """Strict LiftBarrier PER-FRAME geometric predicate (drops is_grasping).
 
-    The NEW criterion (replaces the grasp-blind centre-height check; applied
-    identically in ``LiftBarrierEnv.evaluate`` and in the
-    ``subtask_interpreter.check_barrier_ends_held`` single-env check):
+    This is the SINGLE-FRAME condition that the env's SUSTAINED counter
+    (``LiftBarrierEnv.evaluate`` / ``LiftBarrierEnv._lift_hold``) requires to hold for
+    ``HOLD_FRAMES_K`` consecutive frames before declaring success. The single-frame
+    predicate is:
 
-        success = (BOTH grasp-end world-z > base_z + 0.25)
-                  AND env.agent.agents[0].is_grasping(env.barrier)
-                  AND env.agent.agents[1].is_grasping(env.barrier)
+        C = (BOTH grasp-end world-z > base_z + 0.25)
+            AND arm0 gripper closed (finger-sum < GRIPPER_CLOSE_MAX)
+            AND arm1 gripper closed (finger-sum < GRIPPER_CLOSE_MAX)
 
     where ``base_z = env.agent.agents[0].robot.pose.p[0, 2]`` and the two grasp
     ends are ``barrier.pose.p + R(barrier.pose.q) @ [+/-0.222, 0, 0.074]`` (see
     BARRIER_END_OFFSETS). Both ends must clear the threshold (not the centre), so a
-    flung / tipped / one-end-up bar no longer false-positives.
+    tipped / one-end-up bar fails this frame; the env's HOLD_FRAMES_K counter kills
+    transient flings (single-frame z-teleports) on top.
+
+    WHY no is_grasping: the contact-force ``is_grasping`` UNRELIABLY registers a real
+    load-bearing grasp on the thin (~0.09 m) bar ends (one arm read False for 25
+    consecutive frames on a genuine clean held lift). The gripper-closed geometric
+    check is the robust stand-in.
 
     Args:
         env: a live (possibly wrapped) LiftBarrier env.
 
     Returns:
-        torch.BoolTensor, same batch shape as the env's own success flag.
+        torch.BoolTensor, same batch shape as the env's own success flag (this is the
+        PER-FRAME C, NOT the sustained verdict).
     """
     e = _unwrap(env)
     ends = barrier_grasp_ends_world(e.barrier)               # (..., 2, 3)
     base_z = torch.as_tensor(e.agent.agents[0].robot.pose.p[0, 2])
     ends_z = ends[..., 2]                                    # (..., 2)
     height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (...,) both ends
-    grasp0 = torch.as_tensor(e.agent.agents[0].is_grasping(e.barrier))
-    grasp1 = torch.as_tensor(e.agent.agents[1].is_grasping(e.barrier))
-    return (height_ok & grasp0 & grasp1).bool()
+    closed0 = arm_gripper_closed(e.agent.agents[0])
+    closed1 = arm_gripper_closed(e.agent.agents[1])
+    return (height_ok & closed0 & closed1).bool()
 
 
 # ----------------------------------------------------------------------------

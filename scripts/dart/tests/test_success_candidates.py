@@ -1,14 +1,23 @@
 """PURE tests for robofactory.tasks.success_candidates (no sim / no sapien).
 
 These use tiny FAKE envs that mimic just the attributes the candidate functions
-read (barrier.pose.p, agent.agents[i].is_grasping, cubeA/B/C, goal_region,
-cube_half_size, goal_radius, left/right/middle_agent). They verify:
+read (barrier.pose.p, agent.agents[i].robot.get_qpos() [for the gripper-closed
+check], cubeA/B/C, goal_region, cube_half_size, goal_radius,
+left/right/middle_agent). They verify:
 
-  LiftBarrier strict:
-    * z high but ONE gripper open  -> False
-        (this is the grasp-blind case the OLD height-only check WOULD pass)
-    * both grasping + z high       -> True
-    * both grasping but z low      -> False
+  LiftBarrier (SUSTAINED GEOMETRIC criterion; is_grasping DROPPED):
+    * ``lift_barrier_success_strict`` is the PER-FRAME predicate C:
+        - z high but ONE gripper OPEN (finger-sum >= GRIPPER_CLOSE_MAX) -> False
+            (the grasp-blind case the OLD height-only check WOULD pass)
+        - both grippers CLOSED + both ends z high -> True
+        - both grippers closed but ends z low -> False
+        - a TIPPED bar (one end low) -> False
+    * ``arm_gripper_closed`` reads the LAST 2 qpos (finger joints) and thresholds.
+    * the ENV ``LiftBarrierEnv.evaluate`` SUSTAINED counter: success only after C
+      holds for HOLD_FRAMES_K consecutive env.steps; any break resets the count.
+    * ``subtask_interpreter.check_barrier_ends_held`` is the single-frame predicate
+      (drops is_grasping; the env counter owns the sustain).
+    * is_grasping is NOT called anywhere in the criterion path.
 
   TSC fixed:
     * the cube-C grasp is read from MIDDLE arm (arm 2), NOT left arm (arm 0)
@@ -40,11 +49,19 @@ if _ROOT not in sys.path:
 
 from robofactory.tasks.success_candidates import (  # noqa: E402
     lift_barrier_success_strict,
+    arm_gripper_closed,
     tsc_success_fixed,
     barrier_grasp_ends_world,
     BARRIER_END_OFFSETS,
     BARRIER_LIFT_DZ,
+    GRIPPER_CLOSE_MAX,
+    HOLD_FRAMES_K,
 )
+
+# finger-joint sums (sum over the 2 finger joints) for an OPEN vs CLOSED gripper.
+# open ~0.08 EACH -> sum ~0.16 (>> GRIPPER_CLOSE_MAX); closed ~0.00 -> sum ~0.0.
+_GRIP_OPEN_SUM = 0.16
+_GRIP_CLOSED_SUM = 0.0
 
 
 # ===========================================================================
@@ -64,19 +81,36 @@ class FakeActor:
 
 
 class FakeRobot:
-    def __init__(self, base_z):
+    """A robot exposing pose.p (for base z) and get_qpos() (for the gripper check).
+
+    ``finger_sum`` is the sum of the 2 finger joints; the 9-dim qpos is
+    [7 zeros (arm), finger_sum/2, finger_sum/2] so the LAST 2 entries sum to
+    ``finger_sum`` (matches the Panda layout 7 arm + 2 fingers).
+    """
+    def __init__(self, base_z, finger_sum=_GRIP_OPEN_SUM):
         # pose.p[0, 2] is read for the base z
         self.pose = FakePose((0.0, 0.0, base_z))
+        half = finger_sum / 2.0
+        self._qpos = torch.tensor(
+            [[0.0] * 7 + [half, half]], dtype=torch.float32
+        )  # shape (1, 9)
+
+    def get_qpos(self):
+        return self._qpos
 
 
 class FakeAgent:
-    """An arm. ``grasping`` maps object-identity -> bool returned by is_grasping.
+    """An arm. ``grasping`` maps object-identity -> bool returned by is_grasping
+    (kept only for the TSC tests, which still use is_grasping). ``finger_sum`` sets
+    the gripper-closed reading via robot.get_qpos().
 
     Records every object it was asked about in ``self.queried`` so a test can
-    confirm WHICH arm was used for a given cube.
+    confirm WHICH arm was used for a given cube AND assert is_grasping is NOT used in
+    the LiftBarrier criterion path.
     """
-    def __init__(self, base_z=0.0, grasping=None, name="arm"):
-        self.robot = FakeRobot(base_z)
+    def __init__(self, base_z=0.0, grasping=None, name="arm",
+                 finger_sum=_GRIP_OPEN_SUM):
+        self.robot = FakeRobot(base_z, finger_sum=finger_sum)
         self._grasping = grasping or {}
         self.name = name
         self.queried = []
@@ -99,15 +133,21 @@ class FakeLiftBarrierEnv:
     ``barrier_z`` is the barrier CENTRE z; with the default identity quat the two
     grasp ENDS sit at centre_z + 0.074 (the +z component of [+/-0.222, 0, 0.074]).
     Pass ``barrier_p`` / ``barrier_q`` to place / rotate the barrier exactly.
+    ``closed0`` / ``closed1`` set each arm's gripper-closed state via its finger-sum
+    (closed -> finger-sum ~0.0 < GRIPPER_CLOSE_MAX; open -> ~0.16 >= it).
     """
-    def __init__(self, barrier_z, base_z, grasp0, grasp1,
+    def __init__(self, barrier_z, base_z, closed0, closed1,
                  barrier_p=None, barrier_q=(1.0, 0.0, 0.0, 0.0)):
         p = (0.0, 0.0, barrier_z) if barrier_p is None else tuple(barrier_p)
         self.barrier = FakeActor(p, barrier_q)
         bid = id(self.barrier)
+        fs0 = _GRIP_CLOSED_SUM if closed0 else _GRIP_OPEN_SUM
+        fs1 = _GRIP_CLOSED_SUM if closed1 else _GRIP_OPEN_SUM
+        # grasping={} so any stray is_grasping call returns False AND is recorded in
+        # .queried (the test asserts the criterion path never queries is_grasping).
         self.agent = FakeMultiAgent([
-            FakeAgent(base_z=base_z, grasping={bid: grasp0}, name="arm0"),
-            FakeAgent(base_z=base_z, grasping={bid: grasp1}, name="arm1"),
+            FakeAgent(base_z=base_z, grasping={bid: False}, name="arm0", finger_sum=fs0),
+            FakeAgent(base_z=base_z, grasping={bid: False}, name="arm1", finger_sum=fs1),
         ])
     # candidate reads env.unwrapped or env -> make .unwrapped return self
     @property
@@ -177,8 +217,8 @@ def _b(t):
 
 
 def test_lb_strict_high_but_one_gripper_open_is_false():
-    """ends high (OLD centre check passes) but arm1 NOT grasping -> strict False."""
-    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=False)
+    """ends high (OLD centre check passes) but arm1 gripper OPEN -> per-frame False."""
+    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=False)
     # sanity: the OLD grasp-blind CENTRE-height check WOULD pass here
     old_height = _b(env.barrier.pose.p[..., 2] > env.agent.agents[0].robot.pose.p[0, 2] + 0.15)
     assert old_height is True
@@ -186,46 +226,46 @@ def test_lb_strict_high_but_one_gripper_open_is_false():
 
 
 def test_lb_strict_high_but_other_gripper_open_is_false():
-    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=False, grasp1=True)
+    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=False, closed1=True)
     assert _b(lift_barrier_success_strict(env)) is False
 
 
-def test_lb_strict_both_grasping_and_high_is_true():
-    # centre 0.30 -> ends 0.374 > base+0.25=0.25, both grasping -> True
-    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=True)
+def test_lb_strict_both_closed_and_high_is_true():
+    # centre 0.30 -> ends 0.374 > base+0.25=0.25, both grippers closed -> True
+    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=True)
     assert _b(lift_barrier_success_strict(env)) is True
 
 
-def test_lb_strict_both_grasping_but_low_is_false():
-    """Both grasping but ends not lifted past base+0.25 -> False."""
+def test_lb_strict_both_closed_but_low_is_false():
+    """Both grippers closed but ends not lifted past base+0.25 -> False."""
     # centre 0.10 -> ends 0.174, < 0.25 -> False
-    env = FakeLiftBarrierEnv(barrier_z=0.10, base_z=0.0, grasp0=True, grasp1=True)
+    env = FakeLiftBarrierEnv(barrier_z=0.10, base_z=0.0, closed0=True, closed1=True)
     assert _b(lift_barrier_success_strict(env)) is False
 
 
 def test_lb_strict_respects_base_offset():
     """Threshold is base_z + 0.25, not absolute 0.25 (ends = centre + 0.074)."""
     # centre 0.20, base 0.10 -> ends 0.274; 0.274 > 0.10+0.25=0.35 is False
-    env = FakeLiftBarrierEnv(barrier_z=0.20, base_z=0.10, grasp0=True, grasp1=True)
+    env = FakeLiftBarrierEnv(barrier_z=0.20, base_z=0.10, closed0=True, closed1=True)
     assert _b(lift_barrier_success_strict(env)) is False
     # centre 0.30, base 0.10 -> ends 0.374 > 0.35 True
-    env2 = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.10, grasp0=True, grasp1=True)
+    env2 = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.10, closed0=True, closed1=True)
     assert _b(lift_barrier_success_strict(env2)) is True
 
 
 def test_lb_strict_tipped_bar_one_end_low_is_false():
-    """A TIPPED bar (one end high, other end low) must FAIL even though both arms
-    grasp and the CENTRE is above threshold -- this is the flung/tipped false-
+    """A TIPPED bar (one end high, other end low) must FAIL even though both
+    grippers are closed and the CENTRE is above threshold -- the flung/tipped false-
     positive the both-ends criterion closes.
 
-    Barrier rotated ~90deg about local-y (pitch) so the long axis (local-X) points
+    Barrier rotated ~80deg about local-y (pitch) so the long axis (local-X) points
     mostly along world-z: +x end goes up, -x end goes down. Centre placed high.
     """
     import transforms3d as t3d
     # 80deg pitch about y: +x end -> +z (up), -x end -> -z (down).
     q = t3d.quaternions.mat2quat(t3d.euler.euler2mat(0.0, np.deg2rad(80.0), 0.0))
     env = FakeLiftBarrierEnv(
-        barrier_z=0.0, base_z=0.0, grasp0=True, grasp1=True,
+        barrier_z=0.0, base_z=0.0, closed0=True, closed1=True,
         barrier_p=(0.0, 0.0, 0.30), barrier_q=tuple(q.tolist()),
     )
     # one end is well below base+0.25 -> .all() over ends is False
@@ -237,8 +277,203 @@ def test_lb_strict_accepts_wrapped_env():
     class Wrapper:
         def __init__(self, inner):
             self.unwrapped = inner
-    inner = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, grasp0=True, grasp1=True)
+    inner = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=True)
     assert _b(lift_barrier_success_strict(Wrapper(inner))) is True
+
+
+def test_lb_strict_does_not_call_is_grasping():
+    """The criterion path must NOT consult is_grasping (it was DROPPED as unreliable
+    on the thin bar ends). Drive a clean held lift and assert neither arm's
+    is_grasping was queried about the barrier."""
+    env = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=True)
+    _ = lift_barrier_success_strict(env)
+    bid = id(env.barrier)
+    assert bid not in env.agent.agents[0].queried, "arm0 is_grasping was wrongly used"
+    assert bid not in env.agent.agents[1].queried, "arm1 is_grasping was wrongly used"
+    # and nothing at all was queried (no is_grasping call of any kind)
+    assert env.agent.agents[0].queried == []
+    assert env.agent.agents[1].queried == []
+
+
+# ===========================================================================
+# arm_gripper_closed: the LAST 2 qpos (finger joints) summed vs GRIPPER_CLOSE_MAX
+# ===========================================================================
+def test_constants_are_as_specified():
+    assert HOLD_FRAMES_K == 8
+    assert GRIPPER_CLOSE_MAX == 0.06
+    assert BARRIER_LIFT_DZ == 0.25
+
+
+def test_arm_gripper_closed_reads_last_two_qpos():
+    """finger-sum below GRIPPER_CLOSE_MAX -> closed; above -> open. The 7 arm joints
+    (whatever their values) must NOT affect the verdict."""
+    # closed: fingers sum 0.0
+    closed_arm = FakeAgent(finger_sum=_GRIP_CLOSED_SUM)
+    assert _b(arm_gripper_closed(closed_arm)) is True
+    # open: fingers sum 0.16
+    open_arm = FakeAgent(finger_sum=_GRIP_OPEN_SUM)
+    assert _b(arm_gripper_closed(open_arm)) is False
+    # exactly at threshold sum 0.06 is NOT < 0.06 -> open (strict <)
+    at_thresh = FakeAgent(finger_sum=0.06)
+    assert _b(arm_gripper_closed(at_thresh)) is False
+    # just under threshold -> closed
+    under = FakeAgent(finger_sum=0.0599)
+    assert _b(arm_gripper_closed(under)) is True
+
+
+def test_arm_gripper_closed_ignores_arm_joints():
+    """Large arm-joint values must not be mistaken for finger joints."""
+    arm = FakeAgent(finger_sum=_GRIP_CLOSED_SUM)
+    # overwrite the 7 arm joints with big numbers; fingers (last 2) still ~0.0
+    arm.robot._qpos = torch.tensor([[1.0] * 7 + [0.0, 0.0]], dtype=torch.float32)
+    assert _b(arm_gripper_closed(arm)) is True
+
+
+# ===========================================================================
+# ENV-LEVEL SUSTAINED COUNTER: LiftBarrierEnv.evaluate (logic only, no sim).
+# We drive a lightweight stand-in that reuses the REAL evaluate() bound method so
+# the counter maintenance / reset is exercised exactly as in the task, without
+# gym.make. The counter logic is pure torch (no sapien), so it runs on the login node.
+# ===========================================================================
+class _EvalEnv(FakeLiftBarrierEnv):
+    """FakeLiftBarrierEnv + the REAL LiftBarrierEnv.evaluate bound to it, plus the
+    minimal state evaluate touches (num_envs, _lift_hold). Mutators let a test march
+    the per-frame condition C across env.steps."""
+
+    def __init__(self):
+        super().__init__(barrier_z=0.30, base_z=0.0, closed0=True, closed1=True)
+        self.num_envs = 1
+        self._lift_hold = torch.zeros(self.num_envs, dtype=torch.long)
+        from robofactory.tasks.lift_barrier import LiftBarrierEnv
+        self._evaluate_impl = LiftBarrierEnv.evaluate
+
+    def set_condition(self, c: bool):
+        """Make the per-frame C True/False: True = both ends high + both closed."""
+        if c:
+            self.barrier.pose.p = torch.tensor([[0.0, 0.0, 0.30]], dtype=torch.float32)
+            for a in self.agent.agents:
+                a.robot._qpos = torch.tensor(
+                    [[0.0] * 7 + [_GRIP_CLOSED_SUM / 2] * 2], dtype=torch.float32)
+        else:
+            # drop the bar low (ends below threshold) -> C False
+            self.barrier.pose.p = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+    def evaluate(self):
+        return self._evaluate_impl(self)
+
+
+def _succ(env):
+    out = env.evaluate()["success"]
+    return bool(out.reshape(-1)[0])
+
+
+def test_env_sustained_success_only_after_K_consecutive_frames():
+    """The env declares success ONLY once C has held for HOLD_FRAMES_K consecutive
+    env.steps -- not on the first frame C is True."""
+    env = _EvalEnv()
+    env.set_condition(True)
+    for frame in range(1, HOLD_FRAMES_K):
+        assert _succ(env) is False, f"frame {frame}: success before K frames"
+    # the K-th consecutive True frame flips success on
+    assert _succ(env) is True
+    # and it stays True while C persists
+    assert _succ(env) is True
+
+
+def test_env_sustained_resets_on_gap():
+    """A single False frame (C breaks) RESETS the counter; success requires another
+    full K-consecutive run afterwards (kills transient single-frame flings)."""
+    env = _EvalEnv()
+    env.set_condition(True)
+    for _ in range(HOLD_FRAMES_K - 1):     # K-1 True frames (not yet success)
+        assert _succ(env) is False
+    # one False frame breaks the run -> counter resets to 0
+    env.set_condition(False)
+    assert _succ(env) is False
+    # back to True: must accumulate K MORE consecutive frames from scratch
+    env.set_condition(True)
+    for frame in range(1, HOLD_FRAMES_K):
+        assert _succ(env) is False, f"post-gap frame {frame} succeeded too early"
+    assert _succ(env) is True
+
+
+def test_env_sustained_grippers_open_never_succeeds():
+    """Ends high for many frames but a gripper OPEN the whole time -> never success
+    (the counter never increments because C is always False)."""
+    env = _EvalEnv()
+    # ends high but arm1 gripper OPEN every frame
+    env.barrier.pose.p = torch.tensor([[0.0, 0.0, 0.30]], dtype=torch.float32)
+    env.agent.agents[0].robot._qpos = torch.tensor(
+        [[0.0] * 7 + [_GRIP_CLOSED_SUM / 2] * 2], dtype=torch.float32)
+    env.agent.agents[1].robot._qpos = torch.tensor(
+        [[0.0] * 7 + [_GRIP_OPEN_SUM / 2] * 2], dtype=torch.float32)
+    for _ in range(HOLD_FRAMES_K + 5):
+        assert _succ(env) is False
+
+
+def test_env_sustained_ends_low_never_succeeds():
+    """Both grippers closed but ends never clear base+0.25 -> never success."""
+    env = _EvalEnv()
+    # centre 0.10 -> ends 0.174 < 0.25; both grippers closed
+    env.barrier.pose.p = torch.tensor([[0.0, 0.0, 0.10]], dtype=torch.float32)
+    for a in env.agent.agents:
+        a.robot._qpos = torch.tensor([[0.0] * 7 + [0.0, 0.0]], dtype=torch.float32)
+    for _ in range(HOLD_FRAMES_K + 5):
+        assert _succ(env) is False
+
+
+def test_env_evaluate_returns_batch_shaped_bool():
+    """success shape matches the per-env batch (num_envs,)."""
+    env = _EvalEnv()
+    env.set_condition(True)
+    out = env.evaluate()["success"]
+    assert tuple(out.shape) == (1,)
+    assert out.dtype == torch.bool
+
+
+# ===========================================================================
+# INTERPRETER single-frame check_barrier_ends_held (drops is_grasping)
+# ===========================================================================
+def test_interpreter_check_is_single_frame_geometric():
+    """subtask_interpreter.check_barrier_ends_held is the SINGLE-FRAME predicate:
+    True iff both ends high AND both grippers closed AT the call. It must NOT need K
+    calls (the env counter owns the sustain) and must NOT call is_grasping."""
+    from robofactory.planner.subtask_interpreter import check_barrier_ends_held
+    chk = check_barrier_ends_held(dz=0.25)
+    env_ok = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=True)
+    # passes on a SINGLE call (not after K) -> stateless single-frame predicate
+    assert chk(env_ok, 0, None) is True
+    # is_grasping was never consulted
+    assert env_ok.agent.agents[0].queried == []
+    assert env_ok.agent.agents[1].queried == []
+    # gripper open -> False
+    env_open = FakeLiftBarrierEnv(barrier_z=0.30, base_z=0.0, closed0=True, closed1=False)
+    assert check_barrier_ends_held(dz=0.25)(env_open, 0, None) is False
+    # ends low -> False
+    env_low = FakeLiftBarrierEnv(barrier_z=0.10, base_z=0.0, closed0=True, closed1=True)
+    assert check_barrier_ends_held(dz=0.25)(env_low, 0, None) is False
+
+
+def test_interpreter_check_matches_candidate_predicate():
+    """The interpreter single-frame check and the candidate per-frame predicate must
+    AGREE on the same hand-computed cases (lock-step across the two code paths)."""
+    from robofactory.planner.subtask_interpreter import check_barrier_ends_held
+    cases = [
+        # (barrier_z, closed0, closed1, expected)
+        (0.30, True, True, True),
+        (0.30, True, False, False),
+        (0.30, False, True, False),
+        (0.10, True, True, False),
+        (0.10, False, False, False),
+    ]
+    for bz, c0, c1, exp in cases:
+        env = FakeLiftBarrierEnv(barrier_z=bz, base_z=0.0, closed0=c0, closed1=c1)
+        cand = _b(lift_barrier_success_strict(env))
+        env2 = FakeLiftBarrierEnv(barrier_z=bz, base_z=0.0, closed0=c0, closed1=c1)
+        interp = check_barrier_ends_held(dz=0.25)(env2, 0, None)
+        assert cand is exp, (bz, c0, c1, "candidate")
+        assert interp is exp, (bz, c0, c1, "interpreter")
+        assert cand == interp, (bz, c0, c1, "candidate vs interpreter disagree")
 
 
 # ===========================================================================
