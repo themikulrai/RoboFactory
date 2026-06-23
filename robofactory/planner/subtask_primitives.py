@@ -322,19 +322,37 @@ def place(
     )
 
 
-def _tcp_world_xyz(env, arm: int) -> np.ndarray:
-    """Read the arm's CURRENT tcp world position (xyz) from the live env.
+def _to_np_single(x) -> np.ndarray:
+    """torch/tensor (possibly batched (1,k)) -> flat float32 numpy for ONE env."""
+    x = x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 2:  # batched (n_envs, k) -> take the single env
+        x = x[0]
+    return x.reshape(-1)
 
-    Reads ``env.unwrapped.agent.agents[arm].tcp.pose.p`` and returns a length-3
-    float32 xyz. Off-GPU fakes may expose a plain numpy ``.p``; GPU tensors are
-    moved to numpy. Used by ``retreat_up`` to plan a straight-up move from where
-    the tcp ACTUALLY is right now (the cube was just released, so we do NOT
-    re-resolve a grasp pose).
+
+def _tcp_world_pose(env, arm: int):
+    """Read the arm's CURRENT tcp world pose (xyz, quat-wxyz) from the live env.
+
+    Reads ``env.unwrapped.agent.agents[arm].tcp.pose`` and returns
+    ``(p3, q4)`` as flat float32 numpy: position ``p`` (len 3) and the orientation
+    quaternion ``q`` in sapien's wxyz convention (len 4). Off-GPU fakes may expose
+    plain numpy ``.p``/``.q``; GPU tensors are moved to numpy and the single env's
+    value is taken. Used by ``retreat_up`` to plan a straight-up move that PRESERVES
+    the current orientation from where the tcp ACTUALLY is right now (the cube was
+    just released, so we do NOT re-resolve a grasp pose).
     """
     u = env.unwrapped if hasattr(env, "unwrapped") else env
-    p = u.agent.agents[arm].tcp.pose.p
-    p = p.detach().cpu().numpy() if hasattr(p, "detach") else np.asarray(p)
-    return np.asarray(p).reshape(-1)[:3].astype(np.float32)
+    pose = u.agent.agents[arm].tcp.pose
+    p = _to_np_single(pose.p)[:3]
+    q = _to_np_single(pose.q)[:4]
+    return p, q
+
+
+def _tcp_world_xyz(env, arm: int) -> np.ndarray:
+    """Back-compat: just the tcp world xyz (len-3 float32)."""
+    p, _ = _tcp_world_pose(env, arm)
+    return p
 
 
 def retreat_up(
@@ -347,21 +365,22 @@ def retreat_up(
     the arm has just OPENED its gripper and released the cube, so we do NOT
     re-resolve a cube grasp pose. Instead we read the LIVE tcp world pose
     (``env.unwrapped.agent.agents[arm].tcp.pose``), build a target = current xyz +
-    [0, 0, dz] (keeping the current orientation, identity-quat for the screw plan),
-    and per-arm ``dry_run`` plan to it. ``grip`` defaults OPEN (gripper stays
-    released as the arm clears the stacking region). Labelled ``LIFT`` (it is a
-    raise/clear motion) with target_id 0; ``target_pose`` stores the raised xyz so
-    an optional check can confirm the arm rose (target z > start z).
+    [0, 0, dz] while PRESERVING the current tcp orientation (quaternion). This is a
+    PURE vertical translation: using an identity quaternion here would force the
+    screw planner to also REORIENT the (downward-pointing) gripper to neutral,
+    producing a pathological ~567-step reorient path that blows the step budget and
+    stalls the serial TSC stack. Per-arm ``dry_run`` plan to the target. ``grip``
+    defaults OPEN (gripper stays released as the arm clears the stacking region).
+    Labelled ``LIFT`` (it is a raise/clear motion) with target_id 0; ``target_pose``
+    stores the raised xyz so an optional check can confirm the arm rose (z > start z).
     """
-    start_xyz = _tcp_world_xyz(env, arm)
+    start_xyz, q = _tcp_world_pose(env, arm)
     target_xyz = start_xyz.copy()
     target_xyz[2] += float(dz)
-    # Pose = xyz + identity quat (wxyz). The screw planner solves IK to the xyz;
-    # we keep a neutral orientation since the arm just released and is clearing up.
-    pose = np.array(
-        [target_xyz[0], target_xyz[1], target_xyz[2], 1.0, 0.0, 0.0, 0.0],
-        dtype=np.float32,
-    )
+    # Pose = (raised xyz, CURRENT tcp quaternion wxyz). Preserving the orientation
+    # makes this a pure vertical translation; the grasp/lift builders pass resolved
+    # 7-vecs the same way (xyz then quat), so the quaternion convention matches.
+    pose = np.concatenate([target_xyz[:3], q[:4]]).astype(np.float32)
     waypoints = _plan_to_pose(planner, arm, pose)
     ticks = _ticks_from_waypoints(waypoints, grip)
     text = vocab.render(vocab.LIFT, 0, task)

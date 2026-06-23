@@ -68,18 +68,25 @@ class FakeActor:
         self.z = z
 
 
+# Down-pointing tcp orientation (wxyz, NON-identity) after a place. retreat_up must
+# PRESERVE this quaternion (a pure vertical translation); an identity quat would
+# force a large reorient (~567-step path) and stall the serial stack.
+_DOWN_Q = np.array([0.0, 1.0, 0.0, 0.0], np.float32)
+
+
 class _FakePose:
-    def __init__(self, xyz):
+    def __init__(self, xyz, q=_DOWN_Q):
         self.p = np.asarray(xyz, np.float32)
+        self.q = np.asarray(q, np.float32)
 
 
 class _FakeTcp:
-    def __init__(self, xyz):
-        self.pose = _FakePose(xyz)
+    def __init__(self, xyz, q=_DOWN_Q):
+        self.pose = _FakePose(xyz, q)
 
 
 class _FakeAgent:
-    """Per-arm agent exposing tcp.pose.p (read by retreat_up)."""
+    """Per-arm agent exposing tcp.pose.p and tcp.pose.q (read by retreat_up)."""
     def __init__(self, arm):
         # distinct tcp z per arm so retreat target z = start z + dz is checkable.
         self.tcp = _FakeTcp([0.1 * arm, 0.0, 0.4 + 0.05 * arm])
@@ -180,6 +187,12 @@ def test_retreat_up_plans_straight_up():
         # xy held (straight up): planned xy == start xy
         assert pytest.approx(pl.last_dry_run_pose[0], abs=1e-5) == \
             float(env.agent.agents[arm].tcp.pose.p[0])
+        # orientation PRESERVED: planned quat == current tcp quat (NOT identity)
+        cur_q = np.asarray(env.agent.agents[arm].tcp.pose.q, np.float32).reshape(-1)[:4]
+        np.testing.assert_allclose(pl.last_dry_run_pose.reshape(-1)[3:7], cur_q, atol=1e-6)
+        assert not np.allclose(pl.last_dry_run_pose.reshape(-1)[3:7],
+                               np.array([1.0, 0.0, 0.0, 0.0], np.float32)), \
+            "retreat_up must NOT use an identity quaternion (the ~567-step reorient bug)"
         # gripper OPEN (cube released)
         assert all(g == OPEN for _, g in prim.ticks)
 
