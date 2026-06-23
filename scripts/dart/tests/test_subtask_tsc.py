@@ -169,32 +169,82 @@ def test_render_tsc_strings():
 
 
 # ===========================================================================
-# PURE: the retreat_up primitive plans STRAIGHT UP from the live tcp pose
+# PURE: the TSC retreat targets the arm's PARKED pose (grasp+0.5), NOT current+up
 # ===========================================================================
-def test_retreat_up_plans_straight_up():
+def _grasp_pose(pl, arm):
+    """The arm's OWN cube grasp pose as the FakePlanner resolves it (OBB)."""
+    return pl.get_grasp_pose_from_obb(None, arm).reshape(-1).astype(np.float32)
+
+
+def test_retreat_targets_parked_grasp_pose_plus_dz():
+    """The TSC retreat (last primitive) plans to the arm's OWN cube grasp pose
+    (its parked side, captured at PICK) RAISED by park_dz — the SAME high pose the
+    lift reached — NOT "current tcp + dz". This is the original solver's
+    move-back-to-grasp_pose+0.5 retreat (known-reachable, out of the central goal).
+
+    We build a full program so the approach recipe runs first and CAPTURES the grasp
+    pose into the shared ``parked`` dict; the retreat then reuses it. xy of the
+    planned retreat pose == the arm's grasp xy (its own cube side), z == grasp z +
+    park_dz, orientation == the grasp orientation (full 7-vec)."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
     pl, env = _fakes()
+    prog = spec.build(pl, env)
     for arm in (0, 1, 2):
-        start_z = float(env.agent.agents[arm].tcp.pose.p[2])
-        prim = P.retreat_up(pl, env, arm=arm, task="ThreeRobotsStackCube", dz=0.5,
-                            grip=OPEN)
+        # run the approach FIRST (this is what captures parked[arm]).
+        prog[arm][0].recipe(pl, env, arm)
+        grasp = _grasp_pose(pl, arm)
+        prim = prog[arm][-1].recipe(pl, env, arm)  # the retreat (last primitive)
         # labelled LIFT (a raise/clear motion), target_id 0, named retreat_up
         assert prim.verb_id == vocab.LIFT
         assert prim.target_id == 0
         assert prim.name.startswith("retreat_up")
-        # planned pose z = tcp z + dz, and the stored target_pose z > start z
-        assert pytest.approx(pl.last_dry_run_pose[2], abs=1e-5) == start_z + 0.5
-        assert float(prim.target_pose[2]) > start_z
-        # xy held (straight up): planned xy == start xy
-        assert pytest.approx(pl.last_dry_run_pose[0], abs=1e-5) == \
-            float(env.agent.agents[arm].tcp.pose.p[0])
-        # orientation PRESERVED: planned quat == current tcp quat (NOT identity)
-        cur_q = np.asarray(env.agent.agents[arm].tcp.pose.q, np.float32).reshape(-1)[:4]
-        np.testing.assert_allclose(pl.last_dry_run_pose.reshape(-1)[3:7], cur_q, atol=1e-6)
-        assert not np.allclose(pl.last_dry_run_pose.reshape(-1)[3:7],
-                               np.array([1.0, 0.0, 0.0, 0.0], np.float32)), \
-            "retreat_up must NOT use an identity quaternion (the ~567-step reorient bug)"
+        planned = pl.last_dry_run_pose.reshape(-1)
+        # xy == the arm's grasp xy (its OWN cube side), NOT the placed/current xy
+        assert pytest.approx(planned[0], abs=1e-6) == float(grasp[0])
+        assert pytest.approx(planned[1], abs=1e-6) == float(grasp[1])
+        # z == grasp z + park_dz (the parked high pose the lift reached)
+        assert pytest.approx(planned[2], abs=1e-6) == float(grasp[2]) + STSC.TSC_LIFT_DZ
+        # full grasp ORIENTATION carried through (so the quaternion is right)
+        np.testing.assert_allclose(planned[3:7], grasp[3:7], atol=1e-6)
+        assert float(prim.target_pose[2]) == pytest.approx(float(grasp[2]) + STSC.TSC_LIFT_DZ)
         # gripper OPEN (cube released)
         assert all(g == OPEN for _, g in prim.ticks)
+
+
+def test_approach_captures_parked_and_lift_retreat_reuse_it():
+    """The approach recipe CAPTURES the arm's grasp pose into a shared per-arm dict;
+    the lift and the retreat both target that SAME captured pose + park_dz (so they
+    agree). We verify by perturbing the planner's resolved grasp pose AFTER approach
+    runs: the lift/retreat must still use the CAPTURED (pre-perturbation) value,
+    proving they reuse the captured copy rather than re-resolving live."""
+    spec = next(m for m in STSC.sample(7) if m.name == "simultaneous_pick")
+    pl, env = _fakes()
+    prog = spec.build(pl, env)
+    arm = 1
+    grasp = _grasp_pose(pl, arm)  # the value at approach time
+
+    # approach captures parked[arm].
+    prog[arm][0].recipe(pl, env, arm)
+
+    # Now MOVE the cube: make the planner resolve a different grasp pose. If the
+    # lift/retreat re-resolved live they'd pick this up; if they use the captured
+    # copy they ignore it.
+    moved = grasp.copy()
+    moved[0] += 5.0  # large xy shift
+    pl.get_grasp_pose_from_obb = lambda actor, agent_id=0, _m=moved: _m.copy()
+
+    # lift (index 2 for a raising arm) -> uses captured grasp xy, z = grasp z + dz
+    lift_prim = prog[arm][2].recipe(pl, env, arm)
+    assert lift_prim.verb_id == vocab.LIFT
+    lift_planned = pl.last_dry_run_pose.reshape(-1)
+    assert pytest.approx(lift_planned[0], abs=1e-6) == float(grasp[0])  # captured, NOT moved
+    assert pytest.approx(lift_planned[2], abs=1e-6) == float(grasp[2]) + STSC.TSC_LIFT_DZ
+
+    # retreat (last) -> SAME captured target as the lift
+    retreat_prim = prog[arm][-1].recipe(pl, env, arm)
+    retreat_planned = pl.last_dry_run_pose.reshape(-1)
+    assert pytest.approx(retreat_planned[0], abs=1e-6) == float(grasp[0])
+    np.testing.assert_allclose(retreat_planned[:3], lift_planned[:3], atol=1e-6)
 
 
 # ===========================================================================

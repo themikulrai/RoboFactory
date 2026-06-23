@@ -322,73 +322,35 @@ def place(
     )
 
 
-def _to_np_single(x) -> np.ndarray:
-    """torch/tensor (possibly batched (1,k)) -> flat float32 numpy for ONE env."""
-    x = x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
-    x = np.asarray(x, dtype=np.float32)
-    if x.ndim == 2:  # batched (n_envs, k) -> take the single env
-        x = x[0]
-    return x.reshape(-1)
-
-
-def _tcp_world_pose(env, arm: int):
-    """Read the arm's CURRENT tcp world pose (xyz, quat-wxyz) from the live env.
-
-    Reads ``env.unwrapped.agent.agents[arm].tcp.pose`` and returns
-    ``(p3, q4)`` as flat float32 numpy: position ``p`` (len 3) and the orientation
-    quaternion ``q`` in sapien's wxyz convention (len 4). Off-GPU fakes may expose
-    plain numpy ``.p``/``.q``; GPU tensors are moved to numpy and the single env's
-    value is taken. Used by ``retreat_up`` to plan a straight-up move that PRESERVES
-    the current orientation from where the tcp ACTUALLY is right now (the cube was
-    just released, so we do NOT re-resolve a grasp pose).
-    """
-    u = env.unwrapped if hasattr(env, "unwrapped") else env
-    pose = u.agent.agents[arm].tcp.pose
-    p = _to_np_single(pose.p)[:3]
-    q = _to_np_single(pose.q)[:4]
-    return p, q
-
-
-def _tcp_world_xyz(env, arm: int) -> np.ndarray:
-    """Back-compat: just the tcp world xyz (len-3 float32)."""
-    p, _ = _tcp_world_pose(env, arm)
-    return p
-
-
-def retreat_up(
-    planner, env, arm: int, task: str, dz: float = 0.5,
-    grip: float = OPEN, success_check: Optional[Callable] = None,
+def move_to_pose(
+    planner, env, arm: int, target_pose, task: str,
+    grip: float = OPEN, verb: int = vocab.LIFT, target_id: int = 0,
+    name: Optional[str] = None, success_check: Optional[Callable] = None,
 ) -> Primitive:
-    """Retreat: plan a STRAIGHT-UP move from the arm's CURRENT tcp pose by ``dz``.
+    """Plan a per-arm move to a GIVEN 7-vec ``target_pose`` (xyz + quat-wxyz).
 
-    Mirrors the canonical solver's "move back up to grasp_pose+0.5" after a place:
-    the arm has just OPENED its gripper and released the cube, so we do NOT
-    re-resolve a cube grasp pose. Instead we read the LIVE tcp world pose
-    (``env.unwrapped.agent.agents[arm].tcp.pose``), build a target = current xyz +
-    [0, 0, dz] while PRESERVING the current tcp orientation (quaternion). This is a
-    PURE vertical translation: using an identity quaternion here would force the
-    screw planner to also REORIENT the (downward-pointing) gripper to neutral,
-    producing a pathological ~567-step reorient path that blows the step budget and
-    stalls the serial TSC stack. Per-arm ``dry_run`` plan to the target. ``grip``
-    defaults OPEN (gripper stays released as the arm clears the stacking region).
-    Labelled ``LIFT`` (it is a raise/clear motion) with target_id 0; ``target_pose``
-    stores the raised xyz so an optional check can confirm the arm rose (z > start z).
+    The general "go to this known pose" primitive: it does NOT re-resolve any actor
+    pose, it plans straight to the caller-supplied 7-vec via ``_plan_to_pose``. The
+    TSC retreat uses this to drive the arm back to its PARKED pose (its own cube
+    grasp pose + park_dz, captured at PICK time) — exactly what the original solver
+    does (``move_to_pose_with_screw(grasp_pose, move_id)`` where grasp_pose[2] was
+    raised +0.5 during the lift). Because the target is a KNOWN-REACHABLE pose the
+    arm already visited during its lift, the screw plan is a short reverse path that
+    leaves the arm OVER its own cube side (out of the central stacking region),
+    instead of the pathological ~567-step "current tcp + dz" reorient that stalled
+    the serial stack. ``grip`` defaults OPEN (cube released before the retreat).
+    Labelled ``verb`` (default LIFT, a raise/clear motion); ``target_pose`` stores
+    the planned xyz so an optional check can confirm the arm reached it.
     """
-    start_xyz, q = _tcp_world_pose(env, arm)
-    target_xyz = start_xyz.copy()
-    target_xyz[2] += float(dz)
-    # Pose = (raised xyz, CURRENT tcp quaternion wxyz). Preserving the orientation
-    # makes this a pure vertical translation; the grasp/lift builders pass resolved
-    # 7-vecs the same way (xyz then quat), so the quaternion convention matches.
-    pose = np.concatenate([target_xyz[:3], q[:4]]).astype(np.float32)
+    pose = np.asarray(target_pose, dtype=np.float32).reshape(-1)
     waypoints = _plan_to_pose(planner, arm, pose)
     ticks = _ticks_from_waypoints(waypoints, grip)
-    text = vocab.render(vocab.LIFT, 0, task)
+    text = vocab.render(verb, target_id, task)
     return Primitive(
-        verb_id=vocab.LIFT, target_id=0, text=text, ticks=ticks,
+        verb_id=verb, target_id=target_id, text=text, ticks=ticks,
         task=task, success_check=success_check,
-        name=f"retreat_up(arm{arm})",
-        target_pose=target_xyz.reshape(-1)[:3].copy(),
+        name=name if name is not None else f"move_to_pose(arm{arm})",
+        target_pose=pose[:3].copy(),
     )
 
 

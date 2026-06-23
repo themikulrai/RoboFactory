@@ -145,16 +145,41 @@ def _color_of_cube(cube: str) -> str:
 # calls it JIT at primitive entry so it plans from the LIVE pose.
 
 
-def _approach_qp(color: str, *, grip: float = P.OPEN,
+def _approach_qp(color: str, parked: Dict[int, np.ndarray], *, grip: float = P.OPEN,
                  success_tol: float = 0.08, wait_for=None) -> QueuedRecipe:
-    """approach the cube of ``color`` (OBB grasp pose). success_check = TCP near."""
+    """approach the cube of ``color`` (OBB grasp pose). success_check = TCP near.
+
+    CAPTURE side effect: the approach runs FIRST (cube still at its original
+    location), so it resolves the arm's OWN cube grasp pose and stores a COPY in
+    ``parked[arm]``. The lift and the retreat both reuse this captured pose (raised
+    by park_dz) so they agree on a KNOWN-REACHABLE target on the arm's own side,
+    mirroring the original solver capturing ``grasp_poseA`` once at pick time."""
     tid = _COLOR_TID[color]
 
     def recipe(planner, env, arm: int) -> P.Primitive:
+        u = env.unwrapped if hasattr(env, "unwrapped") else env
+        # Capture the arm's OWN cube grasp pose ONCE, before the cube moves.
+        parked[arm] = np.asarray(
+            P.resolve_cube_grasp_pose(planner, u, arm, color), dtype=np.float32
+        ).reshape(-1).copy()
         sc = check_tcp_near(tol=success_tol)
         return P.approach(planner, env, arm=arm, target_id=tid, task=TSC,
                           grip=grip, success_check=sc)
     return QueuedRecipe(recipe, wait_for=wait_for)
+
+
+def _parked_base(parked: Dict[int, np.ndarray], planner, env, arm: int,
+                 color: str) -> np.ndarray:
+    """The arm's PARKED base grasp pose: the COPY captured at approach if present,
+    else resolved live (so a recipe probed in isolation — e.g. a pure unit test that
+    calls the lift/retreat recipe without first running approach — still gets the
+    arm's own cube grasp pose). In a real rollout approach ALWAYS runs first, so the
+    captured copy (cube at its ORIGINAL location) is the one used."""
+    base = parked.get(arm)
+    if base is None:
+        u = env.unwrapped if hasattr(env, "unwrapped") else env
+        base = P.resolve_cube_grasp_pose(planner, u, arm, color)
+    return np.asarray(base, dtype=np.float32).reshape(-1).copy()
 
 
 def _close_qp(*, wait_for=None) -> QueuedRecipe:
@@ -166,14 +191,21 @@ def _close_qp(*, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _lift_qp(color: str, *, dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
+def _lift_qp(color: str, parked: Dict[int, np.ndarray], *,
+             dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
     # NO success_check: env stack-success is the real gate, and a per-cube height
     # check would need the cube's base z which the sampler does not know off-GPU.
+    # Targets the CAPTURED parked pose (the arm's own grasp pose from approach)
+    # raised by dz, so lift and retreat agree on the SAME known-reachable target.
     tid = _COLOR_TID[color]
 
     def recipe(planner, env, arm: int) -> P.Primitive:
-        return P.lift(planner, env, arm=arm, target_id=tid, task=TSC, dz=dz,
-                      grip=P.CLOSED, success_check=None)
+        target = _parked_base(parked, planner, env, arm, color)
+        target[2] += float(dz)
+        return P.move_to_pose(planner, env, arm=arm, target_pose=target, task=TSC,
+                              grip=P.CLOSED, verb=vocab.LIFT, target_id=tid,
+                              name=f"lift({vocab.target_name(TSC, tid)})",
+                              success_check=None)
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
@@ -201,14 +233,26 @@ def _open_qp(*, wait_for=None) -> QueuedRecipe:
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
-def _retreat_qp(*, dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
-    """retreat the arm STRAIGHT UP out of the stacking region after a place+open.
+def _retreat_qp(color: str, parked: Dict[int, np.ndarray], *,
+                dz: float = TSC_LIFT_DZ, wait_for=None) -> QueuedRecipe:
+    """retreat the arm back to its PARKED pose after a place+open.
 
-    Mirrors the original solver's move-back-to-grasp_pose+0.5. Gripper OPEN (the
-    cube was just released). Plans from the LIVE tcp pose (no grasp re-resolve)."""
+    EXACTLY the original solver's "move back to grasp_pose+0.5": the target is the
+    arm's OWN cube grasp pose (captured at approach in ``parked[arm]``) raised by
+    park_dz — the SAME high pose the lift reached. This is a KNOWN-REACHABLE target
+    that the arm just visited (short reverse path) and sits over the arm's OWN cube
+    side, OUT of the central stacking region, so the next arm can descend. Replaces
+    the pathological "current tcp + dz" retreat that planned a ~567-step reorient
+    AND stayed over the central goal (blocking the next arm). Gripper OPEN (the cube
+    was just released). For the direct_place arm0 (no lift) this is still valid: it
+    goes from the goal back to its own cube location, raised — parked[arm0] is
+    captured at approach regardless of whether arm0 lifts."""
     def recipe(planner, env, arm: int) -> P.Primitive:
-        return P.retreat_up(planner, env, arm=arm, task=TSC, dz=dz,
-                            grip=P.OPEN, success_check=None)
+        target = _parked_base(parked, planner, env, arm, color)
+        target[2] += float(dz)
+        return P.move_to_pose(planner, env, arm=arm, target_pose=target, task=TSC,
+                              grip=P.OPEN, verb=vocab.LIFT, target_id=0,
+                              name=f"retreat_up(arm{arm})", success_check=None)
     return QueuedRecipe(recipe, wait_for=wait_for)
 
 
@@ -260,24 +304,30 @@ def _retreat_done_idx(prog_len: int) -> int:
 # --------------------------------------------------------------------------- per-arm program builder
 
 
-def _arm_program(color: str, dest: str, *, grasp_gate, place_gate,
-                 raise_first: bool) -> List[QueuedRecipe]:
+def _arm_program(color: str, dest: str, parked: Dict[int, np.ndarray], *,
+                 grasp_gate, place_gate, raise_first: bool) -> List[QueuedRecipe]:
     """Build ONE arm's full program.
 
     approach -> close -> [lift(0.5) if raise_first] -> place -> open -> retreat_up.
 
     ``raise_first`` False DROPS the lift (the ``direct_place`` arm0): it places
     directly from the grasp. ``grasp_gate`` gates the FIRST primitive (approach);
-    ``place_gate`` gates the PLACE (serial-place stack-order gate)."""
+    ``place_gate`` gates the PLACE (serial-place stack-order gate).
+
+    ``parked`` is the SHARED per-arm captured-grasp-pose dict: approach writes
+    parked[arm] (the arm's own cube grasp pose, before the cube moves), and both the
+    lift and the retreat read it back (raised by park_dz) so they target the SAME
+    known-reachable high pose on the arm's own side — the original solver's
+    grasp_pose+0.5 retreat."""
     queue: List[QueuedRecipe] = [
-        _approach_qp(color, wait_for=grasp_gate),
+        _approach_qp(color, parked, wait_for=grasp_gate),
         _close_qp(),
     ]
     if raise_first:
-        queue.append(_lift_qp(color))
+        queue.append(_lift_qp(color, parked))
     queue.append(_place_qp(color, dest, wait_for=place_gate))
     queue.append(_open_qp())
-    queue.append(_retreat_qp())
+    queue.append(_retreat_qp(color, parked))
     return queue
 
 
@@ -303,6 +353,12 @@ def _build_program(assign: Dict[int, _Assign], *,
     """
 
     def build(planner, env):
+        # SHARED per-arm captured grasp-pose dict (closure): each arm's approach
+        # recipe writes parked[arm] at run time (cube still at its original
+        # location); the arm's lift and retreat read it back (raised by park_dz).
+        # Mirrors the original solver capturing grasp_poseA/B/C once at pick time.
+        parked: Dict[int, np.ndarray] = {}
+
         # First pass: determine each arm's program length (depends on raise_first)
         # so place gates can target the previous arm's RETREAT-done index.
         prog_len: Dict[int, int] = {}
@@ -333,7 +389,7 @@ def _build_program(assign: Dict[int, _Assign], *,
 
             raise_first = (direct_place_arm is None) or (arm != direct_place_arm)
             prog[arm] = _arm_program(
-                color, a.dest_actor_name,
+                color, a.dest_actor_name, parked,
                 grasp_gate=grasp_gate, place_gate=place_gate,
                 raise_first=raise_first,
             )

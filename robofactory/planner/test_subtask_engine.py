@@ -204,34 +204,29 @@ def test_place_uses_dest_actor_pose():
     assert prim.text == "place on the goal"
 
 
-def test_retreat_up_preserves_orientation_and_raises_z():
-    """retreat_up = PURE vertical translation: z up, xy held, quat == current tcp quat.
-
-    Regression-lock for the identity-quat bug: an identity quaternion would force a
-    large reorient (~567-step path) and stall the serial TSC stack. The planned pose
-    must carry the arm's CURRENT (down-pointing, NON-identity) tcp quaternion.
+def test_move_to_pose_plans_to_given_7vec():
+    """move_to_pose plans straight to the caller-supplied 7-vec (xyz + quat), with NO
+    actor re-resolve. This is the general "go to a KNOWN pose" primitive the TSC
+    retreat uses to drive back to the arm's parked grasp_pose+0.5 (the original
+    solver's move-back), replacing the pathological "current tcp + dz" retreat.
     """
     pl, env = FakePlanner(num_arms=2), FakeEnv(num_arms=2)
     arm = 1
-    start_p = env.agent.agents[arm].tcp.pose.p.reshape(-1)[:3].astype(np.float32)
-    cur_q = env.agent.agents[arm].tcp.pose.q.reshape(-1)[:4].astype(np.float32)
+    # an explicit target pose with a NON-identity (down-pointing) quaternion.
+    target = np.array([0.3, -0.2, 1.0, 0.0, 1.0, 0.0, 0.0], np.float32)
 
-    prim = P.retreat_up(pl, env, arm=arm, task="ThreeRobotsStackCube", dz=0.5)
+    prim = P.move_to_pose(pl, env, arm=arm, target_pose=target,
+                          task="ThreeRobotsStackCube", grip=OPEN, verb=vocab.LIFT,
+                          target_id=0)
     assert prim.verb_id == vocab.LIFT
     assert prim.target_id == 0
     assert all(g == OPEN for _, g in prim.ticks)
 
     planned = pl.last_dry_run_pose.reshape(-1)
-    # z raised by dz; xy held
-    assert pytest.approx(planned[2], abs=1e-5) == float(start_p[2]) + 0.5
-    assert pytest.approx(planned[0], abs=1e-6) == float(start_p[0])
-    assert pytest.approx(planned[1], abs=1e-6) == float(start_p[1])
-    # orientation PRESERVED: planned quat == current tcp quat (NOT identity)
-    np.testing.assert_allclose(planned[3:7], cur_q, atol=1e-6)
-    assert not np.allclose(planned[3:7], np.array([1.0, 0.0, 0.0, 0.0], np.float32)), \
-        "retreat_up must NOT use an identity quaternion (the ~567-step reorient bug)"
-    # target_pose stores the raised xyz (for the rose-up check)
-    assert pytest.approx(prim.target_pose[2], abs=1e-5) == float(start_p[2]) + 0.5
+    # the planned pose is EXACTLY the given 7-vec (xyz + quat), no reorient/re-resolve
+    np.testing.assert_allclose(planned[:7], target, atol=1e-6)
+    # target_pose stores the planned xyz
+    np.testing.assert_allclose(prim.target_pose[:3], target[:3], atol=1e-6)
 
 
 def test_dry_run_pose_list_rejected():
