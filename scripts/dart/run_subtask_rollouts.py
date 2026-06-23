@@ -121,6 +121,55 @@ class DartCfg:
     shove_joints: tuple = (0, 1, 2, 3)
 
 
+@dataclass
+class JitterCfg:
+    """DART DENSE jitter knobs (distinct from the sparse shove in ``DartCfg``).
+
+    Jitter is the DENSE, MILD per-step perturbation: before a ``jitter_frac``
+    fraction of RECORDED steps, ONE moving arm's target is nudged by
+    ``clean_waypoint + N(0, jitter_sigma, 7)`` via ONE UNRECORDED unwrapped-env step
+    (see ``dart_perturb.jitter_nudge`` / ``subtask_interpreter.run_program``). It is
+    BOUNDED around the path (centered on the clean waypoint, not the drifted qpos),
+    so the recorded action stays the clean waypoint while the next recorded obs shows
+    a small drift.
+
+    ``jitter_frac <= 0`` (or ``jitter_sigma <= 0``) disables jitter entirely (the
+    interpreter's no-jitter fast path). Defaults OFF so nothing changes unless asked.
+    """
+    jitter_frac: float = 0.0
+    jitter_sigma: float = 0.0
+    jitter_seed: int = 0
+
+
+def _make_jitter_rng(jitter_cfg, env_seed, variant_id):
+    """Build a DETERMINISTIC per-variant jitter ``np.random.Generator`` (or None).
+
+    Returns None when ``jitter_cfg`` is falsy or jitter is disabled
+    (``jitter_frac <= 0`` or ``jitter_sigma <= 0``) -> the interpreter takes its
+    no-jitter fast path.
+
+    The RNG is seeded ONLY from ``SeedSequence([env_seed, variant_id, jitter_seed,
+    JITTER_STREAM_TAG])`` so the whole per-step jitter sequence is a pure function of
+    the variant identity (reproducible) and NEVER touches the env reset RNG. The extra
+    ``JITTER_STREAM_TAG`` constant makes this a DISTINCT stream from the boundary_hook
+    shove RNG (whose SeedSequence is ``[env_seed, variant_id, transition_counter,
+    dart_seed]``) even if the seeds coincide, so jitter and shove never share draws.
+    """
+    if not jitter_cfg or jitter_cfg.jitter_frac <= 0 or jitter_cfg.jitter_sigma <= 0:
+        return None
+    return np.random.default_rng(
+        np.random.SeedSequence(
+            [int(env_seed), int(variant_id), int(jitter_cfg.jitter_seed),
+             _JITTER_STREAM_TAG]
+        )
+    )
+
+
+# Distinct-stream tag appended to the jitter SeedSequence so jitter draws never
+# collide with the shove hook's stream (which has no such tag) at matching seeds.
+_JITTER_STREAM_TAG = 0x4A49  # "JI"
+
+
 def _make_boundary_hook(dart_cfg, env_seed, variant_id):
     """Build a REAL, DETERMINISTIC per-variant boundary_hook (or None).
 
@@ -249,7 +298,7 @@ def _build_planner(env, seed):
     return planner
 
 
-def _run_one_variant(env, spec, max_steps, dart_cfg):
+def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None):
     """Reset to the spec's seed, build the program, run it, return the result.
 
     The DART boundary_hook is built PER VARIANT here from ``dart_cfg`` keyed on
@@ -257,12 +306,18 @@ def _run_one_variant(env, spec, max_steps, dart_cfg):
     deterministic function of its identity (and never touches the env reset RNG).
     When ``dart_cfg`` is None / sigma<=0 the hook is None (clean slice).
 
+    The DENSE jitter RNG is likewise built PER VARIANT from ``jitter_cfg`` keyed on
+    ``(spec.seed, spec.variant_id)`` (a DISTINCT stream from the shove hook). When
+    ``jitter_cfg`` is None / disabled the rng is None -> run_program takes its
+    no-jitter fast path.
+
     Returns (recorder, run_out) on a clean run, or (None, None) if planning or the
     rollout raised (treated as a failed variant -> its whole group is dropped).
     """
     planner = _build_planner(env, spec.seed)
     rec = SubtaskRecorder(num_arms=spec.num_arms)
     boundary_hook = _make_boundary_hook(dart_cfg, spec.seed, spec.variant_id)
+    jitter_rng = _make_jitter_rng(jitter_cfg, spec.seed, spec.variant_id)
     try:
         programs = spec.build(planner, env)
     except Exception as e:  # a plan failure (e.g. -1) drops this variant
@@ -274,6 +329,9 @@ def _run_one_variant(env, spec, max_steps, dart_cfg):
             env, planner, programs, rec, max_steps=max_steps,
             boundary_hook=boundary_hook,
             control_mode=planner.control_mode,
+            jitter_frac=(jitter_cfg.jitter_frac if jitter_cfg else 0.0),
+            jitter_sigma=(jitter_cfg.jitter_sigma if jitter_cfg else 0.0),
+            jitter_rng=jitter_rng,
         )
     except Exception as e:
         # JIT plan failures fire DURING the rollout, not at build (primitives plan
@@ -443,10 +501,16 @@ def _split_budget(num, mix):
     return floors
 
 
-def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T, spec):
+def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T, spec,
+                  n_jitter=0):
     """Write one member's aligned subtask stream (keyed ``traj_{episode_id}``) + its
     meta row (tagged with ``slice_tag``). Shared by the atomic + per-member paths so
-    they cannot drift."""
+    they cannot drift.
+
+    ``n_jitter`` is the per-episode count of UNRECORDED jitter nudges fired during the
+    rollout (``run_program`` returns it as ``n_jitter_steps``); surfaced per-row so
+    jitter density is auditable in subtask_meta.json. 0 when jitter is off.
+    """
     rec.flush(episode_id=episode_id, h5_group=stream_h5, expected_T=T)
     stream_h5.flush()
     episodes_meta.append({
@@ -457,12 +521,14 @@ def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T,
         "contrast_group_id": int(spec.contrast_group_id),
         "T": int(T),
         "slice": slice_tag,
+        "n_jitter_steps": int(n_jitter),
     })
 
 
 def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
                    stream_h5, episodes_meta, slice_tag, seed, gid,
-                   kept_so_far, per_member=False, variant_kept=None):
+                   kept_so_far, per_member=False, variant_kept=None,
+                   jitter_cfg=None):
     """Run ONE contrast group.
 
     per_member=False (default): ATOMIC single-pass-with-delete. Each member runs ONCE;
@@ -491,12 +557,12 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
         if variant_kept is not None:
             variant_kept[spec.name] = variant_kept.get(spec.name, 0) + 1
 
-    written = []   # [(episode_id, recorder, T, spec)] with traj flushed this group
+    written = []   # [(episode_id, recorder, T, spec, n_jitter)] traj flushed this group
     group_ok = True
     for spec in members:
         signal.alarm(int(per_attempt_timeout))
         try:
-            rec, out = _run_one_variant(env, spec, max_steps, dart_cfg)
+            rec, out = _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg)
         except _SolverTimeout:
             print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
                   f"TIMEOUT after {per_attempt_timeout}s", flush=True)
@@ -517,18 +583,19 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
             break         # atomic: stop and roll back below
 
         T = out["steps"]
+        n_jitter = int(out.get("n_jitter_steps", 0))
         env.flush_trajectory()  # writes traj_{env._episode_id}
         episode_id = int(getattr(env, "_episode_id", kept_so_far + len(written)))
         try:
             env._h5_file.flush()
         except AttributeError:
             pass
-        written.append((episode_id, rec, T, spec))
+        written.append((episode_id, rec, T, spec, n_jitter))
         if per_member:
             # commit this variant NOW (independent keep); a later member failing will
             # NOT roll it back.
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
-                          episode_id, rec, T, spec)
+                          episode_id, rec, T, spec, n_jitter=n_jitter)
             _bump_variant(spec)
             print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
                   f"KEPT (per-member) -> traj_{episode_id}", flush=True)
@@ -555,9 +622,9 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
 
     if not per_member:
         # ATOMIC: all members passed -> write aligned streams + meta rows now.
-        for episode_id, rec, T, spec in written:
+        for episode_id, rec, T, spec, n_jitter in written:
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
-                          episode_id, rec, T, spec)
+                          episode_id, rec, T, spec, n_jitter=n_jitter)
             _bump_variant(spec)
         print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
               f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",
@@ -575,7 +642,8 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         max_steps=600, dart_seed=0,
         per_attempt_timeout=300, override_seeds=None, save_video=False,
         floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix="",
-        grasp_settle_steps=10, shove_joints=(0, 1, 2, 3)):
+        grasp_settle_steps=10, shove_joints=(0, 1, 2, 3),
+        jitter_frac=0.0, jitter_sigma=0.0):
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
@@ -658,6 +726,16 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         shove_joints=tuple(int(j) for j in shove_joints),
     )
 
+    # --- DART DENSE jitter config (orthogonal to the sparse shove; reused by every
+    # slice). Disabled (jitter_frac/sigma == 0) -> the interpreter's no-jitter fast
+    # path, so the dataset is unchanged unless jitter is explicitly requested. The
+    # jitter RNG is keyed on (env_seed, variant_id) with a distinct stream tag so it
+    # never collides with the shove hook's RNG. ---
+    jitter_cfg = JitterCfg(
+        jitter_frac=float(jitter_frac), jitter_sigma=float(jitter_sigma),
+        jitter_seed=int(dart_seed),
+    )
+
     # --- slice plan ---
     # No --mix: a SINGLE slice governed by --dart-sigma (today's behavior), tagged
     # "default". With --mix: three sub-runs into ONE combined dataset dir:
@@ -731,6 +809,8 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             "k_max": int(k_max),
             "p_inject": float(p_inject),
             "grasp_settle_steps": int(grasp_settle_steps),
+            "jitter_frac": float(jitter_frac),
+            "jitter_sigma": float(jitter_sigma),
             "config_suffix": config_suffix,
             "mix": mix,
             "num": int(num),
@@ -768,6 +848,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                         env, members, max_steps, per_attempt_timeout, dart_cfg,
                         stream_h5, episodes_meta, slice_tag, seed, gid, kept,
                         per_member=per_member, variant_kept=variant_kept,
+                        jitter_cfg=jitter_cfg,
                     )
                     # count kept episodes regardless of full-group success (per-member
                     # slices keep partial groups); kept_groups counts only complete groups.
@@ -867,6 +948,18 @@ if __name__ == "__main__":
                          "Default '0,1,2,3' (proximal base/shoulder/elbow) leaves the "
                          "wrist (4,5,6) holding its grip geometry. Pass '0,1,2,3,4,5,6' "
                          "to shove all joints (legacy).")
+    ap.add_argument("--jitter-frac", type=float, default=0.0, dest="jitter_frac",
+                    help="DART DENSE jitter: fraction of RECORDED steps before which "
+                         "ONE moving arm gets ONE UNRECORDED unwrapped nudge "
+                         "(clean_waypoint + N(0, jitter_sigma, 7)). The recorded action "
+                         "stays the clean waypoint; only the next obs drifts. Default "
+                         "0.0 = OFF (no jitter). DART's recipe uses 0.40.")
+    ap.add_argument("--jitter-sigma", type=float, default=0.0, dest="jitter_sigma",
+                    help="std-dev of the per-step jitter nudge over the 7 arm joints "
+                         "(centered on the clean waypoint -> bounded around the path, "
+                         "no random-walk). Default 0.0 = OFF. DART's recipe uses 0.05. "
+                         "Both --jitter-frac>0 AND --jitter-sigma>0 are required to "
+                         "enable jitter.")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="splice into the yaml stem, e.g. '_aug' maps "
                          "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")
@@ -908,4 +1001,6 @@ if __name__ == "__main__":
         config_suffix=args.config_suffix,
         mix=args.mix,
         grasp_settle_steps=args.grasp_settle_steps,
-        shove_joints=shove_joints)
+        shove_joints=shove_joints,
+        jitter_frac=args.jitter_frac,
+        jitter_sigma=args.jitter_sigma)

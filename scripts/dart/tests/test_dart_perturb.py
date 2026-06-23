@@ -11,6 +11,7 @@ import pytest
 
 from robofactory.planner.dart_perturb import (
     inject_joint_disturbance,
+    jitter_nudge,
     sample_floored_offset,
 )
 
@@ -616,3 +617,192 @@ def test_tolerates_batched_torch_qpos():
     np.testing.assert_allclose(act["panda-0"][:7], Q0_A[:7])
     np.testing.assert_allclose(act["panda-1"][:7], Q0_B[:7])
     assert act["panda-0"].shape == (8,)
+
+
+# ===========================================================================
+# (h) jitter_nudge: the DENSE waypoint-centered mild perturbation
+# ===========================================================================
+# A clean waypoint DISTINCT from any robot's live qpos so a nudge centered on it
+# is unmistakably "waypoint + noise", never "qpos + noise".
+WAYPOINT7 = np.array([2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6])
+
+
+def test_jitter_one_unwrapped_step():
+    """jitter_nudge issues EXACTLY one unwrapped env step (the dense single nudge)."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05)
+    assert len(env.steps) == 1
+
+
+def test_jitter_chosen_arm_is_waypoint_plus_noise():
+    """The chosen arm's target == waypoint7 + N(0, sigma); it differs from the clean
+    waypoint by the noise, and the displacement magnitude is bounded by ~sigma."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    sigma = 0.05
+    jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(3), jitter_sigma=sigma)
+    arm0 = env.steps[0]["panda-0"][:7]
+    disp = arm0 - WAYPOINT7
+    # the nudge is centered on the WAYPOINT, so the target differs from it by noise
+    assert not np.allclose(arm0, WAYPOINT7)
+    # ... and the per-joint drift is bounded around the waypoint (mild, ~sigma).
+    # 7 joints, N(0, sigma): a generous bound is well under 6*sigma per joint.
+    assert np.all(np.abs(disp) < 6.0 * sigma), disp
+    # the displacement equals exactly the rng's noise draw (no floor / no scaling)
+    expected_noise = np.random.default_rng(3).normal(0.0, sigma, size=7)
+    np.testing.assert_allclose(disp, expected_noise, atol=1e-9)
+
+
+def test_jitter_other_arms_hold_live_qpos():
+    """Every NON-chosen arm holds its LIVE qpos (first 7), unchanged."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(7), jitter_sigma=0.05)
+    # arm1 (not chosen) holds its live qpos exactly
+    np.testing.assert_allclose(env.steps[0]["panda-1"][:7], Q0_B[:7])
+    # arm0 (chosen) is NOT its live qpos (it's the waypoint + noise)
+    assert not np.allclose(env.steps[0]["panda-0"][:7], Q0_A[:7])
+
+
+def test_jitter_waypoint_centered_not_qpos_centered():
+    """CRITICAL invariant: the nudge tracks the SUPPLIED WAYPOINT, not the arm's live
+    qpos. Two calls with the SAME rng seed but DIFFERENT waypoints must produce
+    targets that differ by exactly the waypoint difference (the noise draw is
+    identical) -> proves the center is the waypoint, never the (fixed) qpos."""
+    sigma = 0.05
+    wp_a = WAYPOINT7.copy()
+    wp_b = WAYPOINT7 + 0.5  # a shifted clean waypoint, same live qpos
+
+    envA, robotsA = _make()
+    jitter_nudge(envA, robotsA, [0.04, -0.02], arm_id=0, waypoint7=wp_a,
+                 rng=np.random.default_rng(42), jitter_sigma=sigma)
+    envB, robotsB = _make()
+    jitter_nudge(envB, robotsB, [0.04, -0.02], arm_id=0, waypoint7=wp_b,
+                 rng=np.random.default_rng(42), jitter_sigma=sigma)
+
+    tgtA = envA.steps[0]["panda-0"][:7]
+    tgtB = envB.steps[0]["panda-0"][:7]
+    # target tracks the waypoint: tgtB - tgtA == wp_b - wp_a (same noise cancels)
+    np.testing.assert_allclose(tgtB - tgtA, wp_b - wp_a, atol=1e-9)
+    # and each equals its OWN waypoint + the (shared) noise -> NOT qpos-centered
+    noise = np.random.default_rng(42).normal(0.0, sigma, size=7)
+    np.testing.assert_allclose(tgtA, wp_a + noise, atol=1e-9)
+    np.testing.assert_allclose(tgtB, wp_b + noise, atol=1e-9)
+
+
+def test_jitter_does_not_compound_is_bounded_around_path():
+    """Repeated nudges centered on the SAME waypoint stay within ~sigma of it every
+    time (no random walk): each call's target drift from the waypoint is independently
+    bounded, never accumulating across calls."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    sigma = 0.05
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        env.steps.clear()
+        jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                     rng=rng, jitter_sigma=sigma)
+        disp = env.steps[0]["panda-0"][:7] - WAYPOINT7
+        # bounded around the path every single time (no accumulation)
+        assert np.linalg.norm(disp) < 8.0 * sigma, np.linalg.norm(disp)
+
+
+def test_jitter_gripper_carries_caller_grip():
+    """Each arm's gripper channel carries the caller-supplied (frozen) grip verbatim."""
+    env, robots = _make()
+    grips = [0.037, -0.021]
+    jitter_nudge(env, robots, grips, arm_id=1, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05,
+                 control_mode="pd_joint_pos")
+    act = env.steps[0]
+    assert act["panda-0"].shape == (8,)
+    assert act["panda-0"][-1] == grips[0]
+    assert act["panda-1"][-1] == grips[1]
+
+
+def test_jitter_pd_joint_pos_vel_layout():
+    """pd_joint_pos_vel: action = [7 pos, 7 vel(=0), grip] (15 entries)."""
+    env, robots = _make()
+    grips = [0.05, -0.05]
+    jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05,
+                 control_mode="pd_joint_pos_vel")
+    act = env.steps[0]
+    assert act["panda-0"].shape == (15,)
+    np.testing.assert_allclose(act["panda-0"][7:14], 0.0)  # vel block zeroed
+    assert act["panda-0"][-1] == grips[0]
+
+
+def test_jitter_sink_captures_emitted_action_and_differs_from_clean():
+    """sink captures the ONE emitted disturbance action; it differs from the clean
+    waypoint by the noise (and the magnitude is bounded by ~sigma)."""
+    env, robots = _make()
+    grips = [0.04, -0.02]
+    sink = []
+    sigma = 0.05
+    jitter_nudge(env, robots, grips, arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(11), jitter_sigma=sigma, sink=sink)
+    assert len(sink) == 1
+    captured = sink[0]
+    assert set(captured.keys()) == {"panda-0", "panda-1"}
+    # sink mirrors the actually-stepped action exactly
+    np.testing.assert_allclose(captured["panda-0"], env.steps[0]["panda-0"])
+    # the emitted action's chosen arm differs from the clean waypoint by the noise
+    disp = captured["panda-0"][:7] - WAYPOINT7
+    assert not np.allclose(captured["panda-0"][:7], WAYPOINT7)
+    assert np.all(np.abs(disp) < 6.0 * sigma)
+
+
+def test_jitter_sink_is_deep_copy():
+    """Mutating the live action after the call must not change the sink entry."""
+    env, robots = _make()
+    sink = []
+    jitter_nudge(env, robots, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05, sink=sink)
+    # the env recorded a deep copy; mutating env.steps must not touch sink
+    env.steps[0]["panda-0"][:] = -999.0
+    assert not np.allclose(sink[0]["panda-0"], -999.0)
+
+
+def test_jitter_custom_action_prefix():
+    env, robots = _make()
+    jitter_nudge(env, robots, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05,
+                 action_prefix="agent")
+    assert set(env.steps[0].keys()) == {"agent-0", "agent-1"}
+
+
+def test_jitter_tolerates_batched_torch_qpos_for_held_arms():
+    """Held (non-chosen) arms read get_qpos() which may be a (1,9) torch-like tensor."""
+    env = FakeEnv()
+    robots = [FakeBatchedRobot(Q0_A), FakeBatchedRobot(Q0_B)]
+    jitter_nudge(env, robots, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(0), jitter_sigma=0.05)
+    # arm1 held at its (sliced) live qpos
+    np.testing.assert_allclose(env.steps[0]["panda-1"][:7], Q0_B[:7])
+    assert env.steps[0]["panda-1"].shape == (8,)
+
+
+def test_jitter_determinism_same_rng_identical():
+    """Same rng seed -> identical emitted action (replayable jitter stream)."""
+    envA, robotsA = _make()
+    jitter_nudge(envA, robotsA, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(5), jitter_sigma=0.05)
+    envB, robotsB = _make()
+    jitter_nudge(envB, robotsB, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(5), jitter_sigma=0.05)
+    np.testing.assert_allclose(envA.steps[0]["panda-0"], envB.steps[0]["panda-0"])
+
+
+def test_jitter_different_rng_diverges():
+    envA, robotsA = _make()
+    jitter_nudge(envA, robotsA, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(1), jitter_sigma=0.05)
+    envB, robotsB = _make()
+    jitter_nudge(envB, robotsB, [0.04, -0.02], arm_id=0, waypoint7=WAYPOINT7,
+                 rng=np.random.default_rng(2), jitter_sigma=0.05)
+    assert not np.allclose(envA.steps[0]["panda-0"], envB.steps[0]["panda-0"])

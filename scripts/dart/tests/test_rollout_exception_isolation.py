@@ -157,7 +157,7 @@ def _patch_group_deps(monkeypatch, written_calls, deleted_calls):
                         lambda out: bool(out) and out.get("ok", False))
     monkeypatch.setattr(
         R, "_write_member",
-        lambda stream, meta, tag, seed, eid, rec, T, spec:
+        lambda stream, meta, tag, seed, eid, rec, T, spec, n_jitter=0:
             written_calls.append(eid))
     monkeypatch.setattr(
         R, "_delete_episodes",

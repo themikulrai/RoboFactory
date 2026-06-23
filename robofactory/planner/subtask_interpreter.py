@@ -57,6 +57,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import subtask_vocab as vocab
+from . import dart_perturb
 from .subtask_primitives import Primitive, OPEN
 
 # A PrimitiveRecipe plans ONE primitive against the LIVE env/qpos at entry time:
@@ -391,6 +392,9 @@ def run_program(
     control_mode: Optional[str] = None,
     verbose: bool = False,
     check_success_coverage: str = "warn",
+    jitter_frac: float = 0.0,
+    jitter_sigma: float = 0.0,
+    jitter_rng: Optional[np.random.Generator] = None,
 ) -> Dict:
     """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
 
@@ -422,6 +426,21 @@ def run_program(
         recipes are built lazily, the lint builds a PROBE primitive per recipe to
         inspect its verb/success_check; the probe is built against the CURRENT state
         (pre-run) and discarded (it does not advance physics — dry_run only plans).
+    jitter_frac : DART DENSE jitter probability. Before each RECORDED step, with
+        probability ``jitter_frac`` ONE moving arm (one whose primitive produced a
+        real tick this step — NOT an idle/blocked arm) is nudged by ONE UNRECORDED
+        unwrapped-env step (``dart_perturb.jitter_nudge``) commanding that arm's
+        CURRENT CLEAN WAYPOINT (the same qpos7 the recorded step is about to send)
+        + N(0, ``jitter_sigma``, 7); all other arms hold their live qpos. The
+        recorded step is UNCHANGED (clean waypoint), so the recorded ACTION stays
+        clean while the next recorded OBS shows a small bounded drift. Default 0.0
+        (with ``jitter_rng=None``) -> NO jitter, byte-identical to the no-jitter path.
+    jitter_sigma : stddev of the per-joint jitter nudge (see ``jitter_frac``).
+    jitter_rng : a ``numpy.random.Generator`` (seeded per episode/variant by the
+        caller, a DISTINCT stream from the boundary_hook's shove RNG and the env
+        reset RNG). MUST be supplied for jitter to fire: None -> NO jitter regardless
+        of ``jitter_frac``. The same draw sequence is used for both the per-step
+        inject decision and the arm choice, so a given (rng) replays identically.
 
     Returns
     -------
@@ -431,6 +450,7 @@ def run_program(
         all_success : bool, True iff every primitive with a success_check passed
         terminated, truncated, info : last env.step outputs
         completed : bool, True iff all arms emptied their queues before max_steps
+        n_jitter_steps : number of UNRECORDED jitter nudges fired (0 if jitter off)
     """
     if control_mode is None:
         control_mode = getattr(planner, "control_mode", "pd_joint_pos")
@@ -466,9 +486,16 @@ def run_program(
                 task_name_cache["v"] = _resolve_task_name(programs, planner, env)
         return task_name_cache["v"]
 
+    # jitter is active only when an rng is supplied AND a positive frac/sigma are set
+    # (defaults frac=0/rng=None -> NO jitter, byte-identical to the no-jitter path).
+    jitter_active = (
+        jitter_rng is not None and jitter_frac > 0.0 and jitter_sigma > 0.0
+    )
+
     info = {}
     terminated = truncated = False
     step = 0
+    n_jitter_steps = 0
 
     def _all_done() -> bool:
         return all(a.current is None for a in arms.values())
@@ -519,6 +546,12 @@ def run_program(
         # --- per-arm tick assembly ---
         action_dict: Dict[str, np.ndarray] = {}
         labels: Dict[int, Tuple[int, int, str]] = {}
+        # arms that produced a REAL primitive tick this step (NOT idle/blocked), with
+        # their CLEAN commanded waypoint (the 7 arm joints about to be sent). These
+        # are the jitter-eligible "moving" arms; the clean waypoint is the nudge
+        # center (waypoint-centered, not qpos-centered -> bounded around the path).
+        moving_waypoints: Dict[int, np.ndarray] = {}
+        moving_grips: Dict[int, float] = {}
 
         for i in range(num_arms):
             a = arms[i]
@@ -548,6 +581,34 @@ def run_program(
             # remember as the frozen command (for subsequent holds)
             a.frozen_qpos = qpos7.copy()
             a.frozen_grip = float(grip)
+            # this arm is genuinely moving this tick -> jitter-eligible; the clean
+            # waypoint it is about to command is the nudge center.
+            moving_waypoints[i] = qpos7
+            moving_grips[i] = float(grip)
+
+        # --- DART DENSE jitter: BEFORE the recorded step, with prob jitter_frac,
+        # nudge ONE moving arm by ONE UNRECORDED unwrapped step centered on that
+        # arm's CLEAN waypoint (the same qpos7 about to be commanded) + N(0, sigma).
+        # The recorded env.step below is UNCHANGED (still the clean waypoint), so the
+        # recorded ACTION stays clean while the next recorded OBS drifts. The arm is
+        # chosen from the genuinely-moving arms only (never an idle/blocked arm). ---
+        if jitter_active and moving_waypoints and jitter_rng.random() < jitter_frac:
+            arm_id = int(jitter_rng.choice(np.array(sorted(moving_waypoints))))
+            # carry each arm's FROZEN grip (last commanded) so the nudge never flips a
+            # grasp; non-nudged arms hold their live qpos inside jitter_nudge.
+            grips = [float(arms[i].frozen_grip) for i in range(num_arms)]
+            dart_perturb.jitter_nudge(
+                _unwrap(env),
+                planner.robot,
+                grips,
+                arm_id,
+                moving_waypoints[arm_id],
+                jitter_rng,
+                jitter_sigma,
+                control_mode=control_mode,
+                action_prefix=action_prefix,
+            )
+            n_jitter_steps += 1
 
         # --- ONE env.step per tick (wrapped -> recorded) ---
         obs, reward, terminated, truncated, info = env.step(action_dict)
@@ -596,6 +657,7 @@ def run_program(
         "truncated": bool(truncated),
         "info": info,
         "completed": _all_done(),
+        "n_jitter_steps": int(n_jitter_steps),
     }
 
 

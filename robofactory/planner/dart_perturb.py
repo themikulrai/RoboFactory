@@ -22,7 +22,7 @@ import copy
 
 import numpy as np
 
-__all__ = ["sample_floored_offset", "inject_joint_disturbance"]
+__all__ = ["sample_floored_offset", "inject_joint_disturbance", "jitter_nudge"]
 
 
 def sample_floored_offset(rng, sigma, n, floor):
@@ -211,3 +211,75 @@ def inject_joint_disturbance(
         if sink is not None:
             sink.append(copy.deepcopy(action_dict))
         base_env.step(action_dict)  # UNWRAPPED -> unrecorded
+
+
+def jitter_nudge(
+    base_env,
+    robots,
+    grips,
+    arm_id,
+    waypoint7,
+    rng,
+    jitter_sigma,
+    control_mode="pd_joint_pos",
+    action_prefix="panda",
+    sink=None,
+):
+    """ONE unrecorded unwrapped-env step that nudges ONE arm off its clean path.
+
+    The DENSE, MILD jitter perturbation (ported MATH-ONLY from
+    ``scripts/dart/run_dart_rollouts.py`` ``_jitter_nudge``). For ONE chosen arm
+    (``arm_id``) it commands ``waypoint7 + N(0, jitter_sigma, 7)``; EVERY OTHER arm
+    HOLDS its current live qpos (``robots[i].get_qpos()[:7]``). The gripper channel
+    for each arm carries the caller-supplied ``grips[i]`` (the FROZEN grip), so the
+    nudge never changes a grasp's open/closed state -- the same carry-grip contract
+    as :func:`inject_joint_disturbance`.
+
+    BOUNDED, NOT a random walk: the nudge is centered on the supplied CLEAN
+    WAYPOINT (the same about-to-be-commanded target for ``arm_id``), NOT on the
+    arm's (already-drifted) live qpos, so the arm stays within ~``jitter_sigma`` of
+    the path every jittered step and the noise never accumulates. (Centering on
+    qpos+noise compounded over the jittered steps and wandered the arm off-task ->
+    low yield; this waypoint+noise form keeps yield high while still producing a
+    genuinely-perturbed recorded observation under a clean-waypoint label.)
+
+    UNRECORDED contract: the step is taken on the UNWRAPPED env (``base_env``), so
+    it bypasses any RecordEpisode wrapper. The caller's RECORDED step (run AFTER
+    this nudge, on the WRAPPED env) is UNCHANGED -- it still commands the clean
+    waypoint -- so the recorded ACTION stays the clean waypoint while only the NEXT
+    recorded OBS reflects a small, bounded drift. Noise never becomes a label.
+
+    Args:
+        base_env: the UNWRAPPED env; ``base_env.step(action_dict)`` is called ONCE.
+        robots: list of robot handles, each exposing ``get_qpos()`` (array-like or
+            torch tensor; first 7 entries are arm joints). Used to HOLD non-nudged
+            arms at their live qpos.
+        grips: list of current gripper commands, one float per arm. Indexed by arm
+            id and emitted verbatim as the gripper channel (the carry-grip contract).
+        arm_id: the SINGLE arm to nudge. All others hold their live qpos.
+        waypoint7: the 7-joint CLEAN waypoint for ``arm_id`` at this step (the same
+            target the recorded step will command). The nudge center.
+        rng: a ``numpy.random.Generator`` (only one normal(0, sigma, 7) draw).
+        jitter_sigma: stddev of the per-joint normal nudge added to ``waypoint7``.
+        control_mode: "pd_joint_pos" -> action = [target(7), grip];
+            "pd_joint_pos_vel" -> action = [target(7), zeros(7), grip].
+        action_prefix: action-dict key prefix; key is f"{action_prefix}-{i}".
+        sink: optional list; if not None, a DEEP COPY of the stepped action dict is
+            appended (one entry: this single unwrapped step) for introspection/tests.
+
+    Returns:
+        None. (Side effect: ONE call to ``base_env.step``.)
+    """
+    waypoint7 = np.asarray(waypoint7, dtype=np.float64).reshape(-1)[:7]
+    nudged = waypoint7 + rng.normal(0.0, jitter_sigma, size=waypoint7.shape[0])
+    action_dict = {}
+    for i in range(len(robots)):
+        if i == arm_id:
+            target = nudged          # clean waypoint + noise (bounded around path)
+        else:
+            target = _arm_qpos7(robots[i])  # HOLD live qpos
+        grip = grips[i]              # caller-supplied (frozen) grip -- NOT planner state
+        action_dict[f"{action_prefix}-{i}"] = _assemble_action(target, grip, control_mode)
+    if sink is not None:
+        sink.append(copy.deepcopy(action_dict))
+    base_env.step(action_dict)  # UNWRAPPED -> unrecorded
