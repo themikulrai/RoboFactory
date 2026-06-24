@@ -174,6 +174,26 @@ def _make_jitter_rng(jitter_cfg, env_seed, variant_id):
 # Distinct-stream tag appended to the jitter SeedSequence so jitter draws never
 # collide with the shove hook's stream (which has no such tag) at matching seeds.
 _JITTER_STREAM_TAG = 0x4A49  # "JI"
+# Distinct stream tag for the language-driven WAIT-injection RNG (variant 2a).
+_WAIT_STREAM_TAG = 0x5741  # "WA"
+
+
+def _make_wait_rng(wait_cfg, env_seed, variant_id):
+    """Per-variant deterministic RNG for language-driven WAIT injection (or None).
+
+    ``wait_cfg`` is the variant's ``spec.meta["wait_inject"]`` dict (or None). Returns
+    None when absent / ``frac<=0`` -> the interpreter takes its no-wait fast path. Seeded
+    on ``[env_seed, variant_id, wait_seed, _WAIT_STREAM_TAG]`` -> a DISTINCT stream from
+    jitter and shove, reproducible, never touches the env reset RNG.
+    """
+    if not wait_cfg or float(wait_cfg.get("frac", 0.0)) <= 0.0:
+        return None
+    return np.random.default_rng(
+        np.random.SeedSequence(
+            [int(env_seed), int(variant_id), int(wait_cfg.get("seed", 0)),
+             _WAIT_STREAM_TAG]
+        )
+    )
 
 
 def _make_boundary_hook(dart_cfg, env_seed, variant_id):
@@ -331,6 +351,11 @@ def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None,
     rec = SubtaskRecorder(num_arms=spec.num_arms)
     boundary_hook = _make_boundary_hook(dart_cfg, spec.seed, spec.variant_id)
     jitter_rng = _make_jitter_rng(jitter_cfg, spec.seed, spec.variant_id)
+    # PER-VARIANT language-driven WAIT injection (variant 2a): the config rides in
+    # spec.meta["wait_inject"] so ONLY the wait_hold variant gets waits, keeping a clean
+    # contrast against the no-wait members. None -> no-wait fast path.
+    wait_cfg = (spec.meta or {}).get("wait_inject") if getattr(spec, "meta", None) else None
+    wait_rng = _make_wait_rng(wait_cfg, spec.seed, spec.variant_id)
     try:
         programs = spec.build(planner, env)
     except Exception as e:  # a plan failure (e.g. -1) drops this variant
@@ -347,6 +372,10 @@ def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None,
             jitter_rng=jitter_rng,
             jitter_freeze_qi=jitter_freeze_qi,
             settle_steps=settle_steps,
+            wait_inject_rng=wait_rng,
+            wait_inject_frac=(float(wait_cfg["frac"]) if wait_cfg else 0.0),
+            wait_inject_dur_min=(int(wait_cfg.get("dur_min", 10)) if wait_cfg else 10),
+            wait_inject_dur_max=(int(wait_cfg.get("dur_max", 30)) if wait_cfg else 30),
         )
     except Exception as e:
         # JIT plan failures fire DURING the rollout, not at build (primitives plan
@@ -529,7 +558,7 @@ def _split_budget(num, mix):
 
 
 def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T, spec,
-                  n_jitter=0):
+                  n_jitter=0, n_wait=0):
     """Write one member's aligned subtask stream (keyed ``traj_{episode_id}``) + its
     meta row (tagged with ``slice_tag``). Shared by the atomic + per-member paths so
     they cannot drift.
@@ -549,6 +578,9 @@ def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T,
         "T": int(T),
         "slice": slice_tag,
         "n_jitter_steps": int(n_jitter),
+        "n_wait_steps": int(n_wait),
+        "lead_arm": (spec.meta or {}).get("lead_arm"),
+        "intended_order": (spec.meta or {}).get("intended_order"),
     })
 
 
@@ -613,18 +645,19 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
 
         T = out["steps"]
         n_jitter = int(out.get("n_jitter_steps", 0))
+        n_wait = int(out.get("n_wait_steps", 0))
         env.flush_trajectory()  # writes traj_{env._episode_id}
         episode_id = int(getattr(env, "_episode_id", kept_so_far + len(written)))
         try:
             env._h5_file.flush()
         except AttributeError:
             pass
-        written.append((episode_id, rec, T, spec, n_jitter))
+        written.append((episode_id, rec, T, spec, n_jitter, n_wait))
         if per_member:
             # commit this variant NOW (independent keep); a later member failing will
             # NOT roll it back.
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
-                          episode_id, rec, T, spec, n_jitter=n_jitter)
+                          episode_id, rec, T, spec, n_jitter=n_jitter, n_wait=n_wait)
             _bump_variant(spec)
             print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
                   f"KEPT (per-member) -> traj_{episode_id}", flush=True)
@@ -651,9 +684,9 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
 
     if not per_member:
         # ATOMIC: all members passed -> write aligned streams + meta rows now.
-        for episode_id, rec, T, spec, n_jitter in written:
+        for episode_id, rec, T, spec, n_jitter, n_wait in written:
             _write_member(stream_h5, episodes_meta, slice_tag, seed,
-                          episode_id, rec, T, spec, n_jitter=n_jitter)
+                          episode_id, rec, T, spec, n_jitter=n_jitter, n_wait=n_wait)
             _bump_variant(spec)
         print(f"  [{slice_tag}] seed {seed} group {gid} [{members[0].family}]: KEPT "
               f"{[m.name for m in members]} -> traj_{[w[0] for w in written]}",

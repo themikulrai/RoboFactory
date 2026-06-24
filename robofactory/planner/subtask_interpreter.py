@@ -411,6 +411,10 @@ class _ArmState:
     built: Optional[Primitive] = None
     # success flags per primitive index (None=not yet checked)
     success: Dict[int, Optional[bool]] = field(default_factory=dict)
+    # remaining ticks of an injected language-driven WAIT pause (0 = not paused). While
+    # > 0 the arm holds its current pose, is labelled WAIT, and does NOT advance its
+    # primitive (it resumes exactly where it paused). See the wait-injection block.
+    wait_inject_counter: int = 0
 
     @property
     def current(self) -> Optional[QueuedRecipe]:
@@ -443,6 +447,10 @@ def run_program(
     jitter_rng: Optional[np.random.Generator] = None,
     jitter_freeze_qi: Optional[int] = None,
     settle_steps: int = 0,
+    wait_inject_rng: Optional[np.random.Generator] = None,
+    wait_inject_frac: float = 0.0,
+    wait_inject_dur_min: int = 10,
+    wait_inject_dur_max: int = 30,
 ) -> Dict:
     """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
 
@@ -539,11 +547,18 @@ def run_program(
     jitter_active = (
         jitter_rng is not None and jitter_frac > 0.0 and jitter_sigma > 0.0
     )
+    # language-driven WAIT injection is active only when an rng is supplied AND a
+    # positive frac is set (default frac=0/rng=None -> NO injection, unchanged path).
+    wait_inject_active = (
+        wait_inject_rng is not None and wait_inject_frac > 0.0
+        and wait_inject_dur_max > 0
+    )
 
     info = {}
     terminated = truncated = False
     step = 0
     n_jitter_steps = 0
+    n_wait_steps = 0
 
     def _all_done() -> bool:
         return all(a.current is None for a in arms.values())
@@ -572,6 +587,28 @@ def run_program(
                 if not _eval_gate(predicate, env, state):
                     blocked = True
             blocked_this_tick[i] = blocked
+
+        # --- random language-driven WAIT injection: with prob wait_inject_frac, pause
+        # ONE moving (un-gated, non-idle) arm in place for K ~ U[dur_min,dur_max] ticks.
+        # The paused arm holds its current pose, is labelled WAIT, and does NOT advance
+        # its primitive -> it resumes EXACTLY where it paused. Whether it's waiting is
+        # decodable only from the WAIT label, not the sim state -> language-causal data.
+        # Folded into blocked_this_tick so ALL existing blocked handling (no transition,
+        # hold+WAIT label, jitter-skip, no tick advance) applies uniformly. qi does not
+        # advance, so cross-arm serial gates simply wait longer (deadlock-free). Only ONE
+        # arm is ever paused at a time (bounds the injected-WAIT fraction). ---
+        if wait_inject_active:
+            if not any(arms[i].wait_inject_counter > 0 for i in range(num_arms)):
+                cand = [i for i in range(num_arms)
+                        if arms[i].current is not None and not blocked_this_tick[i]]
+                if cand and wait_inject_rng.random() < wait_inject_frac:
+                    arm_id = int(wait_inject_rng.choice(np.array(sorted(cand))))
+                    arms[arm_id].wait_inject_counter = int(wait_inject_rng.integers(
+                        wait_inject_dur_min, wait_inject_dur_max + 1))
+            for i in range(num_arms):
+                if arms[i].wait_inject_counter > 0:
+                    blocked_this_tick[i] = True
+                    n_wait_steps += 1
 
         # --- detect primitive transitions for arms that will ACTUALLY enter a new
         # primitive this tick (ti==0, not yet built, NOT blocked, and a different qi
@@ -640,13 +677,17 @@ def run_program(
         # The recorded env.step below is UNCHANGED (still the clean waypoint), so the
         # recorded ACTION stays clean while the next recorded OBS drifts. The arm is
         # chosen from the genuinely-moving arms only (never an idle/blocked arm). ---
-        # PHASE-GATE jitter: exclude arms at qi >= jitter_freeze_qi (e.g. an arm in
-        # its place/open/retreat for TSC) so the dense nudge never wobbles a fragile
-        # tower mid-stack. None -> no freeze (every moving arm eligible, LB unchanged).
+        # PHASE-GATE jitter: freeze ONLY the arm whose CURRENT primitive is the place
+        # (verb == PLACE) -- the delicate stack-on-goal action. Detected by VERB, not
+        # qi, so it is robust across variants whose place sits at a different qi (e.g.
+        # direct_place, where arm0 drops its lift -> place at qi 2). Per-arm: a
+        # RETREATING arm (verb LIFT, cube already released) and a still-TRANSPORTING
+        # arm keep jittering; only the active placer freezes so the tower forms.
+        # jitter_freeze_qi is None -> no freeze (LB unchanged).
         jitter_eligible = (
             moving_waypoints if jitter_freeze_qi is None
             else {i: w for i, w in moving_waypoints.items()
-                  if int(arms[i].qi) < jitter_freeze_qi}
+                  if arms[i].built is None or arms[i].built.verb_id != vocab.PLACE}
         )
         if jitter_active and jitter_eligible and jitter_rng.random() < jitter_frac:
             arm_id = int(jitter_rng.choice(np.array(sorted(jitter_eligible))))
@@ -677,8 +718,12 @@ def run_program(
             cur = a.current
             if cur is None:
                 continue
-            # was this arm blocked this iteration? if so it didn't tick its primitive
+            # was this arm blocked this iteration? if so it didn't tick its primitive.
+            # a WAIT-paused arm decrements its remaining-hold counter here (when it hits
+            # 0 the arm is no longer force-blocked next tick and resumes its primitive).
             if blocked_this_tick.get(i, False):
+                if a.wait_inject_counter > 0:
+                    a.wait_inject_counter -= 1
                 continue
             prim = a.built
             a.ti += 1
@@ -738,6 +783,7 @@ def run_program(
         "info": info,
         "completed": _all_done(),
         "n_jitter_steps": int(n_jitter_steps),
+        "n_wait_steps": int(n_wait_steps),
     }
 
 

@@ -554,6 +554,18 @@ def sample(seed: int) -> List[ProgramSpec]:
              {"pick": "staggered", "lead_arm": _lead,
               "follow_arms": [a for a in (0, 1, 2) if a != _lead],
               "complete": True, "assignment": "base"})
+
+    # WAIT_HOLD: same simultaneous choreography as the baseline, but at random ticks one
+    # moving arm FREEZES in place (labelled `wait`) for K random ticks, then RESUMES and
+    # completes the stack. Whether/when an arm waits is decodable ONLY from the `wait`
+    # command, never the sim state -> the strongest "behavior depends on language" signal
+    # short of reordering. Config rides in meta["wait_inject"]; the runner applies it via
+    # run_program ONLY for this variant (clean contrast vs the no-wait baseline). frac is
+    # tuned so injected-WAIT frames stay <~15% of the episode (one pause at a time).
+    emit("wait_hold", "waitcoord", gid,
+         _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
+         {"pick": "simultaneous_wait", "complete": True, "assignment": "base",
+          "wait_inject": {"frac": 0.008, "dur_min": 10, "dur_max": 25, "seed": 0}})
     gid += 1
 
     return specs
@@ -570,13 +582,14 @@ if __name__ == "__main__":
     print(f"sampled {len(s)} specs in {len(by_group)} contrast groups")
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
-        assert len(members) == 4, (gid_, names)  # baseline + 3 staggered permutations
+        assert len(members) == 5, (gid_, names)  # baseline + 3 staggered + wait_hold
         assert "simultaneous_pick" in names, (gid_, names)  # single shared baseline
         print(f"  group {gid_}: {names}")
-    assert len(s) == 4 and len(by_group) == 1, (len(s), len(by_group))
-    assert {m.family for m in s} == {"baseline", "pickcoord"}
+    assert len(s) == 5 and len(by_group) == 1, (len(s), len(by_group))
+    assert {m.family for m in s} == {"baseline", "pickcoord", "waitcoord"}
     assert {m.name for m in s} == {
-        "simultaneous_pick", "staggered_pick", "staggered_lead1", "staggered_lead2"}
+        "simultaneous_pick", "staggered_pick", "staggered_lead1", "staggered_lead2",
+        "wait_hold"}
     assert len({m.variant_id for m in s}) == len(s)
     assert [m.name for m in sample(7)] == [m.name for m in s]
     print("subtask_scenarios_tsc inline OK")
