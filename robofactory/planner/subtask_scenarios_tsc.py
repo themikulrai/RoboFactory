@@ -542,14 +542,18 @@ def sample(seed: int) -> List[ProgramSpec]:
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
          {"pick": "simultaneous", "lead_arm": None, "first_placer": 0,
           "arm0": "raise_then_place", "complete": True, "assignment": "base"})
-    emit("staggered_pick", "pickcoord", gid,
-         _build_program(_BASE_ASSIGN, grasp_lead_arm=0),
-         {"pick": "staggered", "lead_arm": 0, "follow_arms": [1, 2],
-          "complete": True, "assignment": "base"})
-    emit("direct_place", "raisedirect", gid,
-         _build_program(_BASE_ASSIGN, grasp_lead_arm=None, direct_place_arm=0),
-         {"first_placer": 0, "arm0": "direct_place_no_lift", "complete": True,
-          "assignment": "base"})
+    # STAGGERED-PICK PERMUTATIONS: each arm leads the grasp in turn; the OTHER two
+    # wait on the leader's grasp (qi >= GRASP_IDX). Which arm leads is decodable only
+    # from the frame-0 command (approach vs wait), not the scene -> a clean causal
+    # "behavior depends on language" contrast. Serial place order is unchanged (rank
+    # A->B->C), so all three permutations stay collision-free (assert_no_deadlock).
+    for _lead in (0, 1, 2):
+        _name = "staggered_pick" if _lead == 0 else f"staggered_lead{_lead}"
+        emit(_name, "pickcoord", gid,
+             _build_program(_BASE_ASSIGN, grasp_lead_arm=_lead),
+             {"pick": "staggered", "lead_arm": _lead,
+              "follow_arms": [a for a in (0, 1, 2) if a != _lead],
+              "complete": True, "assignment": "base"})
     gid += 1
 
     return specs
@@ -566,13 +570,13 @@ if __name__ == "__main__":
     print(f"sampled {len(s)} specs in {len(by_group)} contrast groups")
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
-        assert len(members) == 3, (gid_, names)  # baseline + two contrast variants
+        assert len(members) == 4, (gid_, names)  # baseline + 3 staggered permutations
         assert "simultaneous_pick" in names, (gid_, names)  # single shared baseline
         print(f"  group {gid_}: {names}")
-    assert len(s) == 3 and len(by_group) == 1, (len(s), len(by_group))
-    assert {m.family for m in s} == {"baseline", "pickcoord", "raisedirect"}
+    assert len(s) == 4 and len(by_group) == 1, (len(s), len(by_group))
+    assert {m.family for m in s} == {"baseline", "pickcoord"}
     assert {m.name for m in s} == {
-        "simultaneous_pick", "staggered_pick", "direct_place"}
+        "simultaneous_pick", "staggered_pick", "staggered_lead1", "staggered_lead2"}
     assert len({m.variant_id for m in s}) == len(s)
     assert [m.name for m in sample(7)] == [m.name for m in s]
     print("subtask_scenarios_tsc inline OK")
