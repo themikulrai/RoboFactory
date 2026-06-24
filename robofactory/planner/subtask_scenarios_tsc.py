@@ -588,7 +588,7 @@ def sample(seed: int) -> List[ProgramSpec]:
     emit("wait_hold", "waitcoord", gid,
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
          {"pick": "simultaneous_wait", "complete": True, "assignment": "base",
-          "wait_inject": {"frac": 0.008, "dur_min": 10, "dur_max": 25, "seed": 0}})
+          "wait_inject": {"frac": 0.008, "dur_min": 20, "dur_max": 30, "seed": 0}})
 
     # REORDER_STACK: the commanded bottom->top cube order varies per seed (all 6 perms
     # covered via PERMS[seed % 6]). Which cube goes where is decodable ONLY from the
