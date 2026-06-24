@@ -356,6 +356,12 @@ def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None,
     # contrast against the no-wait members. None -> no-wait fast path.
     wait_cfg = (spec.meta or {}).get("wait_inject") if getattr(spec, "meta", None) else None
     wait_rng = _make_wait_rng(wait_cfg, spec.seed, spec.variant_id)
+    # REORDER (variant 3): set the per-episode intended stack order on the env AFTER
+    # reset (which set the default (0,1,2)) and BEFORE the rollout, so evaluate()'s
+    # success check matches the commanded order. Absent -> stays canonical A-B-C.
+    _order = (spec.meta or {}).get("intended_order") if getattr(spec, "meta", None) else None
+    if _order is not None:
+        env.unwrapped.intended_order = tuple(int(x) for x in _order)
     try:
         programs = spec.build(planner, env)
     except Exception as e:  # a plan failure (e.g. -1) drops this variant

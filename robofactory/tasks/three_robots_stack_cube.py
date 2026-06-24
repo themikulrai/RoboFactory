@@ -31,6 +31,12 @@ class ThreeRobotsStackCubeEnv(BaseEnv):
     agent: MultiAgent[Tuple[Panda, Panda, Panda]]
 
     goal_radius = 0.12
+    # SUSTAINED-stack success: the geometric stack + placement + release must HOLD for
+    # this many CONSECUTIVE frames before success fires. Replaces the velocity is_static
+    # gate (which spuriously failed on persistent contact micro-drift). A tower that
+    # collapses right after release resets the counter -> never a success. Matches the
+    # lift_barrier HOLD_FRAMES_K convention.
+    STACK_HOLD_K = 8
 
     def __init__(
         self, *args, robot_uids=("panda", "panda", "panda"), robot_init_qpos_noise=0.02, **kwargs
@@ -108,6 +114,16 @@ class ThreeRobotsStackCubeEnv(BaseEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self.scene_builder.initialize(env_idx)
+        # Per-episode intended stack ORDER (bottom -> mid -> top), as cube indices
+        # 0=cubeA, 1=cubeB, 2=cubeC. Default (0,1,2) = canonical A-B-C, so non-reorder
+        # episodes are byte-identical to the original success. The data-gen runner (and
+        # eventually the eval harness) OVERRIDES self.intended_order AFTER reset to drive
+        # the reorder_stack variant; evaluate() reads it (lazy-init fallback below).
+        self.intended_order = (0, 1, 2)
+        # reset the sustained-stack hold counter for the (re)initialised envs.
+        if getattr(self, "_stack_hold", None) is None:
+            self._stack_hold = torch.zeros(self.num_envs, dtype=torch.long)
+        self._stack_hold[env_idx] = 0
 
 
     @property
@@ -123,53 +139,62 @@ class ThreeRobotsStackCubeEnv(BaseEnv):
         return self.agent.agents[2]
     
     def evaluate(self):
-        pos_A = self.cubeA.pose.p
-        pos_B = self.cubeB.pose.p
-        pos_C = self.cubeC.pose.p
-        offset =  pos_B - pos_A
-        xy_flag = (
-            torch.linalg.norm(offset[..., :2], axis=1)
-            <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
-        )
-        z_flag = torch.abs(offset[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
-        is_cubeB_on_cubeA = torch.logical_and(xy_flag, z_flag)
-        offset = pos_C - pos_B
-        xy_flag = (
-            torch.linalg.norm(offset[..., :2], axis=1)
-            <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
-        )
-        z_flag = torch.abs(offset[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
-        is_cubeC_on_cubeB = torch.logical_and(xy_flag, z_flag)
-        cubeB_to_goal_dist = torch.linalg.norm(
-            self.cubeB.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
-        )
-        cubeB_placed = cubeB_to_goal_dist < self.goal_radius
-        cubeC_to_goal_dist = torch.linalg.norm(
-            self.cubeC.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
-        )
-        cubeC_placed = cubeC_to_goal_dist < self.goal_radius
-        is_cubeA_grasped = self.left_agent.is_grasping(self.cubeA)
-        is_cubeB_grasped = self.right_agent.is_grasping(self.cubeB)
-        is_cubeC_grasped = self.middle_agent.is_grasping(self.cubeC)
-        # ROBUSTNESS: require the two stacked cubes to be SETTLED (near-zero velocity),
-        # mirroring canonical ManiSkill StackCube.evaluate (is_static gate). Without it,
-        # the strict 5mm geometric stack could be satisfied for a single frame while the
-        # tower is still wobbling/mid-collapse -> a false positive. lin/ang thresholds
-        # match upstream (GPU sim shows high ang_vel even when ~not rotating).
-        is_cubeB_static = self.cubeB.is_static(lin_thresh=1e-2, ang_thresh=0.5)
-        is_cubeC_static = self.cubeC.is_static(lin_thresh=1e-2, ang_thresh=0.5)
-        success = (
-            is_cubeC_on_cubeB * is_cubeB_on_cubeA * cubeB_placed * cubeC_placed
-            * is_cubeB_static * is_cubeC_static
-            * (~is_cubeA_grasped) * (~is_cubeB_grasped) * (~is_cubeC_grasped)
-        )
+        # PARAMETERIZED by the per-episode intended stack order (bottom -> mid -> top),
+        # cube indices 0=A,1=B,2=C. Default (0,1,2) = canonical A-B-C (so non-reorder
+        # episodes are byte-identical to the original criterion). Cube i is grasped by
+        # agent i (A<->left/0, B<->right/1, C<->middle/2).
+        order = tuple(int(x) for x in getattr(self, "intended_order", (0, 1, 2)))
+        cubes = [self.cubeA, self.cubeB, self.cubeC]
+        agents = [self.left_agent, self.right_agent, self.middle_agent]
+        bottom, mid, top = cubes[order[0]], cubes[order[1]], cubes[order[2]]
+
+        def _on(upper, lower):
+            off = upper.pose.p - lower.pose.p
+            xy_flag = (
+                torch.linalg.norm(off[..., :2], axis=1)
+                <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
+            )
+            z_flag = torch.abs(off[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
+            return torch.logical_and(xy_flag, z_flag)
+
+        # mid sits on bottom, top sits on mid (the commanded order)
+        is_mid_on_bottom = _on(mid, bottom)
+        is_top_on_mid = _on(top, mid)
+        # the two upper cubes are over the goal region (the bottom is placed there first)
+        mid_placed = torch.linalg.norm(
+            mid.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
+        ) < self.goal_radius
+        top_placed = torch.linalg.norm(
+            top.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
+        ) < self.goal_radius
+        # every cube released by its grasping agent
+        grasped = [agents[k].is_grasping(cubes[k]) for k in range(3)]
+        # SUSTAINED-stack success (replaces the velocity is_static gate): the per-frame
+        # geometric condition C = stack-built + both-upper-placed + all-released must
+        # hold for STACK_HOLD_K CONSECUTIVE frames. A tower that collapses right after
+        # release breaks C -> the counter resets -> never a success; a standing tower
+        # holds C (the persistent uniform contact drift never breaks the RELATIVE 5mm
+        # geometry) and passes. No velocity threshold. Mirrors lift_barrier's _lift_hold.
+        cond = (
+            is_top_on_mid & is_mid_on_bottom & mid_placed & top_placed
+            & (~grasped[0]) & (~grasped[1]) & (~grasped[2])
+        ).bool()
+        # lazy-init the counter (evaluate can fire before _initialize_episode in some
+        # harness paths); match cond's batch shape / device.
+        if getattr(self, "_stack_hold", None) is None:
+            self._stack_hold = torch.zeros_like(cond, dtype=torch.long)
+        hold = self._stack_hold.to(cond.device)
+        hold = torch.where(cond, hold + 1, torch.zeros_like(hold))
+        self._stack_hold = hold
+        success = (hold >= self.STACK_HOLD_K)
         return {
-            "is_cubeA_grasped": is_cubeA_grasped,
-            "is_cubeB_grasped": is_cubeB_grasped,
-            "is_cubeC_grasped": is_cubeC_grasped,
-            "is_cubeA_on_cubeB": is_cubeB_on_cubeA,
-            "is_cubeC_on_cubeA": is_cubeC_on_cubeB,
-            "cubeB_placed": cubeB_placed,
+            "is_cubeA_grasped": grasped[0],
+            "is_cubeB_grasped": grasped[1],
+            "is_cubeC_grasped": grasped[2],
+            "is_mid_on_bottom": is_mid_on_bottom,
+            "is_top_on_mid": is_top_on_mid,
+            "stack_hold": hold,
+            "intended_order": order,
             "success": success.bool(),
         }
 

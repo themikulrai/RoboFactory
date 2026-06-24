@@ -287,6 +287,29 @@ _BASE_ASSIGN: Dict[int, _Assign] = {
 }
 
 
+# cube-index (0=A,1=B,2=C) -> actor name. Arm i grasps cube i, so a reordered _Assign
+# is keyed by the same arm/cube index; only the dest chain + stack_rank change.
+_CUBE_NAME = {0: "cubeA", 1: "cubeB", 2: "cubeC"}
+# All 6 bottom->top orders (cube indices). Fixed deterministic order so the per-seed
+# pick PERMS[seed % 6] is reproducible. Index 0 == (0,1,2) == canonical A-B-C.
+_PERMS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+
+
+def _reorder_assign(order) -> Dict[int, _Assign]:
+    """Permuted _Assign for a bottom->top cube ``order`` (e.g. (2,1,0) == C-B-A).
+
+    Each arm still grasps its OWN cube (arm i <-> cube i, reachable; parking stays
+    arm-indexed so the serial-place choreography is collision-free for ANY order).
+    Only the destination chain + stack_rank change: bottom -> goal_region (rank 0),
+    mid -> onto the bottom cube (rank 1), top -> onto the mid cube (rank 2)."""
+    b, m, t = int(order[0]), int(order[1]), int(order[2])
+    return {
+        b: _Assign(cube=_CUBE_NAME[b], dest_actor_name="goal_region", stack_rank=0),
+        m: _Assign(cube=_CUBE_NAME[m], dest_actor_name=_CUBE_NAME[b], stack_rank=1),
+        t: _Assign(cube=_CUBE_NAME[t], dest_actor_name=_CUBE_NAME[m], stack_rank=2),
+    }
+
+
 def _arm_at_rank(assign: Dict[int, _Assign], rank: int) -> int:
     """Return the arm whose stack_rank == ``rank`` (unique per assignment)."""
     for arm, a in assign.items():
@@ -566,6 +589,17 @@ def sample(seed: int) -> List[ProgramSpec]:
          _build_program(_BASE_ASSIGN, grasp_lead_arm=None),
          {"pick": "simultaneous_wait", "complete": True, "assignment": "base",
           "wait_inject": {"frac": 0.008, "dur_min": 10, "dur_max": 25, "seed": 0}})
+
+    # REORDER_STACK: the commanded bottom->top cube order varies per seed (all 6 perms
+    # covered via PERMS[seed % 6]). Which cube goes where is decodable ONLY from the
+    # place commands, never the scene -> the strongest language-causal signal. The env's
+    # evaluate() is parameterized by meta["intended_order"] (set on the env by the runner
+    # after reset). Collision-free for any order (parking is arm-indexed; places serial).
+    _order = _PERMS[int(seed) % len(_PERMS)]
+    emit("reorder_stack", "stackorder", gid,
+         _build_program(_reorder_assign(_order), grasp_lead_arm=None),
+         {"pick": "simultaneous", "complete": True, "assignment": "reorder",
+          "intended_order": list(_order)})
     gid += 1
 
     return specs
@@ -582,14 +616,21 @@ if __name__ == "__main__":
     print(f"sampled {len(s)} specs in {len(by_group)} contrast groups")
     for gid_, members in sorted(by_group.items()):
         names = [m.name for m in members]
-        assert len(members) == 5, (gid_, names)  # baseline + 3 staggered + wait_hold
+        # baseline + 3 staggered + wait_hold + reorder_stack
+        assert len(members) == 6, (gid_, names)
         assert "simultaneous_pick" in names, (gid_, names)  # single shared baseline
         print(f"  group {gid_}: {names}")
-    assert len(s) == 5 and len(by_group) == 1, (len(s), len(by_group))
-    assert {m.family for m in s} == {"baseline", "pickcoord", "waitcoord"}
+    assert len(s) == 6 and len(by_group) == 1, (len(s), len(by_group))
+    assert {m.family for m in s} == {
+        "baseline", "pickcoord", "waitcoord", "stackorder"}
     assert {m.name for m in s} == {
         "simultaneous_pick", "staggered_pick", "staggered_lead1", "staggered_lead2",
-        "wait_hold"}
+        "wait_hold", "reorder_stack"}
     assert len({m.variant_id for m in s}) == len(s)
     assert [m.name for m in sample(7)] == [m.name for m in s]
+    # every reorder permutation must build a valid keyed _Assign (b/m/t distinct arms)
+    for _o in _PERMS:
+        _a = _reorder_assign(_o)
+        assert set(_a.keys()) == {0, 1, 2}, (_o, _a)
+        assert [_a[_arm_at_rank(_a, r)].stack_rank for r in (0, 1, 2)] == [0, 1, 2]
     print("subtask_scenarios_tsc inline OK")
