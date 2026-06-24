@@ -451,6 +451,7 @@ def run_program(
     wait_inject_frac: float = 0.0,
     wait_inject_dur_min: int = 10,
     wait_inject_dur_max: int = 30,
+    wait_inject_max_events: Optional[int] = None,
 ) -> Dict:
     """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
 
@@ -559,6 +560,7 @@ def run_program(
     step = 0
     n_jitter_steps = 0
     n_wait_steps = 0
+    n_wait_events = 0   # number of WAIT-injection pauses STARTED (capped by max_events)
 
     def _all_done() -> bool:
         return all(a.current is None for a in arms.values())
@@ -598,13 +600,16 @@ def run_program(
         # advance, so cross-arm serial gates simply wait longer (deadlock-free). Only ONE
         # arm is ever paused at a time (bounds the injected-WAIT fraction). ---
         if wait_inject_active:
-            if not any(arms[i].wait_inject_counter > 0 for i in range(num_arms)):
+            _under_cap = (wait_inject_max_events is None
+                          or n_wait_events < wait_inject_max_events)
+            if _under_cap and not any(arms[i].wait_inject_counter > 0 for i in range(num_arms)):
                 cand = [i for i in range(num_arms)
                         if arms[i].current is not None and not blocked_this_tick[i]]
                 if cand and wait_inject_rng.random() < wait_inject_frac:
                     arm_id = int(wait_inject_rng.choice(np.array(sorted(cand))))
                     arms[arm_id].wait_inject_counter = int(wait_inject_rng.integers(
                         wait_inject_dur_min, wait_inject_dur_max + 1))
+                    n_wait_events += 1
             for i in range(num_arms):
                 if arms[i].wait_inject_counter > 0:
                     blocked_this_tick[i] = True
