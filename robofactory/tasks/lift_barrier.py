@@ -136,20 +136,18 @@ class LiftBarrierEnv(BaseEnv):
         # sustained counter kills transient flings (single-frame z-teleports) and tips
         # (don't sustain BOTH ends). Shared with success_candidates so the two stay in
         # lock-step. Runs on the env's BATCHED GPU torch tensors (batch dim kept).
+        # PER-FRAME condition C (single source of truth = lift_barrier_success_strict):
+        # BOTH grasp ends clear base_z+0.25 AND BOTH grippers closed AND BOTH ends are
+        # actually HELD (each arm's TCP within TCP_NEAR_END_MAX of a distinct end). The
+        # held-check closes the empty-closed-gripper false positive (one arm lifts the
+        # bar so both ends clear the height while the other arm just closes on air ->
+        # used to score success without grasping). is_grasping stays DROPPED (contact
+        # probe unreliable on the thin bar ends); TCP-proximity is the robust hold gate.
         from robofactory.tasks.success_candidates import (
-            barrier_grasp_ends_world,
-            arm_gripper_closed,
-            BARRIER_LIFT_DZ,
-            GRIPPER_CLOSE_MAX,  # noqa: F401  (documents the gripper-closed threshold)
+            lift_barrier_success_strict,
             HOLD_FRAMES_K,
         )
-        ends = barrier_grasp_ends_world(self.barrier)            # (num_envs, 2, 3)
-        base_z = self.agent.agents[0].robot.pose.p[0, 2]
-        ends_z = ends[..., 2]                                    # (num_envs, 2)
-        height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (num_envs,)
-        closed0 = arm_gripper_closed(self.agent.agents[0])       # (num_envs,)
-        closed1 = arm_gripper_closed(self.agent.agents[1])       # (num_envs,)
-        c = (height_ok & closed0 & closed1).bool()               # (num_envs,) per-frame
+        c = lift_barrier_success_strict(self).bool()             # (num_envs,) per-frame
         # lazy-init the counter (evaluate can fire before _initialize_episode in some
         # harness paths); match c's batch shape / device.
         if getattr(self, "_lift_hold", None) is None:

@@ -78,6 +78,15 @@ HOLD_FRAMES_K = 8
 # that arm's 9-dim qpos = 7 arm + 2 fingers) sum below this. Open ~0.08, closed ~0.00,
 # so a sum < 0.06 means BOTH fingers are well off the open stop (clamping the bar).
 GRIPPER_CLOSE_MAX = 0.06
+# Max distance (m) from an arm's TCP to a barrier grasp-end for that arm to count as
+# HOLDING that end. Closing the gripper is NOT enough — a closed EMPTY gripper parked
+# in free space has finger-sum < GRIPPER_CLOSE_MAX yet grasps nothing. Requiring the
+# TCP to be AT the end closes that false-positive loophole (one arm lifts/balances the
+# bar so both ends clear the height while the other arm just closes on air). The grasp
+# point sits ~0.074 m above the bar's long axis; a real wrap-grasp puts the panda TCP
+# within a few cm of it, so 0.08 m is generous for genuine grasps but excludes an
+# empty gripper parked elsewhere.
+TCP_NEAR_END_MAX = 0.08
 
 
 def _quat_rotate_wxyz(q, v):
@@ -127,6 +136,39 @@ def arm_gripper_closed(agent):
     return finger_sum < GRIPPER_CLOSE_MAX
 
 
+def arm_tcp_world(agent):
+    """Batched world xyz (..., 3) of an arm's TCP (tool-center-point).
+
+    ManiSkill's Panda sets ``agent.tcp`` (the ee link) at init; fall back to the named
+    ee link if needed. Used to verify the gripper is AT a bar end (holding it), not
+    just closed."""
+    tcp = getattr(agent, "tcp", None)
+    if tcp is None:
+        from mani_skill.utils import sapien_utils
+        tcp = sapien_utils.get_obj_by_name(agent.robot.links, agent.ee_link_name)
+    return torch.as_tensor(tcp.pose.p)               # (..., 3)
+
+
+def both_ends_held(agents, ends):
+    """Batched bool (...,): is EACH grasp end held by a DISTINCT arm's TCP (within
+    TCP_NEAR_END_MAX)? Assignment-agnostic — tries both arm<->end pairings and takes
+    the better one — so it doesn't depend on the left/right convention. This is the
+    gate that distinguishes a real two-arm grasp from one arm lifting while the other
+    closes on air."""
+    t0 = arm_tcp_world(agents[0])                    # (..., 3)
+    t1 = arm_tcp_world(agents[1])
+    e0 = ends[..., 0, :]                             # (..., 3)
+    e1 = ends[..., 1, :]
+    d00 = torch.linalg.norm(t0 - e0, dim=-1)
+    d01 = torch.linalg.norm(t0 - e1, dim=-1)
+    d10 = torch.linalg.norm(t1 - e0, dim=-1)
+    d11 = torch.linalg.norm(t1 - e1, dim=-1)
+    D = TCP_NEAR_END_MAX
+    assign_a = (d00 < D) & (d11 < D)                 # arm0->end0, arm1->end1
+    assign_b = (d01 < D) & (d10 < D)                 # arm0->end1, arm1->end0
+    return (assign_a | assign_b).bool()
+
+
 def lift_barrier_success_strict(env):
     """Strict LiftBarrier PER-FRAME geometric predicate (drops is_grasping).
 
@@ -164,7 +206,10 @@ def lift_barrier_success_strict(env):
     height_ok = (ends_z > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (...,) both ends
     closed0 = arm_gripper_closed(e.agent.agents[0])
     closed1 = arm_gripper_closed(e.agent.agents[1])
-    return (height_ok & closed0 & closed1).bool()
+    # NEW: each end must actually be HELD (an arm's TCP at it), not just have a closed
+    # gripper somewhere. Closes the empty-closed-gripper false positive.
+    held = both_ends_held(e.agent.agents, ends)
+    return (height_ok & closed0 & closed1 & held).bool()
 
 
 # ----------------------------------------------------------------------------
