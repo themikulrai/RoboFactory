@@ -557,6 +557,17 @@ def run_program(
         wait_inject_rng is not None and wait_inject_frac > 0.0
         and wait_inject_dur_max > 0
     )
+    # verb-targeted UNIFORM mode: pre-pick (target arm, target ti-fraction) from the
+    # wait RNG so the freeze lands on a UNIFORMLY-RANDOM arm at a random mid-primitive
+    # point (vs the default probabilistic "first moving arm" mode, which is biased to
+    # the first placer in a serial choreography). The freeze fires deterministically
+    # when the target arm's target-verb primitive crosses target_frac. Reproducible.
+    wait_target_arm = None
+    wait_target_frac = 0.0
+    if wait_inject_active and wait_inject_verb_id is not None:
+        wait_target_arm = int(wait_inject_rng.integers(0, num_arms))
+        wait_target_frac = float(
+            wait_inject_rng.uniform(wait_inject_ti_lo, wait_inject_ti_hi))
 
     info = {}
     terminated = truncated = False
@@ -607,27 +618,26 @@ def run_program(
                           or n_wait_events < wait_inject_max_events)
             if _under_cap and not any(arms[i].wait_inject_counter > 0 for i in range(num_arms)):
                 if wait_inject_verb_id is None:
-                    # any genuinely-moving arm at a random tick.
+                    # PROBABILISTIC mode: freeze any genuinely-moving arm at a random
+                    # tick (biased to the first mover in a serial choreography).
                     cand = [i for i in range(num_arms)
                             if arms[i].current is not None and not blocked_this_tick[i]]
+                    if cand and wait_inject_rng.random() < wait_inject_frac:
+                        arm_id = int(wait_inject_rng.choice(np.array(sorted(cand))))
+                        arms[arm_id].wait_inject_counter = int(wait_inject_rng.integers(
+                            wait_inject_dur_min, wait_inject_dur_max + 1))
+                        n_wait_events += 1
                 else:
-                    # ONLY an arm that is PARTWAY through a primitive of the target verb
-                    # (e.g. mid-PLACE: cube descending toward the target, ti in the
-                    # middle window) -> the freeze lands visibly mid-action, not at the
-                    # primitive's start/end where the arm looks parked.
-                    cand = [
-                        i for i in range(num_arms)
-                        if (not blocked_this_tick[i] and arms[i].built is not None
-                            and arms[i].built.verb_id == wait_inject_verb_id
-                            and wait_inject_ti_lo
-                            <= arms[i].ti / max(arms[i].built.n_ticks, 1)
-                            <= wait_inject_ti_hi)
-                    ]
-                if cand and wait_inject_rng.random() < wait_inject_frac:
-                    arm_id = int(wait_inject_rng.choice(np.array(sorted(cand))))
-                    arms[arm_id].wait_inject_counter = int(wait_inject_rng.integers(
-                        wait_inject_dur_min, wait_inject_dur_max + 1))
-                    n_wait_events += 1
+                    # UNIFORM verb-targeted mode: freeze the PRE-PICKED target arm the
+                    # moment its target-verb primitive (e.g. PLACE) crosses the pre-picked
+                    # mid-point fraction -> uniformly-random arm, random mid-action point.
+                    a = arms[wait_target_arm]
+                    if (not blocked_this_tick[wait_target_arm] and a.built is not None
+                            and a.built.verb_id == wait_inject_verb_id
+                            and a.ti / max(a.built.n_ticks, 1) >= wait_target_frac):
+                        a.wait_inject_counter = int(wait_inject_rng.integers(
+                            wait_inject_dur_min, wait_inject_dur_max + 1))
+                        n_wait_events += 1
             for i in range(num_arms):
                 if arms[i].wait_inject_counter > 0:
                     blocked_this_tick[i] = True
