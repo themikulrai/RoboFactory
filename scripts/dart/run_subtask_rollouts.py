@@ -383,6 +383,7 @@ def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None,
             wait_inject_dur_min=(int(wait_cfg.get("dur_min", 10)) if wait_cfg else 10),
             wait_inject_dur_max=(int(wait_cfg.get("dur_max", 30)) if wait_cfg else 30),
             wait_inject_max_events=(wait_cfg.get("max_events") if wait_cfg else None),
+            wait_inject_verb_id=(wait_cfg.get("verb_id") if wait_cfg else None),
         )
     except Exception as e:
         # JIT plan failures fire DURING the rollout, not at build (primitives plan

@@ -452,6 +452,9 @@ def run_program(
     wait_inject_dur_min: int = 10,
     wait_inject_dur_max: int = 30,
     wait_inject_max_events: Optional[int] = None,
+    wait_inject_verb_id: Optional[int] = None,
+    wait_inject_ti_lo: float = 0.3,
+    wait_inject_ti_hi: float = 0.7,
 ) -> Dict:
     """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
 
@@ -603,8 +606,23 @@ def run_program(
             _under_cap = (wait_inject_max_events is None
                           or n_wait_events < wait_inject_max_events)
             if _under_cap and not any(arms[i].wait_inject_counter > 0 for i in range(num_arms)):
-                cand = [i for i in range(num_arms)
-                        if arms[i].current is not None and not blocked_this_tick[i]]
+                if wait_inject_verb_id is None:
+                    # any genuinely-moving arm at a random tick.
+                    cand = [i for i in range(num_arms)
+                            if arms[i].current is not None and not blocked_this_tick[i]]
+                else:
+                    # ONLY an arm that is PARTWAY through a primitive of the target verb
+                    # (e.g. mid-PLACE: cube descending toward the target, ti in the
+                    # middle window) -> the freeze lands visibly mid-action, not at the
+                    # primitive's start/end where the arm looks parked.
+                    cand = [
+                        i for i in range(num_arms)
+                        if (not blocked_this_tick[i] and arms[i].built is not None
+                            and arms[i].built.verb_id == wait_inject_verb_id
+                            and wait_inject_ti_lo
+                            <= arms[i].ti / max(arms[i].built.n_ticks, 1)
+                            <= wait_inject_ti_hi)
+                    ]
                 if cand and wait_inject_rng.random() < wait_inject_frac:
                     arm_id = int(wait_inject_rng.choice(np.array(sorted(cand))))
                     arms[arm_id].wait_inject_counter = int(wait_inject_rng.integers(
