@@ -150,9 +150,18 @@ class ThreeRobotsStackCubeEnv(BaseEnv):
         cubeC_placed = cubeC_to_goal_dist < self.goal_radius
         is_cubeA_grasped = self.left_agent.is_grasping(self.cubeA)
         is_cubeB_grasped = self.right_agent.is_grasping(self.cubeB)
-        is_cubeC_grasped = self.left_agent.is_grasping(self.cubeC)
+        is_cubeC_grasped = self.middle_agent.is_grasping(self.cubeC)
+        # ROBUSTNESS: require the two stacked cubes to be SETTLED (near-zero velocity),
+        # mirroring canonical ManiSkill StackCube.evaluate (is_static gate). Without it,
+        # the strict 5mm geometric stack could be satisfied for a single frame while the
+        # tower is still wobbling/mid-collapse -> a false positive. lin/ang thresholds
+        # match upstream (GPU sim shows high ang_vel even when ~not rotating).
+        is_cubeB_static = self.cubeB.is_static(lin_thresh=1e-2, ang_thresh=0.5)
+        is_cubeC_static = self.cubeC.is_static(lin_thresh=1e-2, ang_thresh=0.5)
         success = (
-            is_cubeC_on_cubeB * is_cubeB_on_cubeA * cubeB_placed * cubeC_placed * (~is_cubeA_grasped) * (~is_cubeB_grasped) * (~is_cubeC_grasped)
+            is_cubeC_on_cubeB * is_cubeB_on_cubeA * cubeB_placed * cubeC_placed
+            * is_cubeB_static * is_cubeC_static
+            * (~is_cubeA_grasped) * (~is_cubeB_grasped) * (~is_cubeC_grasped)
         )
         return {
             "is_cubeA_grasped": is_cubeA_grasped,

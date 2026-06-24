@@ -735,6 +735,18 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         jitter_frac=float(jitter_frac), jitter_sigma=float(jitter_sigma),
         jitter_seed=int(dart_seed),
     )
+    # Jitter explicitly DISABLED (clean slice): no-jitter fast path -> byte-identical
+    # to the un-perturbed contrastive demo. Keeps the clean slice a pure reference.
+    jitter_off = JitterCfg(jitter_frac=0.0, jitter_sigma=0.0, jitter_seed=int(dart_seed))
+    # Shove explicitly DISABLED (merged + clean slices): sigma=0 -> hook OFF, but
+    # object-randomisation (aug config) still applies. Same fields as base otherwise.
+    no_shove_cfg = DartCfg(
+        sigma=0.0, floor=base_dart_cfg.floor,
+        k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
+        p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
+        grasp_settle_steps=base_dart_cfg.grasp_settle_steps,
+        shove_joints=base_dart_cfg.shove_joints,
+    )
 
     # --- slice plan ---
     # No --mix: a SINGLE slice governed by --dart-sigma (today's behavior), tagged
@@ -745,32 +757,23 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     # Each slice gets a portion of the --num episode budget.
     if mix_slices:
         budgets = _split_budget(num, mix_slices)
-        plan = []  # (slice_tag, baseline_only, dart_cfg, budget, per_member)
+        plan = []  # (slice_tag, baseline_only, dart_cfg, budget, per_member, jcfg)
         for name, _frac in mix_slices:
             if name == "recovery":
                 # baseline-only -> 1-member groups; atomic==per-member, keep atomic.
-                plan.append(("recovery", True, base_dart_cfg, budgets[name], False))
+                # FINAL recipe: shove ON (base_dart_cfg) + jitter ON.
+                plan.append(("recovery", True, base_dart_cfg, budgets[name], False, jitter_cfg))
             elif name == "merged":
-                # PER-MEMBER keep: atomic-over-N collapses the yield once the arm-shove is
-                # on (~p^N, e.g. 0.4^3~6%). Keep each passing variant independently; the
-                # deterministic 'clean' slice supplies the guaranteed matched contrast.
-                plan.append(("merged", False, base_dart_cfg, budgets[name], True))
+                # PER-MEMBER keep (atomic-over-N collapses yield).
+                # FINAL recipe: shove OFF (no_shove_cfg) + jitter ON. Contrast groups
+                # perturbed by dense jitter + object-noise, no arm-shove.
+                plan.append(("merged", False, no_shove_cfg, budgets[name], True, jitter_cfg))
             elif name == "clean":
-                # object noise (aug config) stays ON; arm-disturbance hook OFF.
-                # PER-MEMBER keep: atomic-over-3 collapsed the clean yield (one weak
-                # member dropped its whole matched group -> near-zero clean kept). Keep
-                # each passing variant independently; per-variant skew is now tracked
-                # (meta["variant_kept"]) so we can SEE if the contrast drifts.
-                clean_cfg = DartCfg(
-                    sigma=0.0, floor=base_dart_cfg.floor,
-                    k_min=base_dart_cfg.k_min, k_max=base_dart_cfg.k_max,
-                    p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
-                    grasp_settle_steps=base_dart_cfg.grasp_settle_steps,
-                    shove_joints=base_dart_cfg.shove_joints,
-                )
-                plan.append(("clean", False, clean_cfg, budgets[name], True))
+                # PER-MEMBER keep; object noise (aug config) stays ON.
+                # FINAL recipe: shove OFF + jitter OFF -> pure matched-contrast reference.
+                plan.append(("clean", False, no_shove_cfg, budgets[name], True, jitter_off))
     else:
-        plan = [("default", False, base_dart_cfg, num, False)]
+        plan = [("default", False, base_dart_cfg, num, False, jitter_cfg)]
 
     print(f"[subtask] task={task_name}  env_id={env_id}  n_agents={n_agents}")
     print(f"[subtask] config={config_path} (suffix={config_suffix!r})")
@@ -779,7 +782,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     print(f"[subtask] variants_filter={variants}  dart_sigma={dart_sigma} "
           f"floor={floor} k=[{k_min},{k_max}] p_inject={p_inject}  max_steps={max_steps}")
     print(f"[subtask] slice plan: "
-          f"{[(t, 'baseline-only' if bo else 'full', 'hookON' if c.sigma > 0 else 'hookOFF', 'per-member' if pm else 'atomic', b) for t, bo, c, b, pm in plan]}")
+          f"{[(t, 'baseline-only' if bo else 'full', 'shoveON' if c.sigma > 0 else 'shoveOFF', 'jitterON' if jc.jitter_frac > 0 else 'jitterOFF', 'per-member' if pm else 'atomic', b) for t, bo, c, b, pm, jc in plan]}")
 
     seeds = override_seeds if override_seeds is not None else _load_seeds(task_name, num)
     print(f"[subtask] per_attempt_timeout={per_attempt_timeout}s (SIGALRM per variant)",
@@ -825,11 +828,12 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
             json.dump(meta, f, indent=2)
 
     try:
-        for slice_tag, baseline_only, dart_cfg, slice_budget, per_member in plan:
+        for slice_tag, baseline_only, dart_cfg, slice_budget, per_member, slice_jitter_cfg in plan:
             this_slice_kept = 0
             print(f"[subtask] === slice {slice_tag!r}: budget={slice_budget} "
                   f"(baseline_only={baseline_only}, "
-                  f"hook={'on' if dart_cfg.sigma > 0 else 'off'}) ===", flush=True)
+                  f"shove={'on' if dart_cfg.sigma > 0 else 'off'}, "
+                  f"jitter={'on' if slice_jitter_cfg.jitter_frac > 0 else 'off'}) ===", flush=True)
             for seed in seeds:
                 if this_slice_kept >= slice_budget:
                     break
@@ -848,7 +852,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                         env, members, max_steps, per_attempt_timeout, dart_cfg,
                         stream_h5, episodes_meta, slice_tag, seed, gid, kept,
                         per_member=per_member, variant_kept=variant_kept,
-                        jitter_cfg=jitter_cfg,
+                        jitter_cfg=slice_jitter_cfg,
                     )
                     # count kept episodes regardless of full-group success (per-member
                     # slices keep partial groups); kept_groups counts only complete groups.
