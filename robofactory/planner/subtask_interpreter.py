@@ -441,6 +441,8 @@ def run_program(
     jitter_frac: float = 0.0,
     jitter_sigma: float = 0.0,
     jitter_rng: Optional[np.random.Generator] = None,
+    jitter_freeze_qi: Optional[int] = None,
+    settle_steps: int = 0,
 ) -> Dict:
     """Run per-arm primitive RECIPE programs through the wrapped env, labelling live.
 
@@ -638,8 +640,16 @@ def run_program(
         # The recorded env.step below is UNCHANGED (still the clean waypoint), so the
         # recorded ACTION stays clean while the next recorded OBS drifts. The arm is
         # chosen from the genuinely-moving arms only (never an idle/blocked arm). ---
-        if jitter_active and moving_waypoints and jitter_rng.random() < jitter_frac:
-            arm_id = int(jitter_rng.choice(np.array(sorted(moving_waypoints))))
+        # PHASE-GATE jitter: exclude arms at qi >= jitter_freeze_qi (e.g. an arm in
+        # its place/open/retreat for TSC) so the dense nudge never wobbles a fragile
+        # tower mid-stack. None -> no freeze (every moving arm eligible, LB unchanged).
+        jitter_eligible = (
+            moving_waypoints if jitter_freeze_qi is None
+            else {i: w for i, w in moving_waypoints.items()
+                  if int(arms[i].qi) < jitter_freeze_qi}
+        )
+        if jitter_active and jitter_eligible and jitter_rng.random() < jitter_frac:
+            arm_id = int(jitter_rng.choice(np.array(sorted(jitter_eligible))))
             # carry each arm's FROZEN grip (last commanded) so the nudge never flips a
             # grasp; non-nudged arms hold their live qpos inside jitter_nudge.
             grips = [float(arms[i].frozen_grip) for i in range(num_arms)]
@@ -687,6 +697,30 @@ def run_program(
 
         if terminated or truncated:
             break
+
+    # --- SETTLE: after the program completes, hold ALL arms still for settle_steps
+    # RECORDED steps so the tower settles before the final success check. This (a)
+    # lets a genuinely-good stack pass an is_static success gate that the last MOVING
+    # frame would blip, and (b) correctly REJECTS a tower that topples once the arms
+    # stop holding it. Skipped if the env already terminated (e.g. auto-terminate on
+    # success) or truncated. Labelled WAIT (benign hold-still frames). ---
+    if settle_steps > 0 and not (terminated or truncated):
+        for _ in range(settle_steps):
+            if step >= max_steps:
+                break
+            action_dict = {
+                f"{action_prefix}-{i}": _action_for(
+                    control_mode, arms[i].frozen_qpos, arms[i].frozen_grip)
+                for i in range(num_arms)
+            }
+            obs, reward, terminated, truncated, info = env.step(action_dict)
+            recorder.append({
+                i: (vocab.WAIT, 0, vocab.render(vocab.WAIT, 0, _task_name()))
+                for i in range(num_arms)
+            })
+            step += 1
+            if terminated or truncated:
+                break
 
     # assemble success report
     success_report: Dict[int, Dict[int, Optional[bool]]] = {

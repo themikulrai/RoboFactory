@@ -114,6 +114,12 @@ class DartCfg:
     p_inject: float = 0.5
     dart_seed: int = 0
     shove_after_qi: int = 2
+    # PHASE-GATE upper bound: an arm ENTERING a primitive with qi >= shove_max_qi is
+    # NOT shoved. Default 10**9 == no upper bound (LB unchanged). For TSC pass
+    # shove_max_qi=PLACE_IDX(3) so the shove only lands during pick/transport (qi==2,
+    # the lift) and is FROZEN during place/open/retreat -- a shove on a placing arm
+    # topples the fragile 3-cube tower.
+    shove_max_qi: int = 10**9
     grasp_settle_steps: int = 10
     # PROXIMAL-ONLY shove: Panda joints 0-3 (base/shoulder/elbow) are perturbed; the
     # wrist joints 4,5,6 are left at their setpoint so the hand keeps its grip
@@ -205,6 +211,7 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
     counter = {"tc": 0}            # transition counter (closure state)
     forced = {"done": False}       # whether the force-first post-grasp shove has fired
     shove_after_qi = int(getattr(dart_cfg, "shove_after_qi", 2))
+    shove_max_qi = int(getattr(dart_cfg, "shove_max_qi", 10**9))
 
     def hook(unwrapped_env, state):
         tc = counter["tc"]
@@ -230,7 +237,12 @@ def _make_boundary_hook(dart_cfg, env_seed, variant_id):
         # SHOVE ONLY a HELD bar: restrict to moving arms whose grasp is already seated
         # (program progress qi >= shove_after_qi, i.e. on/at the lift). An arm that has
         # not grasped yet is never a shove target (no flinging the un-grasped bar).
-        moving = [i for i in moving if int(getattr(arms[i], "qi", 0)) >= shove_after_qi]
+        # lower bound: grasp seated (qi >= shove_after_qi). upper bound (phase-gate):
+        # never shove an arm entering its place/open/retreat (qi >= shove_max_qi).
+        moving = [
+            i for i in moving
+            if shove_after_qi <= int(getattr(arms[i], "qi", 0)) < shove_max_qi
+        ]
         if not moving:
             return
 
@@ -298,7 +310,8 @@ def _build_planner(env, seed):
     return planner
 
 
-def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None):
+def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None,
+                     jitter_freeze_qi=None, settle_steps=0):
     """Reset to the spec's seed, build the program, run it, return the result.
 
     The DART boundary_hook is built PER VARIANT here from ``dart_cfg`` keyed on
@@ -332,6 +345,8 @@ def _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg=None):
             jitter_frac=(jitter_cfg.jitter_frac if jitter_cfg else 0.0),
             jitter_sigma=(jitter_cfg.jitter_sigma if jitter_cfg else 0.0),
             jitter_rng=jitter_rng,
+            jitter_freeze_qi=jitter_freeze_qi,
+            settle_steps=settle_steps,
         )
     except Exception as e:
         # JIT plan failures fire DURING the rollout, not at build (primitives plan
@@ -364,6 +379,15 @@ def _env_success(info):
         return False
 
 
+# When True (set by run(require_env_success=True)), the keep gate requires a REAL
+# env success at the (post-settle) final frame and DROPS the ``OR completed`` backdoor.
+# The backdoor exists for LiftBarrier (its per-arm queues empty before the lift
+# auto-terminates) but it WRONGLY passes TSC episodes where the arms finish their
+# scripted place/retreat motions yet the tower toppled / was never built. TSC must
+# require the env's stack-success.
+REQUIRE_ENV_SUCCESS = False
+
+
 def _member_passes(out):
     """Per-member KEEP predicate.
 
@@ -393,6 +417,9 @@ def _member_passes(out):
         return False
     if not out.get("all_success", False):
         return False
+    if REQUIRE_ENV_SUCCESS:
+        # strict: a real (settled) env stack-success only -- no ``completed`` backdoor.
+        return _env_success(out.get("info"))
     return _env_success(out.get("info")) or out.get("completed", False)
 
 
@@ -528,7 +555,7 @@ def _write_member(stream_h5, episodes_meta, slice_tag, seed, episode_id, rec, T,
 def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
                    stream_h5, episodes_meta, slice_tag, seed, gid,
                    kept_so_far, per_member=False, variant_kept=None,
-                   jitter_cfg=None):
+                   jitter_cfg=None, jitter_freeze_qi=None, settle_steps=0):
     """Run ONE contrast group.
 
     per_member=False (default): ATOMIC single-pass-with-delete. Each member runs ONCE;
@@ -562,7 +589,9 @@ def _process_group(env, members, max_steps, per_attempt_timeout, dart_cfg,
     for spec in members:
         signal.alarm(int(per_attempt_timeout))
         try:
-            rec, out = _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg)
+            rec, out = _run_one_variant(env, spec, max_steps, dart_cfg, jitter_cfg,
+                                        jitter_freeze_qi=jitter_freeze_qi,
+                                        settle_steps=settle_steps)
         except _SolverTimeout:
             print(f"  [{slice_tag}] seed {seed} group {gid} variant {spec.name}: "
                   f"TIMEOUT after {per_attempt_timeout}s", flush=True)
@@ -643,7 +672,13 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         per_attempt_timeout=300, override_seeds=None, save_video=False,
         floor=0.05, k_min=3, k_max=8, p_inject=0.5, config_suffix="", mix="",
         grasp_settle_steps=10, shove_joints=(0, 1, 2, 3),
-        jitter_frac=0.0, jitter_sigma=0.0):
+        jitter_frac=0.0, jitter_sigma=0.0,
+        require_env_success=False, jitter_freeze_qi=None,
+        shove_max_qi=None, settle_steps=0):
+    global REQUIRE_ENV_SUCCESS
+    REQUIRE_ENV_SUCCESS = bool(require_env_success)
+    # None -> no upper bound (LB unchanged); an int freezes shove at qi >= this.
+    _shove_max_qi = int(shove_max_qi) if shove_max_qi is not None else 10**9
     if task_name not in TASK_MAP:
         sys.exit(f"[ERROR] task {task_name!r} has no subtask scenario sampler "
                  f"(runnable: {sorted(TASK_MAP)}). 3SC is Phase-4.")
@@ -724,6 +759,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         k_min=int(k_min), k_max=int(k_max), p_inject=float(p_inject),
         dart_seed=int(dart_seed), grasp_settle_steps=int(grasp_settle_steps),
         shove_joints=tuple(int(j) for j in shove_joints),
+        shove_max_qi=_shove_max_qi,
     )
 
     # --- DART DENSE jitter config (orthogonal to the sparse shove; reused by every
@@ -746,6 +782,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         p_inject=base_dart_cfg.p_inject, dart_seed=base_dart_cfg.dart_seed,
         grasp_settle_steps=base_dart_cfg.grasp_settle_steps,
         shove_joints=base_dart_cfg.shove_joints,
+        shove_max_qi=base_dart_cfg.shove_max_qi,
     )
 
     # --- slice plan ---
@@ -853,6 +890,8 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
                         stream_h5, episodes_meta, slice_tag, seed, gid, kept,
                         per_member=per_member, variant_kept=variant_kept,
                         jitter_cfg=slice_jitter_cfg,
+                        jitter_freeze_qi=jitter_freeze_qi,
+                        settle_steps=settle_steps,
                     )
                     # count kept episodes regardless of full-group success (per-member
                     # slices keep partial groups); kept_groups counts only complete groups.
@@ -964,6 +1003,26 @@ if __name__ == "__main__":
                          "no random-walk). Default 0.0 = OFF. DART's recipe uses 0.05. "
                          "Both --jitter-frac>0 AND --jitter-sigma>0 are required to "
                          "enable jitter.")
+    ap.add_argument("--require-env-success", action="store_true", default=False,
+                    dest="require_env_success",
+                    help="KEEP only episodes with a REAL env success at the "
+                         "(post-settle) final frame -- drop the 'OR completed' "
+                         "backdoor. Needed for TSC (a finished place/retreat motion "
+                         "does NOT mean the tower stands). Leave OFF for LiftBarrier.")
+    ap.add_argument("--jitter-freeze-qi", type=int, default=None,
+                    dest="jitter_freeze_qi",
+                    help="PHASE-GATE jitter: an arm at program-index qi >= this is "
+                         "EXCLUDED from dense jitter (e.g. 3 = freeze during "
+                         "place/open/retreat for TSC). None = no freeze.")
+    ap.add_argument("--shove-max-qi", type=int, default=None, dest="shove_max_qi",
+                    help="PHASE-GATE shove: never shove an arm ENTERING a primitive "
+                         "with qi >= this (e.g. 3 = shove only on the lift for TSC, "
+                         "freeze during place/stack). None = no upper bound (LB).")
+    ap.add_argument("--settle-steps", type=int, default=0, dest="settle_steps",
+                    help="after the program completes, hold ALL arms still for N "
+                         "RECORDED steps so the tower settles before the success "
+                         "check -- keeps stable stacks, rejects ones that topple on "
+                         "release. Default 0 = OFF (LB unchanged).")
     ap.add_argument("--config-suffix", type=str, default="", dest="config_suffix",
                     help="splice into the yaml stem, e.g. '_aug' maps "
                          "lift_barrier.yaml -> lift_barrier_aug.yaml (object noise).")
@@ -1007,4 +1066,8 @@ if __name__ == "__main__":
         grasp_settle_steps=args.grasp_settle_steps,
         shove_joints=shove_joints,
         jitter_frac=args.jitter_frac,
-        jitter_sigma=args.jitter_sigma)
+        jitter_sigma=args.jitter_sigma,
+        require_env_success=args.require_env_success,
+        jitter_freeze_qi=args.jitter_freeze_qi,
+        shove_max_qi=args.shove_max_qi,
+        settle_steps=args.settle_steps)
