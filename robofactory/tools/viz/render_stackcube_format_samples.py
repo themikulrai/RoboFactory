@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 from PIL import Image
 
 OUT_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site/media/StackCube_formats")
-FPS = 30
+FPS = 20  # true sim control rate (matches LeRobot info.json fps); all four panels share this
 
 
 def _label(img: np.ndarray, text: str) -> np.ndarray:
