@@ -24,12 +24,24 @@ import robofactory.utils.scenes as scene_rf
 from robofactory import CONFIG_DIR
 from robofactory.utils.nested_dict_utils import nested_yaml_map, replace_dir
 
-@register_env("TwoRobotsStackCube-rf", max_episode_steps=500)
+# max_episode_steps bumped 500 -> 600 so the wait_hold causal variant (a single
+# ~200-tick mid-place freeze injected on top of the ~300-tick natural stack) does NOT
+# truncate before the stack completes + the 8-frame sustained-hold success fires. The
+# non-wait variants auto-terminate on success ~300 steps, so the larger budget is a
+# no-op for them. (TSC uses 800; 2SC's shorter episodes only need 600.)
+@register_env("TwoRobotsStackCube-rf", max_episode_steps=600)
 class TwoRobotsStackCubeEnv(BaseEnv):
     SUPPORTED_ROBOTS = [("panda", "panda")]
     agent: MultiAgent[Tuple[Panda, Panda]]
 
     goal_radius = 0.11
+    # SUSTAINED-stack success: the geometric stack + placement + release must HOLD for
+    # this many CONSECUTIVE frames before success fires. Replaces the instantaneous
+    # criterion (which can blip on a tower that collapses right after release, and which
+    # the velocity is_static gate spuriously failed on persistent contact micro-drift).
+    # A tower that collapses right after release resets the counter -> never a success.
+    # Matches the TSC STACK_HOLD_K / lift_barrier HOLD_FRAMES_K convention.
+    STACK_HOLD_K = 8
 
     def __init__(
         self, *args, robot_uids=("panda", "panda"), robot_init_qpos_noise=0.02, **kwargs
@@ -108,6 +120,16 @@ class TwoRobotsStackCubeEnv(BaseEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self.scene_builder.initialize(env_idx)
+        # Per-episode intended stack ORDER (bottom -> top), as cube indices 0=cubeA,
+        # 1=cubeB. Default (0,1) = canonical A-B, so non-reorder episodes are
+        # byte-identical to the original success. The data-gen runner (and eventually
+        # the eval harness) OVERRIDES self.intended_order AFTER reset to drive the
+        # reorder_stack variant; evaluate() reads it (lazy-init fallback below).
+        self.intended_order = (0, 1)
+        # reset the sustained-stack hold counter for the (re)initialised envs.
+        if getattr(self, "_stack_hold", None) is None:
+            self._stack_hold = torch.zeros(self.num_envs, dtype=torch.long)
+        self._stack_hold[env_idx] = 0
 
     @property
     def left_agent(self) -> Panda:
@@ -118,29 +140,53 @@ class TwoRobotsStackCubeEnv(BaseEnv):
         return self.agent.agents[1]
 
     def evaluate(self):
-        pos_A = self.cubeA.pose.p
-        pos_B = self.cubeB.pose.p
-        offset = pos_B - pos_A
+        # PARAMETERIZED by the per-episode intended stack order (bottom -> top), cube
+        # indices 0=cubeA, 1=cubeB. Default (0,1) = canonical A-B (so non-reorder
+        # episodes are byte-identical to the original criterion). Cube i is grasped by
+        # agent i (A<->left/0, B<->right/1).
+        order = tuple(int(x) for x in getattr(self, "intended_order", (0, 1)))
+        cubes = [self.cubeA, self.cubeB]
+        agents = [self.left_agent, self.right_agent]
+        bottom, top = cubes[order[0]], cubes[order[1]]
+
+        # top sits on bottom (the commanded order)
+        offset = top.pose.p - bottom.pose.p
         xy_flag = (
             torch.linalg.norm(offset[..., :2], axis=1)
             <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
         )
         z_flag = torch.abs(offset[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
-        is_cubeB_on_cubeA = torch.logical_and(xy_flag, z_flag)
-        cubeA_to_goal_dist = torch.linalg.norm(
-            self.cubeA.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
-        )
-        cubeA_placed = cubeA_to_goal_dist < self.goal_radius
-        is_cubeA_grasped = self.left_agent.is_grasping(self.cubeA)
-        is_cubeB_grasped = self.right_agent.is_grasping(self.cubeB)
-        success = (
-            is_cubeB_on_cubeA * cubeA_placed * (~is_cubeA_grasped) * (~is_cubeB_grasped)
-        )
+        is_top_on_bottom = torch.logical_and(xy_flag, z_flag)
+        # the bottom cube is placed in the goal region
+        bottom_placed = torch.linalg.norm(
+            bottom.pose.p[:, :2] - self.goal_region.pose.p[..., :2], axis=1
+        ) < self.goal_radius
+        # every cube released by its grasping agent
+        grasped = [agents[k].is_grasping(cubes[k]) for k in range(2)]
+        # SUSTAINED-stack success (replaces the instantaneous criterion): the per-frame
+        # geometric condition C = top-on-bottom + bottom-placed + both-released must hold
+        # for STACK_HOLD_K CONSECUTIVE frames. A tower that collapses right after release
+        # breaks C -> the counter resets -> never a success; a standing tower holds C
+        # (the persistent uniform contact drift never breaks the RELATIVE 5mm geometry)
+        # and passes. No velocity threshold. Mirrors TSC / lift_barrier.
+        cond = (
+            is_top_on_bottom & bottom_placed & (~grasped[0]) & (~grasped[1])
+        ).bool()
+        # lazy-init the counter (evaluate can fire before _initialize_episode in some
+        # harness paths); match cond's batch shape / device.
+        if getattr(self, "_stack_hold", None) is None:
+            self._stack_hold = torch.zeros_like(cond, dtype=torch.long)
+        hold = self._stack_hold.to(cond.device)
+        hold = torch.where(cond, hold + 1, torch.zeros_like(hold))
+        self._stack_hold = hold
+        success = (hold >= self.STACK_HOLD_K)
         return {
-            "is_cubeA_grasped": is_cubeA_grasped,
-            "is_cubeB_grasped": is_cubeB_grasped,
-            "is_cubeB_on_cubeA": is_cubeB_on_cubeA,
-            "cubeB_placed": cubeA_placed,
+            "is_cubeA_grasped": grasped[0],
+            "is_cubeB_grasped": grasped[1],
+            "is_top_on_bottom": is_top_on_bottom,
+            "bottom_placed": bottom_placed,
+            "stack_hold": hold,
+            "intended_order": order,
             "success": success.bool(),
         }
 

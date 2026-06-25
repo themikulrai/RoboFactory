@@ -63,6 +63,7 @@ import robofactory  # registers envs + PandaWristCamMulti  # noqa: E402
 from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver  # noqa: E402
 from robofactory.planner import subtask_scenarios as scenarios  # noqa: E402
 from robofactory.planner import subtask_scenarios_tsc as scenarios_tsc  # noqa: E402
+from robofactory.planner import subtask_scenarios_2sc as scenarios_2sc  # noqa: E402
 from robofactory.planner.subtask_interpreter import (  # noqa: E402
     SubtaskRecorder,
     run_program,
@@ -74,12 +75,17 @@ from robofactory import CONFIG_DIR  # noqa: E402
 HF_DOWNLOAD_ROOT = "/iris/u/mikulrai/data/RoboFactory/hf_download"
 
 # (env_id, yaml_rel, n_agents, scenario_sampler). Only tasks with a scenario
-# sampler are runnable here. LiftBarrier (2 arms) + ThreeRobotsStackCube (3 arms).
+# sampler are runnable here. LiftBarrier (2 arms) + ThreeRobotsStackCube (3 arms) +
+# TwoRobotsStackCube (2 arms).
 TASK_MAP = {
     "LiftBarrier": ("LiftBarrier-rf", "table/lift_barrier.yaml", 2, scenarios.sample),
     "ThreeRobotsStackCube": (
         "ThreeRobotsStackCube-rf", "table/three_robots_stack_cube.yaml", 3,
         scenarios_tsc.sample,
+    ),
+    "TwoRobotsStackCube": (
+        "TwoRobotsStackCube-rf", "table/two_robots_stack_cube.yaml", 2,
+        scenarios_2sc.sample,
     ),
 }
 
