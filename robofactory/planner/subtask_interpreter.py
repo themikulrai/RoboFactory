@@ -710,17 +710,24 @@ def run_program(
         # The recorded env.step below is UNCHANGED (still the clean waypoint), so the
         # recorded ACTION stays clean while the next recorded OBS drifts. The arm is
         # chosen from the genuinely-moving arms only (never an idle/blocked arm). ---
-        # PHASE-GATE jitter: freeze ONLY the arm whose CURRENT primitive is the place
-        # (verb == PLACE) -- the delicate stack-on-goal action. Detected by VERB, not
-        # qi, so it is robust across variants whose place sits at a different qi (e.g.
-        # direct_place, where arm0 drops its lift -> place at qi 2). Per-arm: a
-        # RETREATING arm (verb LIFT, cube already released) and a still-TRANSPORTING
-        # arm keep jittering; only the active placer freezes so the tower forms.
+        # PHASE-GATE jitter (per-arm, QI-BASED): an arm at qi >= jitter_freeze_qi is
+        # EXCLUDED from jitter. With the canonical 6-primitive program
+        # [approach0, close1, lift2, place3, open4, retreat5], jitter_freeze_qi=3 freezes
+        # the whole NEAR-TOWER window (place + open + retreat). Jitter on ANY of those
+        # three destabilizes the just-built tower and, for a long sustained-hold success,
+        # topples it before the hold completes; the effect is CUMULATIVE across the three
+        # (ablation @ hold=50: freezing 3/3 -> ~100% recovery keep, 2/3 -> ~30-35%, 1/3 ->
+        # ~15-25%), so all three must be frozen for good yield. Jitter stays ON for
+        # approach/close/lift (grasp + carry, away from the tower) so obs-robustness is
+        # still learned where it is cheap and safe. (Replaces the older verb==PLACE freeze
+        # which protected only the place primitive and left open/retreat jittering -- fine
+        # for a short hold, fatal for a long one.) Assumes the full 6-primitive program;
+        # for a shortened variant (e.g. a dropped lift) the threshold shifts accordingly.
         # jitter_freeze_qi is None -> no freeze (LB unchanged).
         jitter_eligible = (
             moving_waypoints if jitter_freeze_qi is None
             else {i: w for i, w in moving_waypoints.items()
-                  if arms[i].built is None or arms[i].built.verb_id != vocab.PLACE}
+                  if arms[i].qi < jitter_freeze_qi}
         )
         if jitter_active and jitter_eligible and jitter_rng.random() < jitter_frac:
             arm_id = int(jitter_rng.choice(np.array(sorted(jitter_eligible))))

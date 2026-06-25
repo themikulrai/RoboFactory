@@ -41,7 +41,14 @@ class TwoRobotsStackCubeEnv(BaseEnv):
     # the velocity is_static gate spuriously failed on persistent contact micro-drift).
     # A tower that collapses right after release resets the counter -> never a success.
     # Matches the TSC STACK_HOLD_K / lift_barrier HOLD_FRAMES_K convention.
-    STACK_HOLD_K = 8
+    # 50: long enough to record a "tower stands" holding tail (so the LL learns to hold
+    # /stay after stacking instead of drifting). Generation must supply a recording
+    # runway via --settle-steps (the hold counter climbs through the frozen settle frames
+    # until it reaches 50 -> success). This holds in ALL slices -- including the perturbed
+    # recovery/merged -- because jitter is frozen through place+open+retreat (the runner's
+    # --jitter-freeze-qi 3, qi-based), which keeps perturbed towers stable enough to hold
+    # 50. evaluate() reads self.STACK_HOLD_K each step (overridable per-episode if needed).
+    STACK_HOLD_K = 50
 
     def __init__(
         self, *args, robot_uids=("panda", "panda"), robot_init_qpos_noise=0.02, **kwargs
