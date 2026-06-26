@@ -723,7 +723,7 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         grasp_settle_steps=10, shove_joints=(0, 1, 2, 3),
         jitter_frac=0.0, jitter_sigma=0.0,
         require_env_success=False, jitter_freeze_qi=None,
-        shove_max_qi=None, settle_steps=0):
+        shove_max_qi=None, settle_steps=0, recovery_shove=False):
     global REQUIRE_ENV_SUCCESS
     REQUIRE_ENV_SUCCESS = bool(require_env_success)
     # None -> no upper bound (LB unchanged); an int freezes shove at qi >= this.
@@ -864,10 +864,13 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         for name, _frac in mix_slices:
             if name == "recovery":
                 # baseline-only -> 1-member groups; atomic==per-member, keep atomic.
-                # LOCKED recipe: shove OFF (no_shove_cfg) + jitter ON. Recovery content
-                # comes from dense DAgger-style jitter (unrecorded obs-drift, clean
-                # recorded action), NOT an arm-shove. Object-noise (aug config) on top.
-                plan.append(("recovery", True, no_shove_cfg, budgets[name], False, jitter_cfg))
+                # Default (LB LOCKED recipe): shove OFF (no_shove_cfg) + jitter ON --
+                # recovery content from dense DAgger-style jitter (unrecorded obs-drift,
+                # clean recorded action), NOT an arm-shove. Object-noise (aug config) on top.
+                # --recovery-shove RESTORES the arm-shove (base_dart_cfg, sigma=--dart-sigma)
+                # ON TOP of jitter -- the 2SC causal recipe (explicit knock->recover data).
+                rec_cfg = base_dart_cfg if recovery_shove else no_shove_cfg
+                plan.append(("recovery", True, rec_cfg, budgets[name], False, jitter_cfg))
             elif name == "merged":
                 # PER-MEMBER keep (atomic-over-N collapses yield).
                 # FINAL recipe: shove OFF (no_shove_cfg) + jitter ON. Contrast groups
@@ -1090,6 +1093,11 @@ if __name__ == "__main__":
                     help="PHASE-GATE shove: never shove an arm ENTERING a primitive "
                          "with qi >= this (e.g. 3 = shove only on the lift for TSC, "
                          "freeze during place/stack). None = no upper bound (LB).")
+    ap.add_argument("--recovery-shove", action="store_true", default=False,
+                    dest="recovery_shove",
+                    help="restore the arm-shove (base_dart_cfg, sigma=--dart-sigma) on "
+                         "the recovery slice ON TOP of jitter. Default OFF = LB locked "
+                         "jitter-only recipe. ON = 2SC causal recipe (knock->recover).")
     ap.add_argument("--settle-steps", type=int, default=0, dest="settle_steps",
                     help="after the program completes, hold ALL arms still for N "
                          "RECORDED steps so the tower settles before the success "
@@ -1142,4 +1150,5 @@ if __name__ == "__main__":
         require_env_success=args.require_env_success,
         jitter_freeze_qi=args.jitter_freeze_qi,
         shove_max_qi=args.shove_max_qi,
-        settle_steps=args.settle_steps)
+        settle_steps=args.settle_steps,
+        recovery_shove=args.recovery_shove)
