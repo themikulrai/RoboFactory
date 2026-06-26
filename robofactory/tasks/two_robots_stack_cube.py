@@ -50,6 +50,14 @@ class TwoRobotsStackCubeEnv(BaseEnv):
     # 50. evaluate() reads self.STACK_HOLD_K each step (overridable per-episode if needed).
     STACK_HOLD_K = 50
 
+    # PER-CUBE LIFT GATE: success additionally requires that BOTH cubes were ever lifted
+    # >= LIFT_MARGIN above their spawn rest height. Rejects degenerate "stacks" where the
+    # bottom cube is SLID / bulldozed into the goal (or spawns inside it) and never actually
+    # picked up -- the geometric criterion alone passes such episodes (audit: 4/201 had a
+    # cube with z-lift ~0.001m yet success fired). A real pick lifts the cube ~0.5m, so
+    # 0.05m cleanly separates real picks from slides (bad eps < 0.03m).
+    LIFT_MARGIN = 0.05
+
     def __init__(
         self, *args, robot_uids=("panda", "panda"), robot_init_qpos_noise=0.02, **kwargs
     ):
@@ -137,6 +145,15 @@ class TwoRobotsStackCubeEnv(BaseEnv):
         if getattr(self, "_stack_hold", None) is None:
             self._stack_hold = torch.zeros(self.num_envs, dtype=torch.long)
         self._stack_hold[env_idx] = 0
+        # PER-CUBE LIFT GATE: capture each cube's spawn rest-z (post scene init) and reset
+        # the monotonic "was lifted" latch for the (re)initialised envs.
+        zA = self.cubeA.pose.p[:, 2]; zB = self.cubeB.pose.p[:, 2]
+        if getattr(self, "_cube_lifted", None) is None:
+            self._cube_spawn_z = torch.zeros((self.num_envs, 2), device=zA.device)
+            self._cube_lifted = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=zA.device)
+        self._cube_spawn_z[env_idx, 0] = zA[env_idx]
+        self._cube_spawn_z[env_idx, 1] = zB[env_idx]
+        self._cube_lifted[env_idx] = False
 
     @property
     def left_agent(self) -> Panda:
@@ -186,13 +203,25 @@ class TwoRobotsStackCubeEnv(BaseEnv):
         hold = self._stack_hold.to(cond.device)
         hold = torch.where(cond, hold + 1, torch.zeros_like(hold))
         self._stack_hold = hold
-        success = (hold >= self.STACK_HOLD_K)
+        # PER-CUBE LIFT GATE: latch whether each PHYSICAL cube (A,B -- order-independent)
+        # was ever lifted >= LIFT_MARGIN above its spawn rest-z. Lazy-init for harness paths
+        # where evaluate() can fire before _initialize_episode.
+        zc = torch.stack([cubes[0].pose.p[..., 2], cubes[1].pose.p[..., 2]], dim=-1)
+        if getattr(self, "_cube_lifted", None) is None:
+            self._cube_spawn_z = zc.clone()
+            self._cube_lifted = torch.zeros_like(zc, dtype=torch.bool)
+        spawn_z = self._cube_spawn_z.to(zc.device)
+        self._cube_lifted = self._cube_lifted.to(zc.device) | (zc > spawn_z + self.LIFT_MARGIN)
+        both_lifted = self._cube_lifted[..., 0] & self._cube_lifted[..., 1]
+        # success = sustained stack AND both cubes were genuinely picked up (not slid).
+        success = (hold >= self.STACK_HOLD_K) & both_lifted
         return {
             "is_cubeA_grasped": grasped[0],
             "is_cubeB_grasped": grasped[1],
             "is_top_on_bottom": is_top_on_bottom,
             "bottom_placed": bottom_placed,
             "stack_hold": hold,
+            "both_lifted": both_lifted,
             "intended_order": order,
             "success": success.bool(),
         }
