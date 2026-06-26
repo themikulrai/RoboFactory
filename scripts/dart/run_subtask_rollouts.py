@@ -439,22 +439,24 @@ def _member_passes(out):
 
       member passes  iff  out['all_success']  AND  (env_success(info) OR completed)
 
-    WHY env-success OR completed (not ``completed`` alone): the LiftBarrier env
-    AUTO-TERMINATES the moment the barrier clears z>0.15 (~step 69) — BEFORE the
-    per-arm primitive queues empty — so ``completed`` is False even on a successful
-    lift. Requiring ``completed`` alone therefore wrongly dropped EVERY success.
-    We accept env-success OR completed instead. EVERY variant now ends with BOTH
-    arms lifting (simultaneous / stagger_* — no truncated
-    approach-stop variant), so the normal path is:
-      * the env terminates on the barrier lift -> env_success True (the lift's own
-        check_barrier_lifted may not even have RUN before the early terminate, which
-        is fine — env_success confirms the lift). approach checks always run, so
+    WHY env-success OR completed (NON-strict default, for TSC / short-hold runs):
+    historically the LiftBarrier env auto-terminated on an INSTANTANEOUS lift, BEFORE
+    the per-arm primitive queues emptied, so ``completed`` was False even on a real lift
+    and requiring ``completed`` alone wrongly dropped every success; accepting
+    env-success OR completed fixed that.
+
+    SUSTAINED-HOLD recipe: with LB_HOLD_FRAMES_K~300 + --settle-steps the env now declares
+    success only after a 300-frame SUSTAINED hold, and the locked LB datagen recipe passes
+    --require-env-success so the keep gate is env_success ONLY (held-to-end). The
+    ``OR completed`` backdoor below is a NON-strict convenience that would keep a bar which
+    lifted-then-slipped during settle, so it MUST stay off for the long-hold recipe
+    (REQUIRE_ENV_SUCCESS=True drops it). The non-strict path:
+      * env terminates on a (sustained) lift -> env_success True; approach checks ran so
         ``all_success`` has len(checked)>0 and reflects them.
-      * if a variant's gating delays the lift past the queue draining without the
-        env terminating, ``completed`` covers it (its approach checks passed).
-      * a genuinely FAILED lift: the barrier is not raised, the env never reaches
-        success, the program runs to completion, the lift's check_barrier_lifted RAN
-        and returned False -> all_success False -> dropped.
+      * a variant's gating delays the lift past queue-drain without the env terminating ->
+        ``completed`` covers it (non-strict only).
+      * a genuinely FAILED lift -> env never reaches success, program runs to completion,
+        the lift's check RAN and returned False -> all_success False -> dropped.
     """
     if out is None:
         return False
@@ -740,13 +742,25 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
     # hook; with dart_sigma<=0 the hook is a no-op and those slices silently collapse
     # to the same object-noise-only recipe as 'clean' (but still tagged recovery/merged
     # in meta -> invisible mislabel). Fail loudly instead.
-    if mix_slices and dart_sigma <= 0 and any(
+    # recovery/merged are the PERTURBED slices: they must carry a REAL disturbance
+    # (arm-shove OR dense jitter) or they silently collapse to clean's recipe while
+    # still tagged recovery/merged (invisible mislabel). The LOCKED LB recipe uses
+    # JITTER with NO shove, so --dart-sigma<=0 is FINE as long as jitter is on. Fail
+    # only when BOTH mechanisms are off.
+    # mix slices are ALWAYS built with no_shove_cfg, so --dart-sigma never reaches them;
+    # the only real perturbation on recovery/merged is dense jitter. Gate on jitter alone
+    # (a >0 dart_sigma here is a no-op on the data, so checking it would let recovery/merged
+    # pass while being byte-identical to clean -- the exact mislabel this guard prevents).
+    _jitter_on = jitter_frac > 0 and jitter_sigma > 0
+    if mix_slices and not _jitter_on and any(
         name in ("recovery", "merged") for name, _ in mix_slices
     ):
         sys.exit(
-            "[ERROR] --mix includes recovery/merged (arm-disturbance slices) but "
-            f"--dart-sigma={dart_sigma} <= 0 -> the hook is a no-op and those slices "
-            "would be indistinguishable from 'clean'. Pass --dart-sigma>0."
+            "[ERROR] --mix includes recovery/merged (perturbed slices) but dense jitter "
+            f"(--jitter-frac={jitter_frac}, --jitter-sigma={jitter_sigma}) is OFF -> "
+            "those slices would be indistinguishable from 'clean' (the arm-shove is "
+            "structurally off on every mix slice). Enable jitter "
+            "(--jitter-frac>0 --jitter-sigma>0)."
         )
 
     # --- output paths (mirror hf_download layout) ---
@@ -773,6 +787,11 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         viewer_camera_configs=dict(shader_pack="default"),
         sim_backend="cpu",
         robot_uids=("panda_wristcam_multi",) * n_agents,
+        # The env counts UNRECORDED jitter steps toward its TimeLimit; a valid 300-frame
+        # sustained hold needs ~520 elapsed, so the registered max_episode_steps=500 wrongly
+        # truncates jittered holds. +200 over --max-steps clears it. No runtime cost: the
+        # interpreter's --max-steps and the per-attempt SIGALRM already bound termination.
+        max_episode_steps=max_steps + 200,
     )
     env = RecordEpisodeMA(
         env,
@@ -845,8 +864,10 @@ def run(task_name, num, record_dir, variants=None, dart_sigma=0.0,
         for name, _frac in mix_slices:
             if name == "recovery":
                 # baseline-only -> 1-member groups; atomic==per-member, keep atomic.
-                # FINAL recipe: shove ON (base_dart_cfg) + jitter ON.
-                plan.append(("recovery", True, base_dart_cfg, budgets[name], False, jitter_cfg))
+                # LOCKED recipe: shove OFF (no_shove_cfg) + jitter ON. Recovery content
+                # comes from dense DAgger-style jitter (unrecorded obs-drift, clean
+                # recorded action), NOT an arm-shove. Object-noise (aug config) on top.
+                plan.append(("recovery", True, no_shove_cfg, budgets[name], False, jitter_cfg))
             elif name == "merged":
                 # PER-MEMBER keep (atomic-over-N collapses yield).
                 # FINAL recipe: shove OFF (no_shove_cfg) + jitter ON. Contrast groups
@@ -1055,7 +1076,11 @@ if __name__ == "__main__":
                     help="KEEP only episodes with a REAL env success at the "
                          "(post-settle) final frame -- drop the 'OR completed' "
                          "backdoor. Needed for TSC (a finished place/retreat motion "
-                         "does NOT mean the tower stands). Leave OFF for LiftBarrier.")
+                         "does NOT mean the tower stands) AND for LiftBarrier long-hold "
+                         "datagen (LB_HOLD_FRAMES_K~300 + --settle-steps: the 300-frame "
+                         "hold completes inside settle, so env_success is the correct "
+                         "held-to-end gate; without it a bar that slips during settle is "
+                         "wrongly kept via 'completed').")
     ap.add_argument("--jitter-freeze-qi", type=int, default=None,
                     dest="jitter_freeze_qi",
                     help="PHASE-GATE jitter: an arm at program-index qi >= this is "

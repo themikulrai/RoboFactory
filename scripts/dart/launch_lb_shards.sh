@@ -19,13 +19,19 @@ for s in $(seq 0 $((S-1))); do
   seeds=$($PY -c "print(','.join(str(x) for x in range($lo,$hi)))")
   OUT="$ROOT/shard$s"
   LOG="$TMP/lb_shard$s.log"
-  PYTHONPATH="$WT" setsid $PY scripts/dart/run_subtask_rollouts.py \
+  # LOCKED recipe: object-noise (_aug) + dense jitter (frac0.40/sigma0.05), NO shove
+  # (--dart-sigma 0). LB_HOLD_FRAMES_K=300 + --settle-steps 340 make the env auto-terminate
+  # only after a 300-frame sustained plateau hold, and --require-env-success keeps ONLY
+  # held-to-end episodes (drops the 'OR completed' lift-apex backdoor). All three are
+  # required together or this regenerates the old lift-then-letgo dataset.
+  LB_HOLD_FRAMES_K=300 PYTHONPATH="$WT" setsid $PY scripts/dart/run_subtask_rollouts.py \
     --task LiftBarrier \
     --num $NUM --mix recovery=0.3,merged=0.3,clean=0.4 \
     --config-suffix _aug \
-    --dart-sigma 0.05 --inject-floor 0.05 --grasp-settle 10 --shove-joints 0,1,2,3 \
+    --dart-sigma 0 \
     --jitter-frac 0.40 --jitter-sigma 0.05 \
-    --per-attempt-timeout 300 --max-steps 600 \
+    --settle-steps 340 --require-env-success \
+    --per-attempt-timeout 600 --max-steps 600 \
     --seeds "$seeds" \
     --record-dir "$OUT" > "$LOG" 2>&1 < /dev/null &
   echo "shard $s -> pid $! seeds[$lo,$hi) log=$LOG"

@@ -73,7 +73,7 @@ BARRIER_LIFT_DZ = 0.25
 # env's sustained counter to declare success (the env owns the counter; this is the
 # REQUIRED run length). Kills transient flings (single-frame z-teleports) without the
 # fragile contact check.
-HOLD_FRAMES_K = 8
+HOLD_FRAMES_K = int(__import__("os").environ.get("LB_HOLD_FRAMES_K", "8"))  # env-overridable: long-hold data-gen sets ~300 so the env terminates only AFTER a sustained plateau hold
 # A Panda arm's gripper is "closed" when its two finger joints (the LAST 2 entries of
 # that arm's 9-dim qpos = 7 arm + 2 fingers) sum below this. Open ~0.08, closed ~0.00,
 # so a sum < 0.06 means BOTH fingers are well off the open stop (clamping the bar).
