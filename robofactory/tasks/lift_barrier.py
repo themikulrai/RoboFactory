@@ -143,11 +143,24 @@ class LiftBarrierEnv(BaseEnv):
         # bar so both ends clear the height while the other arm just closes on air ->
         # used to score success without grasping). is_grasping stays DROPPED (contact
         # probe unreliable on the thin bar ends); TCP-proximity is the robust hold gate.
+        import os as _os
+        # FULL-HORIZON COLLECTION MODE (contact-criterion worktree): when set, evaluate()
+        # never reports success, so the episode is NOT terminated early. The eval driver
+        # logs LIVE per-arm gripper<->barrier contact force every frame and the TRUE
+        # success (both arms in contact AND both ends above height, sustained to episode
+        # end) is computed OFFLINE. This sidesteps the early-termination artifact where a
+        # fleeting pose trips the criterion and the episode stops before the fake grasp
+        # falls apart.
+        if _os.environ.get("LB_EVAL_NO_TERMINATE"):
+            return {"success": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)}
         from robofactory.tasks.success_candidates import (
-            lift_barrier_success_strict,
+            lift_barrier_success_contact,
             HOLD_FRAMES_K,
         )
-        c = lift_barrier_success_strict(self).bool()             # (num_envs,) per-frame
+        # SHIPPING criterion: both ends above height AND both arms bearing LIVE contact
+        # load on the barrier, sustained HOLD_FRAMES_K frames. Replaces the TCP-proximity
+        # 'held' gate that passed a closed empty gripper parked at the end.
+        c = lift_barrier_success_contact(self).bool()            # (num_envs,) per-frame
         # lazy-init the counter (evaluate can fire before _initialize_episode in some
         # harness paths); match c's batch shape / device.
         if getattr(self, "_lift_hold", None) is None:

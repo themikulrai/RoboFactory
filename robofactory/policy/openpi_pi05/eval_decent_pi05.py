@@ -119,6 +119,12 @@ class Args:
     env.step, so the recorded actions are the ABSOLUTE joint targets — directly consumable
     by parse_h5_to_zarr_unified.py --state-source qpos. Default off."""
     trajectory_root: str = ""  # PR9: root for --save-trajectory h5s; "" => default eval_trajs root
+    log_contact: bool = False
+    """Contact-criterion worktree: log LIVE per-arm gripper<->barrier contact force +
+    both-ends height + base_z every frame to --contact-dir/seed{seed}.npz. Pair with
+    env var LB_EVAL_NO_TERMINATE=1 so the episode runs the FULL horizon (no early stop),
+    then score the true success offline (both arms in contact AND both ends up, to end)."""
+    contact_dir: str = ""
     wandb: bool = False
     wandb_project: str = "openpi-robofactory"
     wandb_tags: str = "eval,pi05,decent"
@@ -253,6 +259,38 @@ def _action_dict_to_per_arm_list(action_dict: dict, num_arms: int, action_prefix
     return out
 
 
+_GRIP_NAME_KEYS = ("finger", "hand")
+
+def _live_contacts_and_ends(env, num_arms: int):
+    """LIVE per-arm gripper<->barrier contact force (sum of |force| over each arm's
+    gripper links), plus both barrier-end world z and the robot base z. Read AFTER an
+    env.step so SAPIEN has computed contacts for the actual rollout dynamics (this is the
+    reliable signal the post-hoc set_state reconstruction could not produce)."""
+    u = env.unwrapped
+    barrier = u.barrier
+    from robofactory.tasks.success_candidates import BARRIER_END_OFFSETS
+    def t2n(x):
+        return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+    p = t2n(barrier.pose.p).reshape(-1)[:3]; q = t2n(barrier.pose.q).reshape(-1)[:4]
+    w, x, y, z = q
+    R = np.array([[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+                  [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+                  [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
+    end_z = [float((p + R @ np.array(o))[2]) for o in BARRIER_END_OFFSETS]
+    base_z = float(t2n(u.agent.agents[0].robot.pose.p).reshape(-1)[2])
+    forces = []
+    for i in range(num_arms):
+        ag = u.agent.agents[i]; tot = 0.0
+        for l in ag.robot.get_links():
+            if any(k in l.name.lower() for k in _GRIP_NAME_KEYS):
+                try:
+                    tot += float(np.linalg.norm(t2n(u.scene.get_pairwise_contact_forces(l, barrier))))
+                except Exception:
+                    pass
+        forces.append(tot)
+    return forces, end_z, base_z
+
+
 def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_sensors: list[str], seed: int, action_prefix: str, video_path: str) -> dict:
     """Run one episode with 3 per-arm policy servers.
 
@@ -277,6 +315,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
     chunks: list[np.ndarray | None] = [None] * args.num_arms
     chunk_idxs: list[int] = [args.replan_after] * args.num_arms
     video_frames: list[np.ndarray] = []
+    contact_trace: list[list[float]] = []  # per frame: [step, f_arm0, f_arm1, end0_z, end1_z, base_z]
 
     traj_fp = None
     if args.trajectory_log_path:
@@ -344,6 +383,10 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 succ_field = succ_field.item()
             success = bool(succ_field)
 
+            if args.log_contact:
+                _f, _ez, _bz = _live_contacts_and_ends(env, args.num_arms)
+                contact_trace.append([float(env_steps), float(_f[0]), float(_f[1]), float(_ez[0]), float(_ez[1]), float(_bz)])
+
             if traj_fp is not None:
                 row["success_far"] = bool(success)
                 traj_fp.write(json.dumps(row) + "\n")
@@ -373,6 +416,12 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
 
     if video_path and video_frames:
         _write_mp4(video_path, subsample(video_frames, args.video_frame_stride))
+
+    if args.log_contact and contact_trace and args.contact_dir:
+        Path(args.contact_dir).mkdir(parents=True, exist_ok=True)
+        np.savez(str(Path(args.contact_dir) / f"seed{seed}.npz"),
+                 trace=np.asarray(contact_trace, dtype=np.float32),
+                 cols=np.array(["step", "f_arm0", "f_arm1", "end0_z", "end1_z", "base_z"]))
 
     out = {
         "seed": seed,

@@ -169,6 +169,67 @@ def both_ends_held(agents, ends):
     return (assign_a | assign_b).bool()
 
 
+# Minimum LIVE gripper<->barrier contact-force magnitude (N) for an arm to count as
+# load-bearing. Calibrated from full-horizon contact logging: a closed EMPTY gripper
+# parked at the end reads ~0 N through the lift, while a genuine two-arm hold reads
+# several N on BOTH arms (weaker arm ~8 N on confirmed-good seeds vs 0.00 N on the
+# one-arm false positives). 1 N sits in the wide 0-vs-8 N gap. Grasp-style-agnostic
+# (no antipodal-pad assumption like is_grasping; a finger-wrap registers force too).
+GRIPPER_CONTACT_MIN_N = 1.0
+
+
+def arm_barrier_contact_force(agent, barrier, scene):
+    """Batched total contact-force magnitude (N) between this arm's gripper links
+    (fingers + hand) and the barrier, read LIVE from the physics solver. Reliable ONLY
+    when read AFTER an env.step (contacts are computed during the step) — this is why it
+    lives in the env's evaluate(), not a post-hoc set_state replay (which produced
+    spurious ~0 N readings). Returns a (num_envs,) tensor, or a scalar 0 if no gripper
+    link / the query fails."""
+    total = None
+    for l in agent.robot.get_links():
+        nm = l.name.lower()
+        if ("finger" in nm) or ("hand" in nm):
+            try:
+                f = torch.as_tensor(scene.get_pairwise_contact_forces(l, barrier))  # (num_envs, 3)
+                mag = torch.linalg.norm(f, dim=-1)                                   # (num_envs,)
+                total = mag if total is None else total + mag
+            except Exception:
+                pass
+    return total if total is not None else torch.zeros(())
+
+
+def both_arms_in_contact(env, tau: float = GRIPPER_CONTACT_MIN_N):
+    """Batched bool (...,): are BOTH arms bearing load on the barrier (each arm's live
+    gripper<->barrier contact force > ``tau``)? This is the load-bearing gate that
+    distinguishes a real two-arm grasp from one arm lifting/cantilevering while the
+    other parks a closed gripper at its end with ZERO contact (the false positive the
+    TCP-proximity gate let through)."""
+    e = _unwrap(env)
+    f0 = torch.as_tensor(arm_barrier_contact_force(e.agent.agents[0], e.barrier, e.scene)).reshape(-1)
+    f1 = torch.as_tensor(arm_barrier_contact_force(e.agent.agents[1], e.barrier, e.scene)).reshape(-1)
+    return ((f0 > tau) & (f1 > tau)).bool()
+
+
+def lift_barrier_success_contact(env, tau: float = GRIPPER_CONTACT_MIN_N):
+    """CONTACT-based per-frame predicate (the SHIPPING criterion): BOTH grasp ends above
+    base_z + BARRIER_LIFT_DZ AND BOTH arms bearing load on the barrier (live contact
+    force > tau). The env's HOLD_FRAMES_K counter sustains it. Replaces the TCP-proximity
+    'held' gate — which passed a closed empty gripper parked at the end (the user-caught
+    one-arm-cantilever false positive) — with a true load-bearing contact check measured
+    live during the rollout. is_grasping is still avoided (its antipodal-pad test misses
+    finger-wrap grasps); raw contact force is grasp-style-agnostic."""
+    e = _unwrap(env)
+    ends = barrier_grasp_ends_world(e.barrier)                       # (..., 2, 3)
+    base_z = torch.as_tensor(e.agent.agents[0].robot.pose.p[0, 2])
+    height_ok = (ends[..., 2] > base_z + BARRIER_LIFT_DZ).all(dim=-1)  # (...,) both ends
+    contact = both_arms_in_contact(e, tau).to(height_ok.device)
+    # align batch (eval is num_envs=1; broadcast a scalar contact if the force query
+    # returned a 0-dim fallback)
+    if contact.shape != height_ok.shape:
+        contact = contact.reshape(-1)[:1].expand_as(height_ok) if contact.numel() == 1 else contact
+    return (height_ok & contact).bool()
+
+
 def lift_barrier_success_strict(env):
     """Strict LiftBarrier PER-FRAME geometric predicate (drops is_grasping).
 
