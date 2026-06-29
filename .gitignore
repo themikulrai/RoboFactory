@@ -90,5 +90,8 @@ wandb/
 .claude/
 .slurm_scripts/
 slurm/
-eval_results/
-images/tsc_camera_verify/
+eval_results
+.pytest_cache/
+# Eval/verification images (keep tracked README figures like images/motivation.png)
+images/*
+!images/motivation.png
