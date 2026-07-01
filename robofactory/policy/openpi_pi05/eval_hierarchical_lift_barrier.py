@@ -240,7 +240,7 @@ def _overlay_subtasks(img, step, total, left, right):
 class HLClient:
     """Stdlib-HTTP client to the HL Qwen subtask server (memer env, separate process)."""
 
-    def __init__(self, host: str, port: int, instruction: str, hl_cam_map: dict, timeout: float = 60.0):
+    def __init__(self, host: str, port: int, instruction: str, hl_cam_map: dict, timeout: float = 300.0):
         self.host = host
         self.port = port
         self.instruction = instruction
@@ -278,7 +278,7 @@ class HLClient:
     def reset(self) -> None:
         self._post("/reset", {"instruction": self.instruction})
 
-    def query(self, obs, cam_map=None) -> dict:
+    def _build_images(self, obs, cam_map=None) -> dict:
         if cam_map is None:
             cam_map = self.hl_cam_map
         images = {}
@@ -289,7 +289,22 @@ class HLClient:
                 "shape": list(arr.shape),
                 "dtype": "uint8",
             }
-        return self._post("/query", {"images": images, "instruction": self.instruction})
+        return images
+
+    def observe(self, obs, cam_map=None) -> None:
+        """Buffer one env-step's frames on the server (no inference). Call EVERY step so
+        the server's recent-frame context is env-step-indexed (spacing == frame_subsample,
+        decoupled from hl_query_interval)."""
+        self._post("/observe", {"images": self._build_images(obs, cam_map)})
+
+    def predict(self) -> dict:
+        """Run HL inference on the server's CURRENT buffer (no append)."""
+        return self._post("/predict", {"instruction": self.instruction})
+
+    def query(self, obs, cam_map=None) -> dict:
+        """Legacy atomic observe+predict (one frame buffered per call)."""
+        return self._post("/query", {"images": self._build_images(obs, cam_map),
+                                      "instruction": self.instruction})
 
 
 # ------------------------------------------------------------------------------- LL clients
@@ -536,20 +551,127 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         a = x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
         return a.reshape(-1)
     grasp_trace, barz_trace = [], []   # per step: [grasp_left, grasp_right], barrier z
+    # Sustained-hold success: LB_HOLD_FRAMES_K>0 requires K consecutive lifted frames,
+    # rejecting instantaneous knock-up/fling false positives. 0 => legacy single-frame break.
+    import os as _os
+    held = 0
+    HOLD_K = int(_os.environ.get("LB_HOLD_FRAMES_K", "0"))
+    # State-based oracle HL (LB_ORACLE_HL=1): privileged state machine emitting each arm's
+    # subtask from ground-truth sim state (gripper<->grasp-end distance + is_grasping), to
+    # isolate LL capability from the learned HL. arm0->left end, arm1->right end (data convention).
+    ORACLE = bool(int(_os.environ.get("LB_ORACLE_HL", "0")))
+    _oracle_close_thresh = float(_os.environ.get("LB_ORACLE_CLOSE_THRESH", "0.06"))
+    lift_started = False
+    if ORACLE:
+        import numpy as _np
+        import robofactory.utils.subtask_obedience as _so
+        _bdata = env.unwrapped.annotation_data["barrier"]
+        def _oracle_step():
+            nonlocal lift_started
+            m = _barrier.pose.to_transformation_matrix()[0].detach().cpu().numpy()
+            ends = _so.barrier_end_positions(m, _bdata)
+            tgt = [ends["left"], ends["right"]]
+            g = [bool(_subagents[i].is_grasping(_barrier)[0].item()) for i in range(args.num_arms)]
+            if args.num_arms > 1 and g[0] and g[1]:
+                lift_started = True  # latch: once both grasp, keep lifting (mirror the demo)
+            out = []
+            for i in range(args.num_arms):
+                if lift_started:
+                    out.append("lift")
+                elif g[i]:
+                    out.append("close_gripper")  # maintain grasp while partner catches up
+                else:
+                    tcp = _subagents[i].tcp.pose.p[0].detach().cpu().numpy()
+                    d = float(_np.linalg.norm(tcp[:3] - tgt[i][:3]))
+                    out.append("close_gripper" if d < _oracle_close_thresh else "approach")
+            return out
+    # Datagen-replay HL (LB_REPLAY_DIR set): feed the LL the clean demo's per-frame subtask
+    # schedule for THIS seed (fixed expert timing) — training-consistent subtasks, open-loop.
+    REPLAY_DIR = _os.environ.get("LB_REPLAY_DIR", "")
+    _replay_l = _replay_r = None
+    if REPLAY_DIR:
+        import json as _json, h5py as _h5py, numpy as _np3
+        _verbmap = {0: "wait", 1: "approach", 2: "approach", 3: "close_gripper", 4: "lift"}
+        try:
+            _meta = _json.load(open(_os.path.join(REPLAY_DIR, "subtask_meta.json")))
+            _eps = _meta["episodes"] if isinstance(_meta, dict) else _meta
+            # datagen writes a contrastive group per seed (simultaneous + 2 stagger perms);
+            # use ONLY the clean 'simultaneous' variant per seed (no contrastive pairs).
+            _sid2ep = {int(e.get("env_seed", e.get("seed"))): int(e["episode_id"])
+                       for e in _eps if e.get("variant", "simultaneous") == "simultaneous"}
+            _cs = int(seed)
+            if _cs in _sid2ep:
+                with _h5py.File(_os.path.join(REPLAY_DIR, "LiftBarrier_subtask_stream.h5"), "r") as _f:
+                    _tk = f"traj_{_sid2ep[_cs]}"
+                    _v0 = _np3.asarray(_f[_tk]["subtask_arm0_verb"][...]).astype(int)
+                    _v1 = _np3.asarray(_f[_tk]["subtask_arm1_verb"][...]).astype(int)
+                _replay_l = [_verbmap.get(int(x), "wait") for x in _v0]
+                _replay_r = [_verbmap.get(int(x), "wait") for x in _v1]
+                print(f"[replay] seed {_cs}: loaded demo traj_{_sid2ep[_cs]} ({len(_replay_l)} steps)")
+            else:
+                print(f"[replay] WARNING seed {_cs}: no clean demo; using flat instruction")
+        except Exception as _e:
+            print(f"[replay] ERROR loading stream for seed {seed}: {_e}")
+    # Grasp-verified success (LB_REQUIRE_GRASP=1): a frame counts toward the hold only if BOTH
+    # gripper TCPs are within LB_GRASP_DIST of their (moving) barrier ends — the slab is CARRIED
+    # by the grippers, not shoved (co-movement proxy; robust where is_grasping's force test fails
+    # on the thin slab). The per-step distances are recorded regardless of the gate.
+    REQUIRE_GRASP = bool(int(_os.environ.get("LB_REQUIRE_GRASP", "0")))
+    _grasp_dist = float(_os.environ.get("LB_GRASP_DIST", "0.08"))
+    _grasp_ok = _barrier is not None
+    if _grasp_ok:
+        try:
+            import numpy as _npg
+            import robofactory.utils.subtask_obedience as _sog
+            _bdata_g = env.unwrapped.annotation_data["barrier"]
+        except Exception:
+            _grasp_ok = False
+    tcp_end_dist_trace = []
     for step in range(args.max_env_steps):
-        # ---- HL query every K steps (skipped in flat-baseline) ----
-        if hl_client is not None and (step % args.hl_query_interval == 0):
-            last_hl = hl_client.query(obs)
-            n_hl_queries += 1
-            sl = last_hl.get("subtask_left")
-            sr = last_hl.get("subtask_right")
-            if sl:
-                prompts[0] = sl
-            if args.num_arms > 1 and sr:
-                prompts[1] = sr
-            right_p = prompts[1] if args.num_arms > 1 else None
-            print(f"[seed {seed} step {step}] HL -> left={prompts[0]!r} right={right_p!r} "
-                  f"(src={last_hl.get('dual_source')})")
+        # ---- HL query: datagen-replay, else state-based oracle, else live HL server ----
+        if _replay_l is not None:
+            prompts[0] = _replay_l[min(step, len(_replay_l) - 1)]
+            if args.num_arms > 1:
+                prompts[1] = _replay_r[min(step, len(_replay_r) - 1)]
+            last_hl = {"subtask_left": prompts[0],
+                       "subtask_right": prompts[1] if args.num_arms > 1 else None,
+                       "dual_source": "replay"}
+            if step % args.hl_query_interval == 0:
+                n_hl_queries += 1
+                right_p = prompts[1] if args.num_arms > 1 else None
+                print(f"[seed {seed} step {step}] REPLAY -> left={prompts[0]!r} right={right_p!r}")
+        elif ORACLE:
+            _ss = _oracle_step()
+            prompts[0] = _ss[0]
+            if args.num_arms > 1:
+                prompts[1] = _ss[1]
+            last_hl = {"subtask_left": _ss[0],
+                       "subtask_right": _ss[1] if args.num_arms > 1 else None,
+                       "dual_source": "oracle"}
+            if step % args.hl_query_interval == 0:
+                n_hl_queries += 1
+                right_p = prompts[1] if args.num_arms > 1 else None
+                print(f"[seed {seed} step {step}] ORACLE -> left={prompts[0]!r} right={right_p!r}")
+        elif hl_client is not None:
+            # Decoupled HL context: feed the server a frame EVERY env-step (cheap append,
+            # no inference) so its recent-frame buffer is env-step-indexed; the server
+            # strides it by frame_subsample (training value) to reproduce the 0.25s
+            # training context spacing — independent of hl_query_interval. Inference runs
+            # only every K steps. (Old code appended once per /query, so spacing silently
+            # scaled with the query interval: query=25 x subsample=5 = 6.25s garbled.)
+            hl_client.observe(obs)
+            if step % args.hl_query_interval == 0:
+                last_hl = hl_client.predict()
+                n_hl_queries += 1
+                sl = last_hl.get("subtask_left")
+                sr = last_hl.get("subtask_right")
+                if sl:
+                    prompts[0] = sl
+                if args.num_arms > 1 and sr:
+                    prompts[1] = sr
+                right_p = prompts[1] if args.num_arms > 1 else None
+                print(f"[seed {seed} step {step}] HL -> left={prompts[0]!r} right={right_p!r} "
+                      f"(src={last_hl.get('dual_source')})")
 
         # ---- record the subtask active for THIS step's action (held between HL queries) ----
         cur_l = prompts[0]
@@ -585,8 +707,9 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
 
         obs, _, term, trunc, info = env.step(action_dict)
         s = info.get("success", False)
-        success = bool(s.item() if hasattr(s, "item") else s)
+        lifted_now = bool(s.item() if hasattr(s, "item") else s)
         # record per-arm grasp + barrier height for THIS step (incl. the final/break step)
+        _gnow = False
         if _barrier is not None:
             try:
                 barz_trace.append(float(_scal(_barrier.pose.p)[2]))
@@ -594,8 +717,31 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
                                     for i in range(args.num_arms)])
             except Exception:
                 pass
-        if success or term or trunc:
-            break
+            if _grasp_ok:
+                try:
+                    _mg = _barrier.pose.to_transformation_matrix()[0].detach().cpu().numpy()
+                    _eg = _sog.barrier_end_positions(_mg, _bdata_g)
+                    _tg = [_eg["left"], _eg["right"]]
+                    _dd = [float(_npg.linalg.norm(
+                        _subagents[i].tcp.pose.p[0].detach().cpu().numpy()[:3] - _tg[i][:3]))
+                        for i in range(args.num_arms)]
+                    tcp_end_dist_trace.append([round(x, 4) for x in _dd])
+                    _gnow = all(d < _grasp_dist for d in _dd)
+                except Exception:
+                    tcp_end_dist_trace.append(None)
+        if HOLD_K > 0:
+            _ok = lifted_now and (_gnow if REQUIRE_GRASP else True)  # lifted [+ both grippers at ends]
+            held = held + 1 if _ok else 0          # consecutive qualifying frames
+            success = held >= HOLD_K               # success only after a sustained hold
+            # Ignore the env's `terminated` here: it fires on the FIRST instantaneous lift
+            # (barrier crosses the height threshold), which would cut the hold window to 1 frame.
+            # Keep simulating until a genuine sustained hold or truncation (max_env_steps).
+            if success or trunc:
+                break
+        else:
+            success = lifted_now                   # legacy instantaneous criterion (unchanged)
+            if success or term or trunc:
+                break
 
     if frames:
         _write_mp4(video_path, subsample(frames, args.video_frame_stride))
@@ -612,6 +758,10 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         "subtask_trace_right": subtasks_r,
         "grasp_trace": grasp_trace,   # per step [grasp_left, grasp_right]
         "barz_trace": barz_trace,     # per step barrier z height
+        "tcp_end_dist_trace": tcp_end_dist_trace,  # per step [d_left, d_right] tcp<->grasp-end
+        "hold_frames_k": int(HOLD_K), # sustained-hold frames required (0 = instantaneous)
+        "require_grasp": bool(REQUIRE_GRASP),
+        "grasp_dist": float(_grasp_dist),
     }
 
 

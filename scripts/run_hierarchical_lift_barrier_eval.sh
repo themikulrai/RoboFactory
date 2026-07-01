@@ -186,14 +186,22 @@ if [[ "$FLAT_BASELINE" -eq 0 ]]; then
   else
     [[ -z "$HL_MODEL" ]] && { echo "--hl-model required (or use --mock / --flat-baseline)" >&2; exit 2; }
     echo "[launcher] starting HL server on :$HL_PORT (model=$HL_MODEL, GPU=$HL_GPU)"
+    # HL_FRAME_SUBSAMPLE pins the recent-frame context stride server-side. The HL's 8-frame
+    # context window is spaced (hl_query_interval * frame_subsample) env-steps apart, because
+    # the server appends one frame per /query and build_recent_context_indices strides THAT
+    # buffer. Training built the context at frame_subsample=5 over the full-rate H5 (5-step /
+    # 0.25s spacing). To reproduce that at eval the product (query_interval * frame_subsample)
+    # must equal 5 — e.g. query=5,subsample=1. Leaving this unset keeps the server default (5),
+    # which with query=25 gives a garbled 125-step (6.25s) context. See memory 2SC finding.
     CUDA_VISIBLE_DEVICES="$HL_GPU" \
       "$MEMER_PY" "$HL_SERVER" --model-path "$HL_MODEL" --port "$HL_PORT" \
+        ${HL_FRAME_SUBSAMPLE:+--frame-subsample "$HL_FRAME_SUBSAMPLE"} \
         >"$LOG_DIR/hl.log" 2>&1 &
   fi
   PIDS+=("$!")
   # Qwen3-VL-4B + LoRA load from a cold HF cache over the shared FS can take 4-6 min, so give
   # the HL health check a generous window (300 retries x 2s = 10 min).
-  wait_http_health 127.0.0.1 "$HL_PORT" 300 || { cat "$LOG_DIR/hl.log"; exit 1; }
+  wait_http_health 127.0.0.1 "$HL_PORT" "${HL_HEALTH_RETRIES:-900}" || { cat "$LOG_DIR/hl.log"; exit 1; }
   echo "[launcher] HL healthy on :$HL_PORT"
 fi
 
@@ -220,8 +228,8 @@ if [[ "$MOCK" -eq 0 ]]; then
         --policy.config="$LL_CONFIG_ARM1" --policy.dir="$LL_CKPT_ARM1" ) \
       >"$LOG_DIR/ll_arm1.log" 2>&1 &
   PIDS+=("$!")
-  wait_ws_health 127.0.0.1 "$LL_PORT0" || { cat "$LOG_DIR/ll_arm0.log"; exit 1; }
-  wait_ws_health 127.0.0.1 "$LL_PORT1" || { cat "$LOG_DIR/ll_arm1.log"; exit 1; }
+  wait_ws_health 127.0.0.1 "$LL_PORT0" "${LL_HEALTH_RETRIES:-450}" || { cat "$LOG_DIR/ll_arm0.log"; exit 1; }
+  wait_ws_health 127.0.0.1 "$LL_PORT1" "${LL_HEALTH_RETRIES:-450}" || { cat "$LOG_DIR/ll_arm1.log"; exit 1; }
   echo "[launcher] both LL servers healthy on :$LL_PORT0 :$LL_PORT1"
 fi
 
