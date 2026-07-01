@@ -56,7 +56,8 @@ LEROBOT_SCRIPT=/iris/u/mikulrai/projects/openpi/examples/robofactory/convert_rob
 
 H5_ROOT=/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix
 ZARR_OUT_ROOT=/iris/u/mikulrai/data/RoboFactory/zarr_data
-LEROBOT_OUT_ROOT=/iris/u/mikulrai/data/RoboFactory/lerobot
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+LEROBOT_OUT_ROOT="${RF_LEROBOT_HOME:?RF_LEROBOT_HOME unset — source ~/.config/dataroots.sh}"
 CAM_MAP_DIR=/iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings
 
 mkdir -p "${ZARR_OUT_ROOT}" "${LEROBOT_OUT_ROOT}" /iris/u/mikulrai/logs/conversion_post_seedfix

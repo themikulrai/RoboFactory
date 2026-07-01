@@ -25,9 +25,9 @@ conda activate RoboFactory
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
-export OPENPI_DATA_HOME=/iris/u/mikulrai/data/openpi
 export HF_HOME=/iris/u/mikulrai/.cache/huggingface
-export HF_LEROBOT_HOME=/iris/u/mikulrai/data/RoboFactory/lerobot
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${RF_LEROBOT_HOME:?RF_LEROBOT_HOME unset — source ~/.config/dataroots.sh}}"
 export XDG_CACHE_HOME=/iris/u/mikulrai/.cache
 export JAX_COMPILATION_CACHE_DIR=/iris/u/mikulrai/.cache/jax
 export TMPDIR=/iris/u/mikulrai/tmp
@@ -63,7 +63,7 @@ echo "[server] cent GPU=0 port=${PORT} cfg=${CENT_CFG}"
  CUDA_VISIBLE_DEVICES=0 \
  XLA_PYTHON_CLIENT_PREALLOCATE=false \
  XLA_PYTHON_CLIENT_MEM_FRACTION=0.30 \
- HF_LEROBOT_HOME=/iris/u/mikulrai/data/RoboFactory/lerobot \
+ HF_LEROBOT_HOME="$HF_LEROBOT_HOME" \
  "$OPENPI_PY" scripts/serve_policy.py \
      --port "${PORT}" \
      policy:checkpoint \

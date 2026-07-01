@@ -25,7 +25,8 @@ conda activate RoboFactory
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
 export HF_HOME=/iris/u/mikulrai/.cache/huggingface
-export HF_LEROBOT_HOME=/iris/u/mikulrai/data/RoboFactory/lerobot
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${RF_LEROBOT_HOME:?RF_LEROBOT_HOME unset — source ~/.config/dataroots.sh}}"
 export XDG_CACHE_HOME=/iris/u/mikulrai/.cache
 export TMPDIR=/iris/u/mikulrai/tmp
 mkdir -p "$TMPDIR"

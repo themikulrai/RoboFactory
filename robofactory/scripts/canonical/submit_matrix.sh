@@ -279,7 +279,7 @@ if [[ "$POLICY" == "pi05" ]]; then
         DATA_PATH="$HF_LEROBOT_DIR/$REPO"
         if [[ ! -e "$DATA_PATH" ]]; then
             warn "LeRobot dataset not found: $DATA_PATH"
-            warn "create symlink: ln -s /iris/u/mikulrai/data/RoboFactory/lerobot/$REPO $DATA_PATH"
+            warn "create symlink: ln -s /iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/$REPO $DATA_PATH"
             [[ "$ALLOW_BROKEN_SYMLINK" -eq 0 ]] && die "aborting; pass --allow-broken-symlink to override"
         fi
     fi
