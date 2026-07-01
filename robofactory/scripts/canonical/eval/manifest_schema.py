@@ -137,7 +137,7 @@ class SbatchCfg(StrictModel):
     mem: str = "64G"
     exclude: Optional[str] = "iris-hp-z8,iris-hgx-1,iris-hgx-2"
     partition: Optional[str] = None
-    output: Optional[str] = None  # default: /iris/u/mikulrai/logs/eval/<launcher_id>_%j.out
+    output: Optional[str] = None  # default: unset -> Slurm default; manifest sets /iris/u/mikulrai/slurm/%j.out
     error: Optional[str] = None
     mail_type: Optional[str] = "END,FAIL"
     mail_user: Optional[str] = "mikulrai+spam@gmail.com"

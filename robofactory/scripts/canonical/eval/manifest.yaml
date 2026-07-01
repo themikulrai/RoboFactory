@@ -55,8 +55,8 @@ launchers:
       gres: "gpu:a40:1"
       cpus_per_task: 8
       mem: "48G"
-      output: /iris/u/mikulrai/logs/eval_pi05/%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_pi05/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # pi05_decent — 3 servers (per-arm LoRA), 3 GPUs
@@ -105,8 +105,8 @@ launchers:
       gres: "gpu:a40:3"
       cpus_per_task: 8
       mem: "64G"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # dp_single — single-arm DP, eval_dp.py
@@ -135,8 +135,8 @@ launchers:
       gres: "gpu:1"
       cpus_per_task: 8
       mem: "64G"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   pm_dp_dino_blora:
     policy_type: dp_single
@@ -161,8 +161,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       exclude: "iris-hp-z8,iris-hgx-1"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   pm_dp_dino_spatch:
     policy_type: dp_single
@@ -187,8 +187,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       exclude: "iris-hp-z8,iris-hgx-1"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   pm_dp_in1k_crop:
     policy_type: dp_single
@@ -213,8 +213,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       exclude: "iris-hp-z8,iris-hgx-1"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   pm_dp_r3m:
     policy_type: dp_single
@@ -241,8 +241,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       exclude: "iris-hp-z8,iris-hgx-1"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # dp_decent_multi — eval_multi_dp.py (3 per-arm ckpts evaluated jointly)
@@ -277,8 +277,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       exclude: "iris-hp-z8,iris-hgx-1"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   tsc_dp_d1_freezeenc_decent:
     policy_type: dp_decent_multi
@@ -309,8 +309,8 @@ launchers:
       gres: "gpu:1"
       cpus_per_task: 4
       mem: "32G"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   tsc_dp_d2_wristcam_reeval:
     policy_type: dp_decent_multi
@@ -345,8 +345,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       partition: iris
-      output: /iris/u/mikulrai/logs/%x_%j.out
-      error: /iris/u/mikulrai/logs/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # dp_joint_cent — eval_joint_dp.py (single joint policy)
@@ -375,8 +375,8 @@ launchers:
       gres: "gpu:1"
       cpus_per_task: 4
       mem: "32G"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   tsc_dp_d2_wristcam_cent:
     policy_type: dp_joint_cent
@@ -403,8 +403,8 @@ launchers:
       gres: "gpu:1"
       cpus_per_task: 4
       mem: "32G"
-      output: /iris/u/mikulrai/logs/phase2_debug/%x_%j.out
-      error: /iris/u/mikulrai/logs/phase2_debug/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # dp_decent_multi — 2SC (TwoRobotsStackCube) decentralised DP, eval_multi_dp.py
@@ -457,8 +457,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       partition: iris
-      output: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   2sc_dp_decent_workspace:
     policy_type: dp_decent_multi
@@ -495,8 +495,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       partition: iris
-      output: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_2026-05-11/eval_dp_2sc_%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # dp_decent_multi — LongPipelineDelivery (LP) 1-demo overfit eval.
@@ -551,8 +551,8 @@ launchers:
       gres: "gpu:1"
       cpus_per_task: 8
       mem: "64G"
-      output: /iris/u/mikulrai/logs/eval_lp_overfit/eval_lp_%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_lp_overfit/eval_lp_%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # pi05_decent — 2SC wristcam decentralised Pi0.5 eval (2 servers, 2 GPUs).
@@ -615,8 +615,8 @@ launchers:
       cpus_per_task: 8
       mem: "64G"
       partition: orion
-      output: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   # ---------------------------------------------------------------------------
   # pi05_decent — 2SC FLATBASELINE decentralised Pi0.5 evals (wristcam + workspace),
@@ -688,8 +688,8 @@ launchers:
       cpus_per_task: 8
       mem: "96G"
       partition: orion
-      output: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_flat_decent/%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_flat_decent/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
 
   2sc_pi05_ws_flatbaseline_decent:
     policy_type: pi05_decent
@@ -735,5 +735,5 @@ launchers:
       cpus_per_task: 8
       mem: "96G"
       partition: orion
-      output: /iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/%x_%j.out
-      error: /iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/%x_%j.err
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err

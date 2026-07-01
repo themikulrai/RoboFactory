@@ -6,10 +6,12 @@
 # Cube spawn = 15x15cm box (eval15 yaml, centered, in-distribution vs 25cm datagen).
 # CKPT_STEP selects step (default 14999). partition/gpu/mem/time set via iris-mcp args.
 set -euo pipefail
-mkdir -p /iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
+
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task TwoRobotsStackCube-rf --cam ws --method pi05 --category eval --variant flat_decent
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
@@ -46,7 +48,7 @@ for d in "$ARM0_DIR" "$ARM1_DIR"; do
 done
 echo "Evaluating step ${CKPT_STEP}: arm0=${ARM0_DIR} arm1=${ARM1_DIR}"
 
-SERVER_LOG_DIR=/iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/${SLURM_JOB_ID:-local}_servers
+SERVER_LOG_DIR="$RUN_LOG_DIR/servers"
 mkdir -p "$SERVER_LOG_DIR"
 
 start_server () {
@@ -96,8 +98,8 @@ for port in "$PORT0" "$PORT1"; do
     echo "[wait] port ${port} up"
 done
 
-VIDEO_DIR=/iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/videos_${SLURM_JOB_ID:-local}
-OUT_DIR=/iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent
+VIDEO_DIR="$RUN_VIDEO_DIR"
+OUT_DIR="$RUN_LOG_DIR"
 mkdir -p "$VIDEO_DIR" "$OUT_DIR"
 # Match the wc flat-baseline eval protocol exactly for a clean ws-vs-wc A/B:
 # same held-out seed pool (paired cube spawns) AND same step budget.
@@ -130,3 +132,5 @@ MAX_ENV_STEPS=600
 echo "Done at $(date)"
 RESULT_FILE="$(ls -t $OUT_DIR/eval_decent_TwoRobotsStackCube-rf_*.json 2>/dev/null | head -1)"
 echo "Results JSON: $RESULT_FILE"
+
+logrun_finish --status done --config "" --cmd "$0"

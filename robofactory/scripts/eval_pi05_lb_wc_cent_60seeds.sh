@@ -8,8 +8,8 @@
 # partition / gpu / account are set at submit time via the iris-mcp tool args.
 #
 #SBATCH --job-name=eval_pi05_lb_wc_cent
-#SBATCH --output=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -18,10 +18,12 @@
 #SBATCH --gres=gpu:a40:1
 
 set -euo pipefail
-mkdir -p /iris/u/mikulrai/logs/eval_pi05_lb_wc_cent
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
+
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam wc --method pi05 --category eval --variant cent
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
@@ -55,7 +57,7 @@ echo "Evaluating cent ckpt: $CENT_DIR"
 PORT=$("$PREFLIGHT_PYTHON" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
 echo "[server] cent will use port ${PORT}"
 
-SERVER_LOG_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/${SLURM_JOB_ID}_servers
+SERVER_LOG_DIR="$RUN_LOG_DIR/servers"
 mkdir -p "$SERVER_LOG_DIR"
 
 echo "[server] cent GPU=0 port=${PORT} cfg=${CENT_CFG}"
@@ -96,8 +98,8 @@ while ! "$PREFLIGHT_PYTHON" -c "import socket,sys; s=socket.socket(); s.settimeo
 done
 echo "[wait] port ${PORT} up"
 
-VIDEO_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent/videos_${SLURM_JOB_ID}
-OUT_DIR=/iris/u/mikulrai/logs/eval_pi05_lb_wc_cent
+VIDEO_DIR="$RUN_VIDEO_DIR"
+OUT_DIR="$RUN_LOG_DIR"
 mkdir -p "$VIDEO_DIR" "$OUT_DIR"
 SEEDS=$(paste -sd, /iris/u/mikulrai/runs/eval_seeds_60.txt)
 
@@ -133,3 +135,5 @@ python scripts/log_eval.py \
     --jsonl "$RESULT_FILE" \
     --job "${SLURM_JOB_ID:-manual}" \
     --title "Eval LB wc Pi0.5 [Cent, 60seeds]" || true
+
+logrun_finish --status done --config "" --cmd "$0"
