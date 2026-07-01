@@ -9,6 +9,24 @@ moment the training job(s) COMPLETE with exit 0.
         --eval <eval_launcher_id>  [--eval  <id2> ...] \\
         [--shards N] [--after <existing_jobid> ...] [--dry-run]
 
+Examples (real launcher ids from the current manifests; each verified with --dry-run).
+All elide the `python -m robofactory.scripts.canonical.chain_train_eval` prefix:
+  # Flagship: shard a 2SC decentralised Pi0.5 eval into 4 array tasks, gated on the
+  # two per-arm openpi train jobs you already submitted (pass their ids via --after):
+  --after <arm0_jid> --after <arm1_jid> --eval 2sc_pi05_wc_decent --shards 4
+  # 3-arm decentralised DP eval gated on three already-submitted arm trains:
+  --after <a0_jid> --after <a1_jid> --after <a2_jid> --eval tsc_dp_d1_decent_in1k
+  # Single DP eval gated on one already-submitted train:
+  --after <train_jid> --eval pm_dp_in1k
+  # Fresh in-manifest (NON-gated) DP train, then its eval afterok on it:
+  --train pm_d1_ep300_r3m --eval pm_dp_r3m
+
+Gated train launchers (e.g. tsc_d2_ep300_in1k_a0, pm_d1_ep300_in1k, tsc_ws_camfix_a0 —
+anything with preflight.heavy.gated/needs_overfit=true) are REFUSED here: run them
+through submit_with_preflights.sh (which builds the overfit->preflight->train chain)
+and chain the eval onto the resulting train job id via --after, OR pass --force-ungated
+to submit them straight to sbatch and skip the safety preflights.
+
 Behavior:
   * Every --train id is validated against the TRAIN manifest and every --eval id
     against the EVAL manifest BEFORE anything is submitted (a typo aborts the
@@ -92,7 +110,17 @@ def _submit(cmd: list[str], *, dry_run: bool, fake_jobid: int) -> int:
         print(f"DRYRUN: {shlex.join(cmd)}")
         return fake_jobid
     print(f"[chain_train_eval] {shlex.join(cmd)}", file=sys.stderr, flush=True)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        # A hung sbatch may or may not have actually queued the job. Surface a clear
+        # abort so the caller runs its scancel-hint path, and remind the operator to
+        # hunt for a stray job the timed-out submit might have created.
+        raise RuntimeError(
+            "sbatch did not return within 60s — it may or may not have queued a job. "
+            "Check `squeue -u $USER` / `sacct --starttime now-10min` and `scancel` any "
+            "stray job before retrying."
+        )
     if proc.returncode != 0:
         raise RuntimeError(
             f"sbatch failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
@@ -107,6 +135,7 @@ def run_chain(
     shards: int = 1,
     after: Optional[list[int]] = None,
     dry_run: bool = False,
+    force_ungated: bool = False,
     train_manifest: Optional[Path] = None,
     eval_manifest: Optional[Path] = None,
 ) -> int:
@@ -132,6 +161,36 @@ def run_chain(
                   f"known: {sorted(eval_mfst.launchers)}", file=sys.stderr)
         return 2
 
+    # ---- refuse to submit gated train launchers UNgated ---------------------
+    # A launcher with preflight.heavy.gated (and/or needs_overfit) MUST run the
+    # heavy-preflight (+ overfit-bootstrap) afterok chain via submit_with_preflights.sh;
+    # submitting it straight to sbatch skips those safety gates. Hard-fail up front
+    # (nothing submitted) listing the offenders, unless --force-ungated overrides.
+    gated = [
+        t for t in train_ids
+        if train_mfst.launchers[t].preflight.heavy.gated
+        or train_mfst.launchers[t].preflight.heavy.needs_overfit
+    ]
+    if gated and not force_ungated:
+        print(
+            f"[chain_train_eval] REFUSING to submit gated train launcher(s) UNGATED: "
+            f"{gated}\n"
+            "  These carry preflight.heavy.gated/needs_overfit=true and MUST run the "
+            "heavy-preflight (and overfit-bootstrap) afterok chain via\n"
+            "  submit_with_preflights.sh, then chain the eval onto the resulting train "
+            "job id(s) with --after <train_jobid>.\n"
+            "  To bypass the safety preflights and submit them straight to sbatch anyway, "
+            "re-run with --force-ungated.",
+            file=sys.stderr,
+        )
+        return 2
+    if gated and force_ungated:
+        print(
+            f"[chain_train_eval] WARN: --force-ungated: submitting gated launcher(s) "
+            f"{gated} straight to sbatch, SKIPPING the heavy-preflight chain.",
+            file=sys.stderr,
+        )
+
     submitted: list[tuple[str, int]] = []  # (label, jobid) for the scancel hint
     fake = 900001  # deterministic fake ids for --dry-run chain display
 
@@ -139,10 +198,6 @@ def run_chain(
     train_jids: list[int] = []
     for tid in train_ids:
         cfg = train_mfst.launchers[tid]
-        if cfg.preflight.heavy.gated:
-            print(f"[chain_train_eval] WARN: {tid!r} has preflight.heavy.gated=true; "
-                  "this tool submits it UNgated — gate via submit_with_preflights.sh "
-                  "and chain the eval with --after instead.", file=sys.stderr)
         cmd = train_sh._build_sbatch_cmd(tid, cfg, [])
         cmd.insert(1, "--parsable")
         try:
@@ -192,8 +247,23 @@ def run_chain(
     return 0
 
 
+_EPILOG = """\
+examples (real launcher ids, each verified with --dry-run):
+  --after <arm0_jid> --after <arm1_jid> --eval 2sc_pi05_wc_decent --shards 4
+  --after <a0_jid> --after <a1_jid> --after <a2_jid> --eval tsc_dp_d1_decent_in1k
+  --after <train_jid> --eval pm_dp_in1k
+  --train pm_d1_ep300_r3m --eval pm_dp_r3m
+gated train ids (preflight.heavy.gated/needs_overfit) are refused unless --force-ungated;
+prefer submit_with_preflights.sh + --after <train_jobid>.
+"""
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--train", action="append", default=[], metavar="TRAIN_ID",
                    help="Train launcher id (repeatable; e.g. one per decent arm).")
     p.add_argument("--eval", action="append", default=[], metavar="EVAL_ID",
@@ -208,12 +278,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "--train may be omitted when this is given.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the exact sbatch commands without submitting.")
+    p.add_argument("--force-ungated", action="store_true",
+                   help="Submit train launchers that declare preflight.heavy.gated/"
+                        "needs_overfit=true straight to sbatch, SKIPPING the heavy-"
+                        "preflight chain. Without this the tool hard-fails on a gated id.")
     p.add_argument("--train-manifest", type=Path, default=None)
     p.add_argument("--eval-manifest", type=Path, default=None)
     args = p.parse_args(argv)
     return run_chain(
         args.train, args.evals,
         shards=args.shards, after=args.after, dry_run=args.dry_run,
+        force_ungated=args.force_ungated,
         train_manifest=args.train_manifest, eval_manifest=args.eval_manifest,
     )
 

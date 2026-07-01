@@ -22,8 +22,13 @@ import pytest
 from robofactory.scripts.canonical import chain_train_eval as ct
 
 
-TRAIN_A = "tsc_d2_ep300_in1k_a0"
-TRAIN_B = "tsc_d2_ep300_in1k_a1"
+# Two NON-gated train launchers: the happy paths exercise the real train submit
+# builder without tripping the gated-launcher guard (which is covered separately in
+# TestGatedGuard). Both are single-arm DP retrains, enough to test the afterok spec.
+TRAIN_A = "pm_d1_ep300_crop"
+TRAIN_B = "pm_d1_ep300_r3m"
+# A gated launcher (preflight.heavy.gated + needs_overfit): must be refused ungated.
+GATED_TRAIN = "tsc_d2_ep300_in1k_a0"
 EVAL_ID = "pm_dp_in1k"
 
 
@@ -35,7 +40,7 @@ class _FakeSbatch:
         self.fail_at = fail_at  # 0-based call index that returns rc=1
         self.calls: list[list[str]] = []
 
-    def __call__(self, cmd, capture_output=True, text=True):
+    def __call__(self, cmd, capture_output=True, text=True, timeout=None):
         idx = len(self.calls)
         self.calls.append(list(cmd))
         if self.fail_at is not None and idx == self.fail_at:
@@ -165,7 +170,7 @@ class TestAbortSemantics:
 
     def test_unparsable_jobid_aborts(self, monkeypatch, capsys):
         class _Garbage(_FakeSbatch):
-            def __call__(self, cmd, capture_output=True, text=True):
+            def __call__(self, cmd, capture_output=True, text=True, timeout=None):
                 self.calls.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, stdout="???\n", stderr="")
         fake = _Garbage()
@@ -173,6 +178,57 @@ class TestAbortSemantics:
         rc = ct.run_chain([TRAIN_A], [EVAL_ID])
         assert rc == 1
         assert len(fake.calls) == 1  # eval never submitted on unparsable train jid
+
+    def test_sbatch_timeout_aborts_with_scancel_hint(self, monkeypatch, capsys):
+        """A hung sbatch (TimeoutExpired) aborts the chain and prints a scancel hint."""
+        calls = {"n": 0}
+
+        def _timeout(cmd, capture_output=True, text=True, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return subprocess.CompletedProcess(cmd, 0, stdout="111\n", stderr="")
+            raise subprocess.TimeoutExpired(cmd, timeout or 60)
+
+        monkeypatch.setattr(ct.subprocess, "run", _timeout)
+        # First train submits (jid 111); second train's sbatch hangs -> abort.
+        rc = ct.run_chain([TRAIN_A, TRAIN_B], [EVAL_ID])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "ABORT" in err
+        assert "60s" in err            # the timeout message is surfaced
+        assert "scancel 111" in err    # cleanup hint for the already-queued train
+
+
+class TestGatedGuard:
+    """Item 1: a gated train launcher (preflight.heavy.gated/needs_overfit) is refused
+    UNgated (nonzero exit, zero sbatch calls) unless --force-ungated is passed."""
+
+    def test_gated_train_without_flag_submits_nothing(self, monkeypatch, capsys):
+        def _boom(*a, **k):
+            raise AssertionError("subprocess.run called for a gated launcher")
+        monkeypatch.setattr(ct.subprocess, "run", _boom)
+        rc = ct.run_chain([GATED_TRAIN], [EVAL_ID])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "REFUSING" in err and GATED_TRAIN in err
+
+    def test_gated_mixed_with_nongated_still_refused(self, monkeypatch, capsys):
+        def _boom(*a, **k):
+            raise AssertionError("subprocess.run called despite a gated launcher")
+        monkeypatch.setattr(ct.subprocess, "run", _boom)
+        # One non-gated + one gated -> whole chain refused, nothing submitted.
+        rc = ct.run_chain([TRAIN_A, GATED_TRAIN], [EVAL_ID])
+        assert rc == 2
+        assert GATED_TRAIN in capsys.readouterr().err
+
+    def test_force_ungated_proceeds(self, monkeypatch, capsys):
+        fake = _FakeSbatch(jobids=(111, 222))
+        monkeypatch.setattr(ct.subprocess, "run", fake)
+        rc = ct.run_chain([GATED_TRAIN], [EVAL_ID], force_ungated=True)
+        assert rc == 0
+        assert len(fake.calls) == 2  # gated train + eval both submitted
+        err = capsys.readouterr().err
+        assert "force-ungated" in err.lower()  # the skip-preflights warning fired
 
 
 class TestValidationBeforeSubmission:
@@ -203,14 +259,15 @@ class TestMainCli:
     def test_cli_maps_flags_to_run_chain(self, monkeypatch):
         seen = {}
         def _fake_run_chain(train_ids, eval_ids, *, shards, after, dry_run,
-                            train_manifest, eval_manifest):
+                            force_ungated, train_manifest, eval_manifest):
             seen.update(train=train_ids, evals=eval_ids, shards=shards,
-                        after=after, dry_run=dry_run)
+                        after=after, dry_run=dry_run, force_ungated=force_ungated)
             return 0
         monkeypatch.setattr(ct, "run_chain", _fake_run_chain)
         rc = ct.main(["--train", TRAIN_A, "--train", TRAIN_B,
                       "--eval", EVAL_ID, "--shards", "4",
-                      "--after", "999", "--dry-run"])
+                      "--after", "999", "--dry-run", "--force-ungated"])
         assert rc == 0
         assert seen == {"train": [TRAIN_A, TRAIN_B], "evals": [EVAL_ID],
-                        "shards": 4, "after": [999], "dry_run": True}
+                        "shards": 4, "after": [999], "dry_run": True,
+                        "force_ungated": True}
