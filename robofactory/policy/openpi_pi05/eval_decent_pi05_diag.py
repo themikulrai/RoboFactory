@@ -35,7 +35,9 @@ class Args:
     task: str = "LiftBarrier-rf"
     config: str = "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml"
     host: str = "127.0.0.1"
-    ports: str = "8000,8001"
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to colliding ports when co-scheduled. Pass job-unique free ports explicitly.
+    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING
     seed: int = 0
     max_env_steps: int = 400
     replan_after: int = 8

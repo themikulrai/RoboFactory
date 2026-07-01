@@ -88,6 +88,9 @@ def test_hierarchical_plumbing_mock():
         cmd = [
             RF_PY, EVAL,
             "--mock-ll",
+            # --ports is REQUIRED now (no 8000,8001 default). --mock-ll never contacts
+            # the LL servers, so these are throwaway free ports just to satisfy tyro.
+            "--ports", f"{_free_port()},{_free_port()}",
             "--hl-host", "127.0.0.1", "--hl-port", str(hl_port),
             "--hl-query-interval", "10",
             "--max-episodes", "1",

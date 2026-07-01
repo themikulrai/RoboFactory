@@ -38,6 +38,7 @@ import socket
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import gymnasium as gym
 import numpy as np
@@ -92,14 +93,20 @@ class Args:
     config: str = "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml"
     # ---- LL pi0.5 servers ----
     host: str = "127.0.0.1"
-    ports: str = "8000,8001"  # CSV: one port per arm
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to colliding ports when co-scheduled. Launchers always pass job-unique
+    # free ports explicitly (PR1); the smoke test passes throwaway ports (--mock-ll).
+    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING  # CSV: one port per arm
     replan_after: int = 8
     num_arms: int = 2
     robot_uid: str = "panda_wristcam_multi"
     robot_uids_csv: str = "panda_wristcam_multi,panda_wristcam_multi"
     # ---- HL Qwen server ----
     hl_host: str = "127.0.0.1"
-    hl_port: int = 8200
+    # REQUIRED (tyro.MISSING, no default): same collision rationale as --ports. Every
+    # caller (run_hierarchical_lift_barrier_eval.sh, test_hierarchical_smoke.py) already
+    # allocates + passes a job-unique --hl-port, so no default is needed.
+    hl_port: Annotated[int, tyro.conf.arg(help="HL Qwen server HTTP port (REQUIRED)")] = tyro.MISSING
     hl_query_interval: int = 25  # K: query HL every K env steps
     hl_instruction: str = "lift the steel barrier using two robot arms"
     # ---- rollout / eval control ----

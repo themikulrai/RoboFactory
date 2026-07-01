@@ -68,6 +68,7 @@ import socket
 import sys as _sys
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import gymnasium as gym
 import numpy as np
@@ -115,7 +116,10 @@ class Args:
     config: str = "/iris/u/mikulrai/projects/RoboFactory/robofactory/configs/table/lift_barrier.yaml"
     # ---- LL pi0.5 servers (connect to already-running servers; the launcher serves them) ----
     host: str = "127.0.0.1"
-    ports: str = "8000,8001"  # CSV: one websocket port per arm
+    # REQUIRED (tyro.MISSING, no default): a hardcoded default silently routes a
+    # driver to colliding ports when co-scheduled. run_subtask_obedience_probe.sh
+    # allocates + passes job-unique free ports explicitly (PR1).
+    ports: Annotated[str, tyro.conf.arg(help="comma-separated ports, one per arm (REQUIRED)")] = tyro.MISSING  # CSV: one websocket port per arm
     config_arm0: str = "pi05_robofactory_lb_ws_subtaskdart_decent_arm0"
     config_arm1: str = "pi05_robofactory_lb_ws_subtaskdart_decent_arm1"
     ckpt_arm0: str = ""  # informational (recorded in JSON); the launcher serves these
