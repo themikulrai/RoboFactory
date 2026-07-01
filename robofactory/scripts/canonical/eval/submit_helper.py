@@ -10,6 +10,8 @@ Usage:
     python -m robofactory.scripts.canonical.eval.submit_helper <launcher_id>
     python -m robofactory.scripts.canonical.eval.submit_helper <launcher_id> --print
     python -m robofactory.scripts.canonical.eval.submit_helper <launcher_id> -- --dry-run
+    python -m robofactory.scripts.canonical.eval.submit_helper <launcher_id> \\
+        --shards 4 --dependency afterok:<train_jobid>
 
 The `-- <extra>` pass-through is forwarded as argv to `run_eval.sh`.
 """
@@ -38,6 +40,7 @@ def _build_sbatch_cmd(
     cfg: LauncherCfg,
     run_eval_argv: list[str],
     shards: int = 1,
+    dependency: Optional[str] = None,
 ) -> list[str]:
     sb = cfg.sbatch
     cmd: list[str] = ["sbatch"]
@@ -47,6 +50,25 @@ def _build_sbatch_cmd(
     cmd.extend(["--gres", sb.gres])
     cmd.extend(["--cpus-per-task", str(sb.cpus_per_task)])
     cmd.extend(["--mem", sb.mem])
+    # Train->eval chaining: a full sbatch dependency spec (e.g. "afterok:123" or
+    # "afterok:123:456" for a decent train pair) gates this eval on the training
+    # job(s). Composes with --shards: the dependency attaches to the array JOB
+    # as a whole, so every array task waits on it. --kill-on-invalid-dep=yes
+    # auto-cancels the eval when the train job fails, instead of leaving it
+    # parked in DependencyNeverSatisfied forever.
+    #
+    # afterok + requeue/preemption: afterok is evaluated against the dependency
+    # job's FINAL state. A preempted-and-requeued train job returns to PENDING
+    # under the same job id, so the eval keeps waiting and fires only when the
+    # (re)run finally COMPLETEs with exit 0.
+    #
+    # CAVEAT for anything downstream of the EVAL job itself: eval Slurm exit
+    # codes are UNRELIABLE — job 16045963 ended State=FAILED ExitCode=2 yet had
+    # already written a complete results JSON. Eval success = results-JSON-
+    # exists, NEVER Slurm state. Do not chain afterok on an eval job id.
+    if dependency:
+        cmd.extend(["--dependency", dependency])
+        cmd.append("--kill-on-invalid-dep=yes")
     if sb.exclude:
         cmd.extend(["--exclude", sb.exclude])
     if sb.partition:
@@ -93,6 +115,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--shards", type=int, default=1,
                    help="Submit as an sbatch --array of N shards; each array task evals a "
                         "disjoint round-robin slice of the seed pool (merge with merge_shards.py).")
+    p.add_argument("--dependency", default=None,
+                   help="Full sbatch dependency spec passed through verbatim, e.g. "
+                        "'afterok:12345' or 'afterok:123:456' (decent train pair). "
+                        "Adds --kill-on-invalid-dep=yes so a failed upstream job "
+                        "auto-cancels this eval.")
     args = p.parse_args(main_argv)
 
     mfst = load_manifest(args.manifest)
@@ -104,7 +131,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
     cfg = mfst.launchers[args.launcher_id]
-    cmd = _build_sbatch_cmd(args.launcher_id, cfg, extra, shards=args.shards)
+    cmd = _build_sbatch_cmd(args.launcher_id, cfg, extra, shards=args.shards,
+                            dependency=args.dependency)
 
     if args.print_only:
         print(shlex.join(cmd))

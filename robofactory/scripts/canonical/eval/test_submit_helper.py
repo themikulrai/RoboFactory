@@ -65,3 +65,53 @@ class TestShardedSubmit:
         assert cmd[-1] == "--dry-run"
         # --num-shards precedes the forwarded extra argv.
         assert cmd.index("--num-shards") < cmd.index("--dry-run")
+
+
+class TestDependencySubmit:
+    """Train->eval chaining: --dependency must reach sbatch verbatim, with
+    --kill-on-invalid-dep=yes, and must compose with --shards."""
+
+    def test_dependency_flag_and_kill_on_invalid_dep(self):
+        cfg = _cfg("pm_dp_in1k")
+        cmd = sh._build_sbatch_cmd("pm_dp_in1k", cfg, [], dependency="afterok:12345")
+        assert cmd[cmd.index("--dependency") + 1] == "afterok:12345"
+        assert "--kill-on-invalid-dep=yes" in cmd
+        # Both are sbatch flags: they must precede the run_eval.sh positional.
+        script_idx = next(i for i, a in enumerate(cmd) if a.endswith("run_eval.sh"))
+        assert cmd.index("--dependency") < script_idx
+        assert cmd.index("--kill-on-invalid-dep=yes") < script_idx
+
+    def test_multi_jobid_spec_passthrough(self):
+        # Decent train pair: eval waits on BOTH arm jobs.
+        cfg = _cfg("pm_dp_in1k")
+        cmd = sh._build_sbatch_cmd("pm_dp_in1k", cfg, [], dependency="afterok:111:222")
+        assert cmd[cmd.index("--dependency") + 1] == "afterok:111:222"
+
+    def test_dependency_composes_with_shards(self):
+        # The dependency attaches to the --array job as a whole, so every array
+        # task inherits it; both flags must coexist on one sbatch CLI.
+        cfg = _cfg("pm_dp_in1k")
+        cmd = sh._build_sbatch_cmd(
+            "pm_dp_in1k", cfg, [], shards=4, dependency="afterok:12345"
+        )
+        assert cmd[cmd.index("--array") + 1] == "0-3"
+        assert cmd[cmd.index("--dependency") + 1] == "afterok:12345"
+        assert "--kill-on-invalid-dep=yes" in cmd
+        assert cmd[cmd.index("--num-shards") + 1] == "4"
+
+    def test_no_dependency_is_the_default_and_adds_nothing(self):
+        cfg = _cfg("pm_dp_in1k")
+        cmd = sh._build_sbatch_cmd("pm_dp_in1k", cfg, [])
+        assert "--dependency" not in cmd
+        assert "--kill-on-invalid-dep=yes" not in cmd
+
+    def test_cli_dependency_flag_reaches_builder(self, capsys):
+        # End-to-end through main() with --print: no sbatch is invoked; the printed
+        # CLI must carry the dependency + shards composition.
+        rc = sh.main(["pm_dp_in1k", "--print", "--shards", "4",
+                      "--dependency", "afterok:777:888"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "--dependency afterok:777:888" in out
+        assert "--kill-on-invalid-dep=yes" in out
+        assert "--array 0-3" in out
