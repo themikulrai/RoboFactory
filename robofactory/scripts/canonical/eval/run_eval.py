@@ -245,11 +245,18 @@ def _exp_slug(cfg: LauncherCfg) -> str:
     return f"{_cam(cfg.task.camera_family)}_{method}_{variant}"
 
 
+def _group(bucket: str) -> str:
+    """Group prefix: RoboFactory robot tasks + MemER live under multi-robot/;
+    DLRT/NLA/misc stay top-level."""
+    return "multi-robot/" if bucket in ("PM", "2SC", "3SC", "LB", "MemER") else ""
+
+
 def _video_out_dirs(cfg: LauncherCfg, run_id: str) -> tuple[Path, Path]:
-    """4-level scheme: logs/<BUCKET>/eval/<cam>_<method>_<variant>/<run_id> (text),
+    """Scheme: logs/[<group>/]<BUCKET>/eval/<cam>_<method>_<variant>/<run_id> (text),
     eval_artifacts/<same>/videos (media). Replaces the legacy logs/eval_pi05 base.
     PURE: creates no directories (see _ensure_argv_dirs for real-run creation)."""
-    rel = f"{_bucket(cfg.task.env_id)}/eval/{_exp_slug(cfg)}/{run_id}"
+    bucket = _bucket(cfg.task.env_id)
+    rel = f"{_group(bucket)}{bucket}/eval/{_exp_slug(cfg)}/{run_id}"
     return _LOGS_ROOT / rel, _ART_ROOT / rel / "videos"
 
 
