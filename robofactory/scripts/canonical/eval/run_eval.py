@@ -18,6 +18,8 @@ for diffing against the legacy `.sh` invocations during migration.
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import pathlib
 import shlex
@@ -170,14 +172,90 @@ def run_env_hooks(cfg: LauncherCfg, *, dry_run: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Driver argv builders — one per policy_type
 # ---------------------------------------------------------------------------
-def _video_out_dirs(cfg: LauncherCfg, slurm_job_id: str) -> tuple[Path, Path]:
-    """Mirror legacy launcher convention for video + output dirs."""
-    base = Path("/iris/u/mikulrai/logs/eval_pi05")
-    if cfg.policy_type == PolicyType.PI05_DECENT:
-        base = Path("/iris/u/mikulrai/logs/eval_pi05_decent")
-    video_dir = base / f"videos_{slurm_job_id}"
-    out_dir = base
-    return out_dir, video_dir
+# --- new 4-level log/artifact scheme (mirrors ~/bin/log-run-paths.sh) ---
+_LOGS_ROOT = Path("/iris/u/mikulrai/logs")
+_ART_ROOT = Path("/iris/u/mikulrai/eval_artifacts")
+
+
+def _bucket(env_id: str) -> str:
+    t = (env_id or "").lower()
+    if "tworobots" in t or "2sc" in t:
+        return "2SC"
+    if "threerobots" in t or "3sc" in t or "tsc" in t:
+        return "3SC"
+    if "liftbarrier" in t or "lift_barrier" in t:
+        return "LB"
+    if "pickmeat" in t or "pick_meat" in t:
+        return "PM"
+    if "longpipeline" in t or "long_pipeline" in t:
+        return "LP"
+    return "misc"
+
+
+def _cam(camera_family: Optional[str]) -> str:
+    c = (camera_family or "").lower()
+    if "wrist" in c:
+        return "wc"
+    if "work" in c:
+        return "ws"
+    return c or "x"
+
+
+def _method_variant(policy_type: PolicyType) -> tuple[str, str]:
+    return {
+        PolicyType.PI05_SINGLE:     ("pi05", "single"),
+        PolicyType.PI05_DECENT:     ("pi05", "decent"),
+        PolicyType.DP_SINGLE:       ("dp", "single"),
+        PolicyType.DP_DECENT_MULTI: ("dp", "decent"),
+        PolicyType.DP_JOINT_CENT:   ("dp", "cent"),
+    }[policy_type]
+
+
+def _exp_slug(cfg: LauncherCfg) -> str:
+    method, variant = _method_variant(cfg.policy_type)
+    return f"{_cam(cfg.task.camera_family)}_{method}_{variant}"
+
+
+def _video_out_dirs(cfg: LauncherCfg, run_id: str) -> tuple[Path, Path]:
+    """4-level scheme: logs/<BUCKET>/eval/<cam>_<method>_<variant>/<run_id> (text),
+    eval_artifacts/<same>/videos (media). Replaces the legacy logs/eval_pi05 base.
+    PURE: creates no directories (see _ensure_argv_dirs for real-run creation)."""
+    rel = f"{_bucket(cfg.task.env_id)}/eval/{_exp_slug(cfg)}/{run_id}"
+    return _LOGS_ROOT / rel, _ART_ROOT / rel / "videos"
+
+
+def _ensure_argv_dirs(argv: list[str]) -> None:
+    """Create the output dirs an argv references. REAL runs only -- called just
+    before subprocess.run, so --dry-run and tests never pollute logs/."""
+    for i, a in enumerate(argv):
+        if a in ("--out-dir", "--video-dir") and i + 1 < len(argv):
+            Path(argv[i + 1]).mkdir(parents=True, exist_ok=True)
+        elif a == "--jsonl-path" and i + 1 < len(argv):
+            Path(argv[i + 1]).parent.mkdir(parents=True, exist_ok=True)
+        elif a.startswith("--jsonl-path="):
+            Path(a.split("=", 1)[1]).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _register_run(cfg: LauncherCfg, run_id: str, out_dir: Path) -> None:
+    """Write meta.json + index.d/<run_id>.json so the run is greppable via
+    ~/logs/index.jsonl (mirrors log-run-paths.sh logrun_finish). Best-effort."""
+    method, variant = _method_variant(cfg.policy_type)
+    rec = {
+        "jobid": run_id, "bucket": _bucket(cfg.task.env_id), "category": "eval",
+        "exp": _exp_slug(cfg), "task": cfg.task.env_id,
+        "cam": _cam(cfg.task.camera_family), "method": method, "variant": variant,
+        "status": "done", "wandb_url": "", "fn_cell": "",
+        "config": str(cfg.task.scene_config), "cmd": "run_eval.py (launcher)",
+        "date": datetime.date.today().isoformat(), "source": "launcher:run_eval",
+    }
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "meta.json").write_text(json.dumps(rec, indent=2))
+        idxd = _LOGS_ROOT / "index.d"
+        idxd.mkdir(parents=True, exist_ok=True)
+        (idxd / f"{run_id}.json").write_text(json.dumps(rec))
+    except Exception as e:  # noqa: BLE001
+        print(f"[run_eval] WARN index register failed: {e}", file=sys.stderr, flush=True)
 
 
 def build_pi05_single_argv(
@@ -185,8 +263,6 @@ def build_pi05_single_argv(
 ) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    video_dir.mkdir(parents=True, exist_ok=True)
     argv = [
         PREFLIGHT_PYTHON,
         "-u",
@@ -224,8 +300,6 @@ def build_pi05_decent_argv(
 ) -> list[str]:
     assert cfg.server is not None
     out_dir, video_dir = _video_out_dirs(cfg, slurm_job_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    video_dir.mkdir(parents=True, exist_ok=True)
     argv = [
         PREFLIGHT_PYTHON,
         "-u",
@@ -432,7 +506,7 @@ def resolve_n_repeats(cfg: LauncherCfg, launcher_id: str) -> int:
     return 1 if is_ablation else 3
 
 
-def _inject_rep_output(argv: list[str], cfg: LauncherCfg, rep: int) -> list[str]:
+def _inject_rep_output(argv: list[str], cfg: LauncherCfg, rep: int, run_id: str) -> list[str]:
     """Route this rep's result file to a `*_rep{k}.json[l]` path so reps never collide
     and `summarize_eval_runs.py` can glob them. pi0.5 drivers take --out-dir; DP drivers
     take --jsonl-path. Idempotent: only appended when the manifest didn't already set one.
@@ -445,12 +519,10 @@ def _inject_rep_output(argv: list[str], cfg: LauncherCfg, rep: int) -> list[str]
         if "--out-dir" in argv:
             i = argv.index("--out-dir")
             argv[i + 1] = str(Path(argv[i + 1]) / f"rep{rep}")
-        Path(argv[argv.index("--out-dir") + 1]).mkdir(parents=True, exist_ok=True)
     else:
         # DP: give the driver an explicit per-rep jsonl path (only if none set yet).
         if "--jsonl-path" not in argv and not any(a.startswith("--jsonl-path=") for a in argv):
-            base = Path("/iris/u/mikulrai/logs/eval") / f"{cfg.task.env_id}_rep{rep}.jsonl"
-            base.parent.mkdir(parents=True, exist_ok=True)
+            base = _video_out_dirs(cfg, run_id)[0] / f"{cfg.task.env_id}_rep{rep}.jsonl"
             argv.append(f"--jsonl-path={base}")
     return argv
 
@@ -501,12 +573,10 @@ def run_launcher(
                 f"{cfg.server.ports})",
                 file=sys.stderr, flush=True,
             )
-            server_log_dir = Path(
-                f"/iris/u/mikulrai/logs/eval_pi05/run_eval_{rep_job_id}_servers"
-            )
+            server_log_dir = _video_out_dirs(cfg, rep_job_id)[0] / "servers"
             specs = _build_server_specs(cfg, real_ports)
             argv = build_driver_argv(cfg, seeds, rep_job_id, real_ports)
-            argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
+            argv = _inject_rep_output(argv, cfg, rep, rep_job_id) if n_repeats > 1 else argv
             print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
             if dry_run:
                 for spec in specs:
@@ -516,18 +586,22 @@ def run_launcher(
                         file=sys.stderr, flush=True,
                     )
                 continue
+            _ensure_argv_dirs(argv)
             with Pi05ServerSupervisor(specs, log_dir=server_log_dir):
                 wait_for_ports(real_ports, deadline_s=600.0, poll_s=5.0)
                 print("[run_eval] all server ports up; launching eval driver", file=sys.stderr, flush=True)
                 rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
+            _register_run(cfg, rep_job_id, _video_out_dirs(cfg, rep_job_id)[0])
         else:
             # DP path: no server bringup.
             argv = build_driver_argv(cfg, seeds, rep_job_id)
-            argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
+            argv = _inject_rep_output(argv, cfg, rep, rep_job_id) if n_repeats > 1 else argv
             print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
             if dry_run:
                 continue
+            _ensure_argv_dirs(argv)
             rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
+            _register_run(cfg, rep_job_id, _video_out_dirs(cfg, rep_job_id)[0])
         if rc != 0:
             rc_final = rc  # keep going through reps but surface a nonzero exit
     return rc_final
