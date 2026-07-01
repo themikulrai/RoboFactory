@@ -137,7 +137,7 @@ class Pi05ServerSupervisor:
         # An unset OPENPI_DATA_HOME makes serve_policy re-download the 11.6GB norm-stats /
         # asset bundle into the venv default, which blows the wait_for_ports health-check
         # window (600s) and cold-starts every job. Pin it to the shared cache.
-        env.setdefault("OPENPI_DATA_HOME", "/iris/u/mikulrai/data/openpi")
+        env.setdefault("OPENPI_DATA_HOME", "/iris/u/mikulrai/.cache/openpi")
         env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu_index)
         env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(spec.xla_mem_fraction)
