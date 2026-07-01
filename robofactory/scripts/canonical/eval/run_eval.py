@@ -70,10 +70,17 @@ def shard_seeds(seeds: str, shard_index: int, num_shards: int, delim: str) -> st
     if num_shards <= 1:
         return seeds
     toks = seeds.replace(",", " ").split()
-    assert 0 <= shard_index < num_shards <= len(toks), (
-        f"invalid shard: shard_index={shard_index}, num_shards={num_shards}, "
-        f"n_seeds={len(toks)} (need 0 <= shard_index < num_shards <= n_seeds)"
-    )
+    # A plain `assert` here is compiled OUT under `python -O`, which would let a
+    # shard past the pool bounds (e.g. num_shards > n_seeds) silently return an EMPTY
+    # slice — an eval on zero seeds with no error. Use an explicit runtime check that
+    # fires regardless of optimization level.
+    if not (0 <= shard_index < num_shards <= len(toks)):
+        raise SystemExit(
+            f"[run_eval] invalid shard: shard_index={shard_index}, "
+            f"num_shards={num_shards}, n_seeds={len(toks)} "
+            "(need 0 <= shard_index < num_shards <= n_seeds; num_shards must not "
+            "exceed the pool size, else some shards get zero seeds)."
+        )
     return delim.join(toks[shard_index::num_shards])
 
 

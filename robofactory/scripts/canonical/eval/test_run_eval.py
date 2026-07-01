@@ -410,12 +410,23 @@ class TestShardSeeds:
         assert r.shard_seeds("10,11,12,13", 0, 2, " ") == "10 12"
 
     def test_invalid_shard_raises(self):
-        with pytest.raises(AssertionError):
+        # Explicit SystemExit, NOT a bare `assert`: a `raise` statement is never
+        # stripped by `python -O` (only `assert`/`__debug__` blocks are), so an
+        # out-of-bounds shard fails loudly under optimization instead of silently
+        # returning an EMPTY slice. Asserting SystemExit here (not AssertionError,
+        # which an `assert` would raise in this non-`-O` test process) proves the
+        # check is the explicit raise, not a strippable assert.
+        with pytest.raises(SystemExit):
             r.shard_seeds("1,2,3", 0, 5, ",")   # num_shards > n_seeds
-        with pytest.raises(AssertionError):
+        with pytest.raises(SystemExit):
             r.shard_seeds("1,2,3", 3, 3, ",")   # shard_index == num_shards
-        with pytest.raises(AssertionError):
+        with pytest.raises(SystemExit):
             r.shard_seeds("1,2,3", -1, 3, ",")  # negative shard_index
+
+    def test_valid_edge_num_shards_equals_n_seeds(self):
+        # Boundary: num_shards == n_seeds is valid (each shard gets exactly 1 seed).
+        assert r.shard_seeds("1,2,3", 2, 3, ",") == "3"
+        assert r.shard_seeds("1,2,3", 0, 3, ",") == "1"
 
 
 class TestInjectShardOutput:
