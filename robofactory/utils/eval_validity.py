@@ -216,7 +216,7 @@ _PROMPTS_DIRS = (
     Path(OPENPI_REPO) / "examples" / "robofactory",
 )
 LB_SUBTASK_NPZ = Path(
-    "/iris/u/mikulrai/data/RoboFactory/lerobot/lb_subtask_sidecar/lb_subtask_index.npz"
+    "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/lb_subtask_sidecar/lb_subtask_index.npz"
 )
 
 

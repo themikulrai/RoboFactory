@@ -132,13 +132,13 @@ def main():
         {
             'name': 'state=action',
             'ckpt_suffix': 'workspace_overfit1',
-            'zarr_tpl': '/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1_agent{i}_150.zarr',
+            'zarr_tpl': '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1_agent{i}_150.zarr',
             'agent_pos_fn': _action_agent_pos,
         },
         {
             'name': 'state=qpos',
             'ckpt_suffix': 'workspace_overfit1qpos',
-            'zarr_tpl': '/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{i}_150.zarr',
+            'zarr_tpl': '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{i}_150.zarr',
             'agent_pos_fn': _qpos_agent_pos,
         },
     ]

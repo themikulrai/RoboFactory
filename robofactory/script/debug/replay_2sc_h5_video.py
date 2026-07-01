@@ -8,7 +8,7 @@ Records `head_camera_global` RGB at every env step into an MP4.
 
 Usage:
   python script/debug/replay_2sc_h5_video.py \
-    --h5 /iris/u/mikulrai/data/RoboFactory/h5_data/TwoRobotsStackCube-rf.h5 \
+    --h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/h5_data/TwoRobotsStackCube-rf.h5 \
     --traj 13 --seed 17 \
     --config configs/table/two_robots_stack_cube.yaml \
     --out-mp4 /iris/u/mikulrai/runs/replay/2sc_seed17_traj13.mp4

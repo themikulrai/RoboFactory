@@ -16,7 +16,7 @@ Usage:
         --task LongPipelineDelivery \\
         --start-seed 13 --max-seed 400 --target-extra 137 \\
         --per-attempt-timeout 600 --max-retries 1 \\
-        --existing-h5 /iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/LongPipelineDelivery/LongPipelineDelivery.h5
+        --existing-h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/LongPipelineDelivery/LongPipelineDelivery.h5
 """
 import os
 os.environ.setdefault("SAPIEN_HEADLESS", "1")

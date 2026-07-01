@@ -163,7 +163,7 @@ def main():
     ap.add_argument('--checkpoint-num', type=int, default=2000)
     ap.add_argument('--ckpt-suffix', default='workspace_overfit1qpos')
     ap.add_argument('--zarr-tpl',
-                    default='/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{i}_150.zarr')
+                    default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{i}_150.zarr')
     ap.add_argument('--ep-idx', type=int, default=13)
     ap.add_argument('--seeds', type=int, nargs='+', required=True)
     ap.add_argument('--max-steps', type=int, default=80)  # 80 chunks × 6 = 480 env steps, demo is 257

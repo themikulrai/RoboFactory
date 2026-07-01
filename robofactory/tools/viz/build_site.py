@@ -10,7 +10,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 THIS_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = THIS_DIR / "templates"
 ASSETS_DIR = THIS_DIR / "site_assets"
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 
 # Search paths for plotly.min.js — any conda env that has plotly installed works.
 PLOTLY_SEARCH = [

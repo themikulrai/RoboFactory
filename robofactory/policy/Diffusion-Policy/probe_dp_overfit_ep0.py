@@ -20,7 +20,7 @@ sys.path.insert(0, "./policy/Diffusion-Policy")
 from eval_multi_dp import get_policy
 from diffusion_policy.env_runner.dp_runner import DPRunner
 
-H5 = "/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.h5"
+H5 = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.h5"
 CKPT = {
     0: "/iris/u/mikulrai/checkpoints/RoboFactory/3aa8b94ca354/500.ckpt",
     1: "/iris/u/mikulrai/checkpoints/RoboFactory/c0917d6d7836/500.ckpt",

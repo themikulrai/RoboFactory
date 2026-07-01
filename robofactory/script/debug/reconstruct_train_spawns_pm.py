@@ -21,8 +21,8 @@ import h5py
 import json
 
 ZARR_PATH = '/iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data/PickMeat-rf_150.zarr'
-H5_PATH   = '/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5'
-JSON_PATH = '/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.json'
+H5_PATH   = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5'
+JSON_PATH = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.json'
 
 # ---------------------------------------------------------------------------
 # 1. Load all first frames from zarr

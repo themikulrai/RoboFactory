@@ -7,12 +7,12 @@ cameras PLUS per-arm hand_camera_{i} at 224x224.
 Usage (pilot — verify success rate before committing to 150):
     python scripts/feasibility_wrist_replay/run_wristcam_rollouts.py \\
         --task LongPipelineDelivery --num 20 \\
-        --record-dir /iris/u/mikulrai/data/RoboFactory/hf_download_wristcam_pilot
+        --record-dir /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_wristcam_pilot
 
 Usage (full dataset):
     python scripts/feasibility_wrist_replay/run_wristcam_rollouts.py \\
         --task LongPipelineDelivery --num 150 \\
-        --record-dir /iris/u/mikulrai/data/RoboFactory/hf_download_wristcam
+        --record-dir /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_wristcam
 """
 import os
 os.environ.setdefault("SAPIEN_HEADLESS", "1")
@@ -48,7 +48,7 @@ from robofactory.planner.solutions import (
 from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory import CONFIG_DIR
 
-HF_DOWNLOAD_ROOT = "/iris/u/mikulrai/data/RoboFactory/hf_download"
+HF_DOWNLOAD_ROOT = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download"
 
 # (env_id, yaml_rel, solver, n_agents)
 TASK_MAP = {
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "--record-dir",
         type=str,
-        default="/iris/u/mikulrai/data/RoboFactory/hf_download_wristcam",
+        default="/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_wristcam",
     )
     ap.add_argument("--max-retries", type=int, default=5, dest="max_retries")
     ap.add_argument("--per-attempt-timeout", type=int, default=300, dest="per_attempt_timeout",

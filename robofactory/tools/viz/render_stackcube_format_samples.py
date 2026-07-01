@@ -22,7 +22,7 @@ import zarr
 import pyarrow.parquet as pq
 from PIL import Image
 
-OUT_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site/media/StackCube_formats")
+OUT_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site/media/StackCube_formats")
 FPS = 20  # true sim control rate (matches LeRobot info.json fps); all four panels share this
 
 
@@ -158,10 +158,10 @@ def render_libero_wc(repo_root: Path, out: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--zarr-ws", default="/iris/u/mikulrai/data/RoboFactory/zarr_data/StackCube-rf_workspace_cent_150.zarr")
-    ap.add_argument("--zarr-wc", default="/iris/u/mikulrai/data/RoboFactory/zarr_data/StackCube-rf_wristcam_cent_150.zarr")
-    ap.add_argument("--libero-ws", default="/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_stack_cube_workspace_seedfix_v1")
-    ap.add_argument("--libero-wc", default="/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_stack_cube_wristcam_seedfix_v1")
+    ap.add_argument("--zarr-ws", default="/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/StackCube-rf_workspace_cent_150.zarr")
+    ap.add_argument("--zarr-wc", default="/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/StackCube-rf_wristcam_cent_150.zarr")
+    ap.add_argument("--libero-ws", default="/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_stack_cube_workspace_seedfix_v1")
+    ap.add_argument("--libero-wc", default="/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_stack_cube_wristcam_seedfix_v1")
     ap.add_argument("--out-dir", default=str(OUT_ROOT))
     args = ap.parse_args()
 

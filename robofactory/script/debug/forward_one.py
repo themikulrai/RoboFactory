@@ -16,7 +16,7 @@ Prints:
 
 Usage:
   python script/debug/forward_one.py --ckpt <ckpt> --obs-source train \
-    --h5 /iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5 --traj 0
+    --h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5 --traj 0
   python script/debug/forward_one.py --ckpt <ckpt> --obs-source env \
     --config configs/table/pick_meat.yaml --seed 0
 """

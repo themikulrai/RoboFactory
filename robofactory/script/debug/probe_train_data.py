@@ -2,10 +2,10 @@
 
 Usage:
   python script/debug/probe_train_data.py \
-    --h5 /iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5 --traj 0
+    --h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5 --traj 0
   # or for TSC:
   python script/debug/probe_train_data.py \
-    --h5 /iris/u/mikulrai/data/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.h5 \
+    --h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.h5 \
     --traj 0 --multi-agent
 
 Prints camera image stats + action stats per dim + initial qpos +

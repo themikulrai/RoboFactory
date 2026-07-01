@@ -2,14 +2,14 @@
 
 Renders the *exact* visual inputs that a Diffusion-Policy training run consumes,
 straight from the converted zarr stores under
-/iris/u/mikulrai/data/RoboFactory/zarr_data/.
+/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/.
 
 Cameras are tiled HORIZONTALLY in alphabetical key order to match the existing
 LiftBarrier_dp_* output convention (672x224 for 3 cams, 448x224 for 2 cams,
 896x224 for 4 cams). Encoding: libx264 + yuv420p + faststart, 30 fps.
 
 Output:
-  /iris/u/mikulrai/data/RoboFactory/site/media/<task>_dp_<cam>_<scheme>/
+  /iris/u/mikulrai/datasets/multi_robot/RoboFactory/site/media/<task>_dp_<cam>_<scheme>/
     videos/ep_NNN.mp4
     thumbs/ep_NNN.jpg
 
@@ -29,8 +29,8 @@ import zarr
 
 from .render_videos import encode_video, save_thumb
 
-ZARR_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/zarr_data")
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+ZARR_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 FPS = 30
 NON_IMAGE_KEYS = {"action", "state", "tcp_action"}
 

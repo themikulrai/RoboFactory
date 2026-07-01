@@ -30,7 +30,8 @@ set -euo pipefail
 
 # ---- mandatory env (OPENPI_DATA_HOME: else serve re-downloads 11.6GB pi05_base and
 #      times out the health check -- memory project_hier_eval_openpi_data_home). ----
-export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/iris/u/mikulrai/data/openpi}"
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/iris/u/mikulrai/.cache/openpi}"
 export TMPDIR="${TMPDIR:-/iris/u/mikulrai/tmp}"; mkdir -p "$TMPDIR"
 export HF_HOME="${HF_HOME:-/iris/u/mikulrai/.cache/huggingface}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/iris/u/mikulrai/.cache}"

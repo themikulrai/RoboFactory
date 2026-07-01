@@ -16,7 +16,7 @@ Each tile is 320x240 (resized from the 240x320x3 PNGs in parquet);
 final mosaic is 640x480, libx264 + yuv420p + faststart, 30 fps.
 
 Output:
-  /iris/u/mikulrai/data/RoboFactory/site/media/<task>_pi_<cam>/{videos,thumbs}/ep_NNN.{mp4,jpg}
+  /iris/u/mikulrai/datasets/multi_robot/RoboFactory/site/media/<task>_pi_<cam>/{videos,thumbs}/ep_NNN.{mp4,jpg}
 
 Run with the RoboFactory env interpreter:
   /iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python \
@@ -41,8 +41,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from render_videos import encode_video, save_thumb  # noqa: E402
 
-LEROBOT_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/lerobot")
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+LEROBOT_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 FPS = 30  # match LB's HTML5 convention (info.json says 20 but LB uses 30)
 
 # Tile layout: order matters - 2x2 mosaic indexed row-major (TL, TR, BL, BR)

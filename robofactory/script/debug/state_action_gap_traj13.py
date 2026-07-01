@@ -19,7 +19,7 @@ import numpy as np
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--h5', default='/iris/u/mikulrai/data/RoboFactory/h5_data/TwoRobotsStackCube-rf.h5')
+    ap.add_argument('--h5', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/h5_data/TwoRobotsStackCube-rf.h5')
     ap.add_argument('--traj', type=int, default=13)
     ap.add_argument('--agent-key', default='panda_wristcam_multi')
     ap.add_argument('--action-key', default='panda')

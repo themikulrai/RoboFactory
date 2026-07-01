@@ -12,7 +12,7 @@ Usage:
     python extend_wristcam_h5.py \\
         --task PlaceFood \\
         --start-seed 153 --max-seed 300 --target-extra 8 --max-retries 5 \\
-        --existing-h5 /iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/PlaceFood/PlaceFood.h5
+        --existing-h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/PlaceFood/PlaceFood.h5
 
 The new H5 traj keys are appended as traj_<N>, traj_<N+1>, ... where N is the
 existing trajectory count (NOT next_seed). JSON episodes get episode_id starting

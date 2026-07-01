@@ -18,13 +18,14 @@ mkdir -p "$TMPDIR"
 # from gs://openpi-assets to the cold NFS home cache (that 11.6GB download blew past the
 # launcher's 6-min LL health window and killed the first two attempts). These are
 # inherited by the launcher's LL serve subshells (they only override CUDA/XLA).
-export OPENPI_DATA_HOME=/iris/u/mikulrai/data/openpi
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/iris/u/mikulrai/.cache/openpi}"
 export HF_HOME=/iris/u/mikulrai/.cache/huggingface
 export XDG_CACHE_HOME=/iris/u/mikulrai/.cache
 
 LAUNCHER=/iris/u/mikulrai/projects/RoboFactory/scripts/run_hierarchical_lift_barrier_eval.sh
 
-HL_MODEL=/iris/u/mikulrai/data/memer/ckpts/lb_wc_dual_r64/checkpoint-3000
+HL_MODEL="${MR_CKPT_ROOT:?MR_CKPT_ROOT unset — source ~/.config/dataroots.sh}/memer/ckpts/lb_wc_dual_r64/checkpoint-3000"
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm0/lb_wc_decent_arm0_v1/19999
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm1/lb_wc_decent_arm1_v1/19999
 

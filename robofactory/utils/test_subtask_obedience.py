@@ -43,8 +43,8 @@ def test_prompt_constants_exact():
 @pytest.mark.parametrize(
     "vocab_json",
     [
-        "/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_lift_barrier_ws_subtaskdart_v1/subtask_vocab.json",
-        "/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_lift_barrier_wc_subtaskdart_v1/subtask_vocab.json",
+        "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_lift_barrier_ws_subtaskdart_v1/subtask_vocab.json",
+        "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_lift_barrier_wc_subtaskdart_v1/subtask_vocab.json",
     ],
 )
 def test_probe_strings_in_real_vocab_if_present(vocab_json):

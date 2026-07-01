@@ -21,7 +21,7 @@ import numpy as np
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from PIL import Image
 
-DATASET_DIR = Path("/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam")
+DATASET_DIR = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam")
 PROMPT = "stack the three cubes using three robot arms"
 # Module-level placeholder; rebound in __main__ from --output_dir.
 OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")

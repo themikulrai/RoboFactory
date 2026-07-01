@@ -11,7 +11,8 @@ nvidia-smi -L || true
 LAUNCHER=/iris/u/mikulrai/projects/RoboFactory/scripts/run_hierarchical_lift_barrier_eval.sh
 
 # FULLY-TRAINED checkpoints.
-HL_MODEL=/iris/u/mikulrai/data/memer/ckpts/lb_dual_r64/checkpoint-3000
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+HL_MODEL="${MR_CKPT_ROOT:?MR_CKPT_ROOT unset — source ~/.config/dataroots.sh}/memer/ckpts/lb_dual_r64/checkpoint-3000"
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm0/lb_ws_decent_arm0_v1/18000
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm1/lb_ws_decent_arm1_v1/18000
 

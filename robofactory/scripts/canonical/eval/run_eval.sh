@@ -21,7 +21,8 @@ conda activate RoboFactory
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
-export OPENPI_DATA_HOME=/iris/u/mikulrai/data/openpi
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/iris/u/mikulrai/.cache/openpi}"
 export HF_HOME=/iris/u/mikulrai/.cache/huggingface
 export XDG_CACHE_HOME=/iris/u/mikulrai/.cache
 export JAX_COMPILATION_CACHE_DIR=/iris/u/mikulrai/.cache/jax

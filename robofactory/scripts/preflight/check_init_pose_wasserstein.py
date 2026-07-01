@@ -17,7 +17,7 @@ Why per-dim Wasserstein-1 and not joint KL:
   silently approve a real shift.
 
 Format auto-detection (path suffix):
-- ``*.zarr`` -> zarr DP dataset at /iris/u/mikulrai/data/RoboFactory/zarr_data/.
+- ``*.zarr`` -> zarr DP dataset at /iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/.
   State at ``data/state`` (per-step joint vector), episode boundaries at
   ``meta/episode_ends`` (int array).
 - anything else -> LeRobot HuggingFace ``datasets`` path. We pull the

@@ -31,7 +31,8 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 EXP_TAG="${EXP_TAG:-overfit1}"
 
 TASK_CONFIG="default_task_wristcam"
-ZARR_DIR="/iris/u/mikulrai/data/RoboFactory/zarr_data"
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+ZARR_DIR="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/zarr_data"
 ZARR_SRC_NAME="LongPipelineDelivery_${CAM_FAMILY}_agent${ARM}"
 ZARR_NEW_NAME="LongPipelineDelivery_${CAM_FAMILY}_${EXP_TAG}_agent${ARM}_150"
 ZARR_SRC="${ZARR_DIR}/${ZARR_SRC_NAME}.zarr"

@@ -18,7 +18,7 @@ def meat_xyz(env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='configs/table/pick_meat.yaml')
-    ap.add_argument('--h5', default='/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5')
+    ap.add_argument('--h5', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5')
     ap.add_argument('--seeds', nargs='+', type=int, default=list(range(10000, 10016)))
     args = ap.parse_args()
 

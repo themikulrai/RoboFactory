@@ -17,7 +17,7 @@ from diffusion_policy.workspace.robotworkspace import RobotWorkspace
 def main():
     for arm in (0, 1):
         ckpt = f'/iris/u/mikulrai/checkpoints/RoboFactory/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{arm}_150/2000.ckpt'
-        zp = f'/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{arm}_150.zarr'
+        zp = f'/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_overfit1qpos_agent{arm}_150.zarr'
         print(f'\n=== arm {arm} ===')
         print(f'ckpt: {ckpt}')
         print(f'zarr: {zp}')

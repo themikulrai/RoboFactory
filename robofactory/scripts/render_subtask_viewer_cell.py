@@ -54,7 +54,7 @@ ARM_COLOR = (210, 235, 255)  # warm white for active subtask
 # ---------------------------------------------------------------------------
 TASKS = {
     "LiftBarrier": {
-        "data_dir": "/iris/u/mikulrai/data/RoboFactory/subtask_gen_validate5/LiftBarrier",
+        "data_dir": "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/subtask_gen_validate5/LiftBarrier",
         "num_arms": 2,
         "featured": [0, 1, 3, 4, 5, 9],
         # (h5 cam key, tile label)
@@ -79,7 +79,7 @@ TASKS = {
         "after_cell_id": "fa30fe5b-8d77-4a43-9164-905e47e14fb3",
     },
     "ThreeRobotsStackCube": {
-        "data_dir": "/iris/u/mikulrai/data/RoboFactory/subtask_gen_tsc_v4/ThreeRobotsStackCube",
+        "data_dir": "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/subtask_gen_tsc_v4/ThreeRobotsStackCube",
         "num_arms": 3,
         # 3 DISTINCT behaviours only (traj_2 was raise_and_wait = byte-identical
         # duplicate of traj_0 simultaneous_pick, so it is DROPPED):

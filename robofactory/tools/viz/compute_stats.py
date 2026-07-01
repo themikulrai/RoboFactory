@@ -16,8 +16,8 @@ import h5py
 import numpy as np
 from PIL import Image
 
-DATA_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/hf_download")
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+DATA_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 SAT_THRESHOLD = 0.99
 DIVERSITY_SIZE = 64  # downsample first frame to this (HxH) grayscale for pairwise L2
 

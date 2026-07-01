@@ -111,7 +111,7 @@ def main():
     ap.add_argument('--data-num', type=int, default=150)
     ap.add_argument('--checkpoint-num', type=int, default=2000)
     ap.add_argument('--task', default='TwoRobotsStackCube-rf')
-    ap.add_argument('--zarr-root', default='/iris/u/mikulrai/data/RoboFactory/zarr_data')
+    ap.add_argument('--zarr-root', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data')
     ap.add_argument('--ep-idx', type=int, default=13)
     ap.add_argument('--n-obs-steps', type=int, default=3)
     ap.add_argument('--no-include-global', dest='include_global', action='store_false')

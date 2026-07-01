@@ -22,7 +22,7 @@
 # --camera-family {workspace,wristcam}); we do NOT need 12 separate planner
 # runs.
 #
-# Output: /iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/<Task>/<Task>.h5
+# Output: /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/<Task>/<Task>.h5
 #         + .json + .seedfix_regenerated sentinel
 #
 # Mapping (idx -> task):
@@ -58,7 +58,8 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 fi
 
 TASK="${TASKS[$SLURM_ARRAY_TASK_ID]}"
-RECORD_ROOT=/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+RECORD_ROOT="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/hf_download_post_seedfix"
 OUT_DIR="${RECORD_ROOT}/${TASK}"
 OUT_H5="${OUT_DIR}/${TASK}.h5"
 

@@ -455,8 +455,8 @@ def _load_training_base0_frame(index: int, v21_dir: str) -> np.ndarray:
 def fidelity_check(
     episode_index: int = 0,
     config: str = Args.config,
-    v21_dir: str = "/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_lift_barrier_workspace_seedfix_v1",
-    lb_json: str = "/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.json",
+    v21_dir: str = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_lift_barrier_workspace_seedfix_v1",
+    lb_json: str = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.json",
     rmse_threshold: float = 0.1,
 ) -> dict:
     """Gate G2: render one head_camera_global frame at the training episode's reset

@@ -22,7 +22,7 @@ import cv2
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--h5', default='/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/TwoRobotsStackCube/TwoRobotsStackCube.h5')
+    p.add_argument('--h5', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/TwoRobotsStackCube/TwoRobotsStackCube.h5')
     p.add_argument('--demo-idx', type=int, default=13)
     p.add_argument('--seed', type=int, default=17)
     p.add_argument('--config', default='configs/table/two_robots_stack_cube.yaml')

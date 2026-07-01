@@ -19,7 +19,7 @@
 # lineage. Trajectories differ from the wristcam half because the robot
 # URDF/dynamics differ, even with the same env seed.
 #
-# Output: /iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix_workspace/
+# Output: /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix_workspace/
 #         <ENV_ID>/motionplanning/<traj-name>.h5 (planner.run convention)
 
 set -euo pipefail
@@ -48,7 +48,8 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 fi
 
 IFS=':' read -r ENV_ID YAML N_AGENTS <<< "${TASKS[$SLURM_ARRAY_TASK_ID]}"
-RECORD_ROOT=/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix_workspace
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+RECORD_ROOT="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/hf_download_post_seedfix_workspace"
 OUT_DIR="${RECORD_ROOT}/${ENV_ID}/motionplanning"
 
 echo "[regen-ws] array_id=${SLURM_ARRAY_TASK_ID}  env_id=${ENV_ID}  yaml=${YAML}  n_agents=${N_AGENTS}"

@@ -5,7 +5,7 @@ If failure: env has drifted from data-recording env (different mani_skill / phys
 
 Usage:
   python script/debug/replay_h5.py \
-    --h5 /iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5 \
+    --h5 /iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5 \
     --traj 0 1 2 \
     --config configs/table/pick_meat.yaml
 """

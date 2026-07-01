@@ -37,7 +37,8 @@ else
     TASK_CONFIG="default_task_wristcam"
 fi
 
-ZARR_DIR="/iris/u/mikulrai/data/RoboFactory/zarr_data"
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+ZARR_DIR="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/zarr_data"
 # The state=qpos zarrs were built by parse_h5_to_zarr_unified.py --state-source qpos.
 ZARR_PATH="${ZARR_DIR}/TwoRobotsStackCube-rf_${CAM_FAMILY}_${EXP_TAG}_agent${ARM}_150.zarr"
 [ -e "$ZARR_PATH" ] || { echo "MISSING zarr (build it first with --state-source qpos): $ZARR_PATH"; exit 1; }

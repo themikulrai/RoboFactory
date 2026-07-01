@@ -23,7 +23,8 @@ set -euo pipefail
 WT=/iris/u/mikulrai/projects/RoboFactory/.claude/worktrees/week2-tsc
 RF=$WT/robofactory
 PY=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
-H5_ROOT=/iris/u/mikulrai/data/RoboFactory/hf_download_camfix_workspace
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+H5_ROOT="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/hf_download_camfix_workspace"
 ZARR=/iris/u/mikulrai/projects/RoboFactory/robofactory/data/zarr_data
 ENV=ThreeRobotsStackCube-rf
 YAML=configs/table/three_robots_stack_cube.yaml

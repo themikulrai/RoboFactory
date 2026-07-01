@@ -23,8 +23,8 @@ import yaml
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--zarr-a0', default='/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_decent_agent0_150.zarr')
-    parser.add_argument('--zarr-a1', default='/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_decent_agent1_150.zarr')
+    parser.add_argument('--zarr-a0', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_decent_agent0_150.zarr')
+    parser.add_argument('--zarr-a1', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_decent_agent1_150.zarr')
     parser.add_argument('--demo-idx', type=int, default=13)
     parser.add_argument('--seed', type=int, default=17)
     parser.add_argument('--config', default='configs/table/two_robots_stack_cube.yaml')

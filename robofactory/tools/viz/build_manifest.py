@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 
 
 def build() -> dict:

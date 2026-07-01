@@ -26,7 +26,7 @@ from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401
 
-H5 = "/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.h5"
+H5 = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/LiftBarrier/LiftBarrier.h5"
 IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
 

@@ -98,8 +98,9 @@ ln -sfn "$ROBOFACTORY/robofactory" "$WORK_DIR/robofactory"
 # data/zarr_data is read by the dataset loader; symlink the canonical
 # path so the existing absolute ZARR_PATH stays valid AND the relative
 # data/* hydra defaults still resolve.
-ln -sfn /iris/u/mikulrai/data/RoboFactory/zarr_data "$WORK_DIR/data/zarr_data"
-ln -sfn /iris/u/mikulrai/data/RoboFactory/h5_data   "$WORK_DIR/data/h5_data" 2>/dev/null || true
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+ln -sfn "${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/zarr_data" "$WORK_DIR/data/zarr_data"
+ln -sfn "${RF_DATA_ROOT:?}/h5_data"   "$WORK_DIR/data/h5_data" 2>/dev/null || true
 
 cd "$WORK_DIR"
 

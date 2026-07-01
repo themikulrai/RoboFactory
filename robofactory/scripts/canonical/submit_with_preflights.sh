@@ -12,7 +12,7 @@
 #   bash scripts/canonical/submit_with_preflights.sh \
 #       --train-launcher scripts/canonical/retrain_dp_pm_d1_ep300_in1k.sh \
 #       --ckpt   /iris/u/mikulrai/checkpoints/.../300_in1k.ckpt \
-#       --dataset /iris/u/mikulrai/data/RoboFactory/zarr_data/PickMeat-rf_150.zarr \
+#       --dataset /iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data/PickMeat-rf_150.zarr \
 #       --scene-config configs/table/pick_meat.yaml \
 #       [--out-dir /iris/u/mikulrai/runs/preflight/<run_id>]
 #       [--max-steps 50] [--mse-tolerance 0.01]

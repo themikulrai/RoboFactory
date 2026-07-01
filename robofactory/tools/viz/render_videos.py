@@ -16,8 +16,8 @@ import h5py
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-DATA_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/hf_download")
-SITE_ROOT = Path("/iris/u/mikulrai/data/RoboFactory/site")
+DATA_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download")
+SITE_ROOT = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/site")
 FPS = 30
 THUMB_MAX = (160, 120)  # (w, h) bbox; PIL thumbnail preserves aspect
 

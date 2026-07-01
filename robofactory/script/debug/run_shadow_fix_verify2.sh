@@ -10,7 +10,7 @@ source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
 
 CKPT=/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/300.ckpt
-H5=/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5
+H5=/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5
 CFG=configs/table/pick_meat.yaml
 
 echo "HOST: $(hostname)"

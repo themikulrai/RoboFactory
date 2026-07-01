@@ -24,8 +24,8 @@ import robofactory  # registers envs
 
 # Map dataset-name -> (registered env_id, h5/json base path, #agents)
 TASK_TO_ENV = {
-    "TakePhoto": ("TakePhoto-rf", "/iris/u/mikulrai/data/RoboFactory/hf_download/TakePhoto/TakePhoto", 4),
-    "LongPipelineDelivery": ("LongPipelineDelivery-rf", "/iris/u/mikulrai/data/RoboFactory/hf_download/LongPipelineDelivery/LongPipelineDelivery", 4),
+    "TakePhoto": ("TakePhoto-rf", "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/TakePhoto/TakePhoto", 4),
+    "LongPipelineDelivery": ("LongPipelineDelivery-rf", "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/LongPipelineDelivery/LongPipelineDelivery", 4),
 }
 
 

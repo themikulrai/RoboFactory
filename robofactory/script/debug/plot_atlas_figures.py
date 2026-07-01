@@ -194,7 +194,7 @@ def fig3_cube_scatter() -> None:
 def fig4_gripper_heatmap() -> None:
     src_dir = Path("/iris/u/mikulrai/logs/tsc_debug/arm2_demos")
     # Load parquet data to recompute heatmap
-    data_dir = Path("/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam/data/chunk-000")
+    data_dir = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam/data/chunk-000")
     import pandas as pd
 
     files = sorted(data_dir.glob("episode_*.parquet"))

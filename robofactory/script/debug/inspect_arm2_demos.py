@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path("/iris/u/mikulrai/data/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam/data/chunk-000")
+DATA_DIR = Path("/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/robofactory_three_arm_stack_wristcam/data/chunk-000")
 # Module-level placeholder; rebound in __main__ from --output_dir.
 OUT_DIR: Path = Path("/tmp/_uninitialized_replace_me")
 

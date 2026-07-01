@@ -24,7 +24,8 @@ CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 EXP_TAG="${EXP_TAG:-overfit1qpos}"
 
-ZARR_PATH="/iris/u/mikulrai/data/RoboFactory/zarr_data/TwoRobotsStackCube-rf_workspace_${EXP_TAG}_agent${ARM}_150.zarr"
+source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+ZARR_PATH="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/zarr_data/TwoRobotsStackCube-rf_workspace_${EXP_TAG}_agent${ARM}_150.zarr"
 [ -e "$ZARR_PATH" ] || { echo "MISSING zarr: $ZARR_PATH"; exit 1; }
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh

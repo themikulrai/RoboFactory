@@ -44,7 +44,7 @@ def get_cube_pos(env, name='cubeA'):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--h5', default='/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix/TwoRobotsStackCube/TwoRobotsStackCube.h5')
+    parser.add_argument('--h5', default='/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download_post_seedfix/TwoRobotsStackCube/TwoRobotsStackCube.h5')
     parser.add_argument('--config', default='configs/table/two_robots_stack_cube.yaml')
     parser.add_argument('--demos', nargs='+', type=int, default=[0])
     parser.add_argument('--max-seed', type=int, default=300)

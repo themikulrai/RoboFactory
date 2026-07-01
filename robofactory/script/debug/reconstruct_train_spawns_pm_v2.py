@@ -18,8 +18,8 @@ import numpy as np
 import h5py
 import json
 
-H5_PATH   = '/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.h5'
-JSON_PATH = '/iris/u/mikulrai/data/RoboFactory/hf_download/PickMeat/PickMeat.json'
+H5_PATH   = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.h5'
+JSON_PATH = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/PickMeat/PickMeat.json'
 
 with open(JSON_PATH) as f:
     jd = json.load(f)

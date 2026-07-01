@@ -54,9 +54,9 @@ OPENPI_PY=/iris/u/mikulrai/projects/openpi/.venv/bin/python
 ZARR_SCRIPT=/iris/u/mikulrai/projects/RoboFactory/robofactory/script/parse_h5_to_zarr_unified.py
 LEROBOT_SCRIPT=/iris/u/mikulrai/projects/openpi/examples/robofactory/convert_robofactory_data_to_lerobot.py
 
-H5_ROOT=/iris/u/mikulrai/data/RoboFactory/hf_download_post_seedfix
-ZARR_OUT_ROOT=/iris/u/mikulrai/data/RoboFactory/zarr_data
 source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
+H5_ROOT="${RF_DATA_ROOT:?RF_DATA_ROOT unset — source ~/.config/dataroots.sh}/hf_download_post_seedfix"
+ZARR_OUT_ROOT="${RF_DATA_ROOT:?}/zarr_data"
 LEROBOT_OUT_ROOT="${RF_LEROBOT_HOME:?RF_LEROBOT_HOME unset — source ~/.config/dataroots.sh}"
 CAM_MAP_DIR=/iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings
 

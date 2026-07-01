@@ -21,8 +21,8 @@ import json
 import gymnasium as gym
 from robofactory.tasks import *
 
-H5_PATH   = '/iris/u/mikulrai/data/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.h5'
-JSON_PATH = '/iris/u/mikulrai/data/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.json'
+H5_PATH   = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.h5'
+JSON_PATH = '/iris/u/mikulrai/datasets/multi_robot/RoboFactory/hf_download/ThreeRobotsStackCube/ThreeRobotsStackCube.json'
 CFG       = 'configs/table/three_robots_stack_cube.yaml'
 
 # ---------------------------------------------------------------------------

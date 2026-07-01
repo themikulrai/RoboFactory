@@ -105,7 +105,7 @@ CAMERA_FAMILY_ALIASES = {"ws": "workspace", "wc": "wristcam",
                          "workspace": "workspace", "wristcam": "wristcam"}
 
 DEFAULT_VOCAB_JSON = (
-    "/iris/u/mikulrai/data/RoboFactory/lerobot/"
+    "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/lerobot/"
     "robofactory_lift_barrier_ws_subtaskdart_v1/subtask_vocab.json"
 )
 

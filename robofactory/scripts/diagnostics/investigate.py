@@ -353,7 +353,7 @@ def _guess_dataset_from_manifest_row(row: dict) -> str:
     family. Returns "" if nothing fits — caller errors out cleanly.
     """
     task = (row.get("task") or "").lower()
-    dataset_root = "/iris/u/mikulrai/data/RoboFactory/zarr_data"
+    dataset_root = "/iris/u/mikulrai/datasets/multi_robot/RoboFactory/zarr_data"
     if task == "pm":
         return f"{dataset_root}/PickMeat-rf_150.zarr"
     return ""
