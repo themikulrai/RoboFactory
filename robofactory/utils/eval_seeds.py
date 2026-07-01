@@ -70,6 +70,10 @@ POOLS: Dict[str, List[int]] = {
     "canonical_env_60": [b * 100_000 for b in range(100, 160)],
     # 05-29 fresh-wave OOD convention.
     "fresh_ood_60": list(range(20_000, 20_060)),
+    # 100-seed superset of fresh_ood_60; the flagship 2SC flatbaseline decent evals
+    # ran this range as ad-hoc env_seeds (20000..20099). Named here so those runs can
+    # be resolved/sharded/merged by pool name instead of a raw env-seed list.
+    "fresh_ood_100": list(range(20_000, 20_100)),
     # paper protocol (blocker-1 controls).
     "upstream_100": list(range(1_000, 1_100)),
     # DEPRECATED — the old DP convention. Archaeology only (old result JSONs).

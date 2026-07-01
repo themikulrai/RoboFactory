@@ -55,6 +55,13 @@ class TestPoolValues:
         assert p == list(range(20_000, 20_060))
         assert len(p) == 60
 
+    def test_fresh_ood_100(self):
+        p = es.get_pool("fresh_ood_100")
+        assert p == list(range(20_000, 20_100))
+        assert len(p) == 100
+        # Superset of fresh_ood_60 (shares the 20000..20059 prefix).
+        assert p[:60] == es.get_pool("fresh_ood_60")
+
     def test_upstream_100(self):
         p = es.get_pool("upstream_100")
         assert p == list(range(1_000, 1_100))
@@ -85,6 +92,7 @@ class TestPoolSha:
         "train_datagen": es._sha_of_seeds(list(range(0, 183))),
         "canonical_env_60": "59643d0d7cdedc03330a2b341b3bd9248104cb5cbc803a22deed58bf2ca49f0a",
         "fresh_ood_60": es._sha_of_seeds(list(range(20_000, 20_060))),
+        "fresh_ood_100": es._sha_of_seeds(list(range(20_000, 20_100))),
         "upstream_100": es._sha_of_seeds(list(range(1_000, 1_100))),
         "dp_legacy_60": es._sha_of_seeds(list(range(10_000, 10_030)) + list(range(1_000, 1_030))),
     }
@@ -140,7 +148,8 @@ class TestResolveSeeds:
         assert prov["allow_train"] is True
 
     def test_held_out_pools_pass_guard(self):
-        for name in ("canonical_env_60", "fresh_ood_60", "upstream_100", "dp_legacy_60"):
+        for name in ("canonical_env_60", "fresh_ood_60", "fresh_ood_100",
+                     "upstream_100", "dp_legacy_60"):
             es.assert_no_train_overlap(es.get_pool(name))  # must not raise
 
     def test_boundary_182_is_train_183_is_not(self):
