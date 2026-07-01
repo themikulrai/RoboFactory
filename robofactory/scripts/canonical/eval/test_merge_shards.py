@@ -169,3 +169,133 @@ def test_requeue_multiple_json_newest_wins(tmp_path):
 def test_missing_input_glob_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         m.merge_shards([str(tmp_path / "nope_*.json")], POOL)
+
+
+# ---------------------------------------------------------------------------
+# Item 6: success_first_rate must track the `success_first` field, NOT `success`.
+# The driver sets them equal (eval_decent_pi05.py:380); prove the merge keys off
+# success_first by making the two DIVERGE.
+# ---------------------------------------------------------------------------
+def test_success_first_rate_tracks_success_first_not_success(tmp_path):
+    pool = get_pool(POOL)
+    shard_lists = _three_way(pool)
+    n = len(shard_lists)
+    paths = []
+    for i, seeds in enumerate(shard_lists):
+        d = tmp_path / f"eval_pi05_decent_shard{i}of{n}"
+        d.mkdir(parents=True)
+        # success=True for EVERY episode, but success_first=True only for even seeds.
+        results = [
+            {"seed": int(s), "success": True, "success_first": (s % 2 == 0),
+             "steps": 100, "wall_s": 1.0, "success_sustained_10": False}
+            for s in seeds
+        ]
+        args = {"task": "ThreeRobotsStackCube-rf", "num_arms": 3, "num_episodes": 1,
+                "max_env_steps": 400, "replan_after": 8,
+                "seeds": ",".join(str(s) for s in seeds), "ports": f"{i},{i},{i}",
+                "out_dir": str(d), "video_dir": str(d / "v"), "run_id": f"J{i}"}
+        js = {"args": args, "server_metadata": {"arm0": {"config_name": "c0"}},
+              "results": results}
+        p = d / f"eval_decent_T_{1000 + i}.json"
+        p.write_text(json.dumps(js))
+        paths.append(p)
+
+    merged = m.merge_shards([str(p) for p in paths], POOL)
+    agg = merged["merged_shards"]["aggregate"]
+    n_even = sum(1 for s in pool if s % 2 == 0)
+    # success_rate keys off `success` (all True) -> 60/60.
+    assert agg["n_success"] == 60
+    assert abs(agg["success_rate"] - 1.0) < 1e-9
+    # success_first keys off `success_first` (evens only) -> n_even/60, and DIFFERS.
+    assert agg["n_success_first"] == n_even
+    assert abs(agg["success_first_rate"] - n_even / 60) < 1e-9
+    assert agg["success_first_rate"] != agg["success_rate"]
+
+
+def test_success_first_falls_back_to_success_when_absent(tmp_path):
+    """Exception-path records (eval_decent_pi05.py:565) carry `success` but no
+    `success_first`; the headline must fall back to `success`, not treat it as a miss."""
+    pool = get_pool(POOL)
+    shard_lists = _three_way(pool)
+    n = len(shard_lists)
+    paths = []
+    for i, seeds in enumerate(shard_lists):
+        d = tmp_path / f"eval_pi05_decent_shard{i}of{n}"
+        d.mkdir(parents=True)
+        # NO success_first key at all; success=True for even seeds.
+        results = [
+            {"seed": int(s), "success": (s % 2 == 0), "steps": 100, "wall_s": 1.0}
+            for s in seeds
+        ]
+        args = {"task": "ThreeRobotsStackCube-rf", "num_arms": 3, "num_episodes": 1,
+                "max_env_steps": 400, "replan_after": 8,
+                "seeds": ",".join(str(s) for s in seeds), "ports": f"{i},{i},{i}",
+                "out_dir": str(d), "video_dir": str(d / "v"), "run_id": f"J{i}"}
+        js = {"args": args, "server_metadata": {"arm0": {"config_name": "c0"}},
+              "results": results}
+        p = d / f"eval_decent_T_{1000 + i}.json"
+        p.write_text(json.dumps(js))
+        paths.append(p)
+
+    merged = m.merge_shards([str(p) for p in paths], POOL)
+    agg = merged["merged_shards"]["aggregate"]
+    n_even = sum(1 for s in pool if s % 2 == 0)
+    # Fallback: success_first == success where the field is missing.
+    assert agg["n_success_first"] == n_even
+    assert abs(agg["success_first_rate"] - n_even / 60) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Item 5: --env-seeds merge path — evals that ran ad-hoc env_seeds (seed_pool
+# empty, no named pool) must be mergeable by passing the same seed spec.
+# ---------------------------------------------------------------------------
+ADHOC = list(range(20_000, 20_012))  # 12 ad-hoc env seeds; not a named pool
+
+
+def test_env_seeds_merge_path_adhoc(tmp_path):
+    shard_lists = [ADHOC[0::3], ADHOC[1::3], ADHOC[2::3]]
+    succ = {s: (s % 2 == 0) for s in ADHOC}
+    paths = _write_shards(tmp_path, shard_lists, succ)
+    spec = ",".join(str(s) for s in ADHOC)
+    merged = m.merge_shards([str(p) for p in paths], env_seeds=spec,
+                            out=str(tmp_path / "merged.json"))
+    agg = merged["merged_shards"]["aggregate"]
+    exp = sum(1 for s in ADHOC if s % 2 == 0)
+    assert agg["n_episodes"] == len(ADHOC)
+    assert agg["n_success"] == exp
+    assert agg["n_success_first"] == exp
+    assert merged["seed_provenance"]["seed_pool"] == "adhoc"
+    assert merged["merged_shards"]["pool"] == "adhoc"
+    assert [r["seed"] for r in merged["results"]] == sorted(ADHOC)
+    assert Path(tmp_path / "merged.json").exists()
+
+
+def test_env_seeds_missing_seed_hard_error(tmp_path):
+    shard_lists = [ADHOC[0::3][:-1], ADHOC[1::3], ADHOC[2::3]]  # drop one seed
+    paths = _write_shards(tmp_path, shard_lists, {})
+    spec = ",".join(str(s) for s in ADHOC)
+    with pytest.raises(m.MergeError, match="union does not match"):
+        m.merge_shards([str(p) for p in paths], env_seeds=spec)
+
+
+def test_env_seeds_space_delimited_spec(tmp_path):
+    """The spec accepts whitespace delimiters too (resolve_seeds normalizes)."""
+    shard_lists = [ADHOC[0::2], ADHOC[1::2]]
+    paths = _write_shards(tmp_path, shard_lists, {s: True for s in ADHOC})
+    spec = " ".join(str(s) for s in ADHOC)
+    merged = m.merge_shards([str(p) for p in paths], env_seeds=spec)
+    assert merged["merged_shards"]["aggregate"]["n_success"] == len(ADHOC)
+
+
+def test_pool_and_env_seeds_together_rejected(tmp_path):
+    pool = get_pool(POOL)
+    paths = _write_shards(tmp_path, _three_way(pool), {})
+    with pytest.raises(m.MergeError, match="exactly one"):
+        m.merge_shards([str(p) for p in paths], POOL, env_seeds="20000,20001")
+
+
+def test_neither_pool_nor_env_seeds_rejected(tmp_path):
+    pool = get_pool(POOL)
+    paths = _write_shards(tmp_path, _three_way(pool), {})
+    with pytest.raises(m.MergeError, match="exactly one"):
+        m.merge_shards([str(p) for p in paths])
