@@ -16,7 +16,7 @@ LAUNCHER=/iris/u/mikulrai/projects/RoboFactory/scripts/run_hierarchical_lift_bar
 HL_MODEL="${MR_CKPT_ROOT:?MR_CKPT_ROOT unset — source ~/.config/dataroots.sh}/memer/ckpts/lb_wc_dual_r64/checkpoint-3000"
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm0/lb_wc_decent_arm0_v1/19999
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm1/lb_wc_decent_arm1_v1/19999
-LIVE_JSON=/iris/u/mikulrai/data/memer/eval/wc_grasp_live.json
+LIVE_JSON=/iris/u/mikulrai/logs/MemER/eval/wc_grasp_live.json
 source /iris/u/mikulrai/bin/log-run-paths.sh
 logrun_init --task LiftBarrier-rf --cam wristcam --method pi05 --category probe --variant grasp
 RESULTS_DIR="$RUN_LOG_DIR"

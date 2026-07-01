@@ -17,7 +17,7 @@ HL_MODEL="${MR_CKPT_ROOT:?MR_CKPT_ROOT unset — source ~/.config/dataroots.sh}/
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm0/lb_ws_decent_arm0_v1/6000
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm1/lb_ws_decent_arm1_v1/6000
 
-LIVE_JSON=/iris/u/mikulrai/data/memer/eval/ws_hier_live.json
+LIVE_JSON=/iris/u/mikulrai/logs/MemER/eval/ws_hier_live.json
 source /iris/u/mikulrai/bin/log-run-paths.sh
 logrun_init --task LiftBarrier-rf --cam workspace --method pi05 --category eval --variant hier
 RESULTS_DIR="$RUN_LOG_DIR"
