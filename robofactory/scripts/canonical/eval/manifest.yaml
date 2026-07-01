@@ -617,3 +617,123 @@ launchers:
       partition: orion
       output: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.out
       error: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_decent/%x_%j.err
+
+  # ---------------------------------------------------------------------------
+  # pi05_decent — 2SC FLATBASELINE decentralised Pi0.5 evals (wristcam + workspace),
+  # 100-seed held-out pool. THESE are the flagship evals seed-sharding was built to
+  # speed up (--shards N over run_eval.py; recombine with merge_shards.py). Two per-arm
+  # flatbaseline LoRA servers (step 14999) routed by eval_decent_pi05.py, eval15 scene.
+  #
+  # Ground truth: legacy launchers in the MAIN checkout
+  #   robofactory/scripts/eval_pi05_2sc_ws_flat_decent_100seeds.sh (WS; verified)
+  #   robofactory/scripts/eval_pi05_2sc_wc_decent_60seeds.sh (WC protocol reference)
+  # Checkpoint dirs verified on disk under
+  #   /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/{Wristcam,Workspace}/... (real
+  #   params payloads at steps 10000 + 14999; 14999 is the legacy default).
+  #
+  # Correctness invariants (do NOT tidy):
+  #   - seeds = fresh_ood_100 (env 20000..20099), comma-delim for the pi05 driver;
+  #     matches the legacy `seq 20000 20099` inline set. Merge shards with
+  #     `merge_shards.py --pool fresh_ood_100` (or --env-seeds 20000,...,20099).
+  #   - scene = two_robots_stack_cube_eval15.yaml (15cm in-distribution spawn box).
+  #   - max_env_steps=600 (FLAT-baseline budget; NOT the 400 of the *decent* template).
+  #   - prompt "stack the two cubes with the two robot arms" + --allow-oov-prompt
+  #     (out-of-vocab vs the subtask vocab; recorded in the result JSON).
+  #   - num_arms=2; both arms panda_wristcam_multi; xla_mem_fraction=0.30, replan_after=8.
+  #   - WC uses the wristcam camera-mapping json; WS uses the plain (workspace) one.
+  # ---------------------------------------------------------------------------
+  2sc_pi05_wc_flatbaseline_decent:
+    policy_type: pi05_decent
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm0_h100/14999
+      train_config: pi05_robofactory_2sc_wc_flatbaseline_decent_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm0_h100/14999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube_eval15.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 600
+      replan_after: 8
+    # The pi05_decent argv builder emits neither --prompt nor --allow-oov-prompt;
+    # carry the legacy flat-baseline prompt (out-of-vocab) verbatim via extra_argv.
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes with the two robot arms"
+      - "--allow-oov-prompt"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt.sha256
+      delim: ","
+    server:
+      ports: [0, 1]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_wc_flatbaseline_decent_arm0
+        - pi05_robofactory_2sc_wc_flatbaseline_decent_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm0_h100/14999
+        - /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm1_h200/14999
+    wandb:
+      project: 2SC-Flatbaseline
+      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, table-scene, eval15, 100seeds, step-14999]
+    sbatch:
+      job_name: pi05_2sc_wc_flat_dec
+      time: "08:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "96G"
+      partition: orion
+      output: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_flat_decent/%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_pi05_2sc_wc_flat_decent/%x_%j.err
+
+  2sc_pi05_ws_flatbaseline_decent:
+    policy_type: pi05_decent
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Workspace/2sc_ws_flatbaseline_decent_arm0_anvil/14999
+      train_config: pi05_robofactory_2sc_ws_flatbaseline_decent_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Workspace/2sc_ws_flatbaseline_decent_arm0_anvil/14999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube_eval15.yaml
+      camera_family: workspace
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 600
+      replan_after: 8
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes with the two robot arms"
+      - "--allow-oov-prompt"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt.sha256
+      delim: ","
+    server:
+      ports: [0, 1]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_ws_flatbaseline_decent_arm0
+        - pi05_robofactory_2sc_ws_flatbaseline_decent_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Workspace/2sc_ws_flatbaseline_decent_arm0_anvil/14999
+        - /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Workspace/2sc_ws_flatbaseline_decent_arm1_anvil/14999
+    wandb:
+      project: 2SC-Flatbaseline
+      tags: [eval, pi05, decent, 2sc, workspace, flatbaseline, table-scene, eval15, 100seeds, step-14999]
+    sbatch:
+      job_name: pi05_2sc_ws_flat_dec
+      time: "08:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "96G"
+      partition: orion
+      output: /iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/%x_%j.out
+      error: /iris/u/mikulrai/logs/eval_pi05_2sc_ws_flat_decent/%x_%j.err
