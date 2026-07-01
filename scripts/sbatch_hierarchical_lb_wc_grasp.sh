@@ -16,8 +16,10 @@ HL_MODEL=/iris/u/mikulrai/data/memer/ckpts/lb_wc_dual_r64/checkpoint-3000
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm0/lb_wc_decent_arm0_v1/19999
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_wc_decent_arm1/lb_wc_decent_arm1_v1/19999
 LIVE_JSON=/iris/u/mikulrai/data/memer/eval/wc_grasp_live.json
-RESULTS_DIR=/iris/u/mikulrai/projects/RoboFactory/eval_results/wc_grasp_${SLURM_JOB_ID:-manual}
-mkdir -p "$RESULTS_DIR" "$(dirname "$LIVE_JSON")"
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam wristcam --method pi05 --category probe --variant grasp
+RESULTS_DIR="$RUN_LOG_DIR"
+mkdir -p "$(dirname "$LIVE_JSON")"
 
 bash "$LAUNCHER" \
   --hl-model "$HL_MODEL" \
@@ -29,3 +31,4 @@ bash "$LAUNCHER" \
   --live-json "$LIVE_JSON" --results-dir "$RESULTS_DIR"
 
 echo "[sbatch] DONE. results in $RESULTS_DIR"; ls -la "$RESULTS_DIR" || true
+logrun_finish --status done --config "" --cmd "$0"

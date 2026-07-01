@@ -16,10 +16,12 @@ LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_a
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm1/lb_ws_decent_arm1_v1/18000
 
 LIVE_JSON=/iris/u/mikulrai/data/memer/eval/ws_hier_trace_live.json
-RESULTS_DIR=/iris/u/mikulrai/projects/RoboFactory/eval_results/ws_hier_trace_${SLURM_JOB_ID:-manual}
-VIDEO_DIR=$RESULTS_DIR/videos
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam workspace --method pi05 --category misc --variant hier_trace
+RESULTS_DIR="$RUN_LOG_DIR"
+VIDEO_DIR="$RUN_VIDEO_DIR"
 
-mkdir -p "$RESULTS_DIR" "$VIDEO_DIR" "$(dirname "$LIVE_JSON")"
+mkdir -p "$(dirname "$LIVE_JSON")"
 
 bash "$LAUNCHER" \
   --hl-model "$HL_MODEL" \
@@ -36,3 +38,4 @@ bash "$LAUNCHER" \
 
 echo "[sbatch] DONE. results in $RESULTS_DIR"
 ls -la "$RESULTS_DIR" || true
+logrun_finish --status done --config "" --cmd "$0"

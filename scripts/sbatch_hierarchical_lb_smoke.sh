@@ -13,10 +13,10 @@ LAUNCHER=/iris/u/mikulrai/projects/RoboFactory/scripts/run_hierarchical_lift_bar
 HL_MODEL=/iris/u/mikulrai/data/memer/ckpts/lb_dual_r64/checkpoint-1000
 LL_CKPT_ARM0=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm0/lb_ws_decent_arm0_v1/6000
 LL_CKPT_ARM1=/iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_lb_ws_decent_arm1/lb_ws_decent_arm1_v1/6000
-RESULTS_DIR=/iris/u/mikulrai/projects/RoboFactory/eval_results/hierarchical_lb_smoke_${SLURM_JOB_ID:-manual}
-VIDEO_DIR=$RESULTS_DIR/videos
-
-mkdir -p "$RESULTS_DIR" "$VIDEO_DIR"
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam wristcam --method pi05 --category misc --variant hier_smoke
+RESULTS_DIR="$RUN_LOG_DIR"
+VIDEO_DIR="$RUN_VIDEO_DIR"
 
 # All three model processes share the single allocated GPU (HL_GPU=LL_GPU0=LL_GPU1=0 default).
 # LL JAX servers run at XLA mem-fraction 0.30, prealloc off -> coexist with torch HL + SAPIEN.
@@ -33,3 +33,4 @@ bash "$LAUNCHER" \
 
 echo "[sbatch] DONE. results in $RESULTS_DIR"
 ls -la "$RESULTS_DIR" || true
+logrun_finish --status done --config "" --cmd "$0"
