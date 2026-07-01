@@ -33,7 +33,12 @@ RUN_EVAL_SH = REPO_ROOT / "scripts" / "canonical" / "eval" / "run_eval.sh"
 DEFAULT_MANIFEST = REPO_ROOT / "scripts" / "canonical" / "eval" / "manifest.yaml"
 
 
-def _build_sbatch_cmd(launcher_id: str, cfg: LauncherCfg, run_eval_argv: list[str]) -> list[str]:
+def _build_sbatch_cmd(
+    launcher_id: str,
+    cfg: LauncherCfg,
+    run_eval_argv: list[str],
+    shards: int = 1,
+) -> list[str]:
     sb = cfg.sbatch
     cmd: list[str] = ["sbatch"]
     job_name = sb.job_name or launcher_id
@@ -46,16 +51,24 @@ def _build_sbatch_cmd(launcher_id: str, cfg: LauncherCfg, run_eval_argv: list[st
         cmd.extend(["--exclude", sb.exclude])
     if sb.partition:
         cmd.extend(["--partition", sb.partition])
+    # Sharded submit: one array task per shard. %j (single-job id) can't disambiguate
+    # array tasks, so rewrite it to %A_%a (array-job id + task id) in the log paths.
+    if shards > 1:
+        cmd.extend(["--array", f"0-{shards - 1}"])
     if sb.output:
-        cmd.extend(["--output", sb.output])
+        cmd.extend(["--output", sb.output.replace("%j", "%A_%a") if shards > 1 else sb.output])
     if sb.error:
-        cmd.extend(["--error", sb.error])
+        cmd.extend(["--error", sb.error.replace("%j", "%A_%a") if shards > 1 else sb.error])
     if sb.mail_type:
         cmd.extend(["--mail-type", sb.mail_type])
     if sb.mail_user:
         cmd.extend(["--mail-user", sb.mail_user])
     cmd.append(str(RUN_EVAL_SH))
     cmd.append(launcher_id)
+    # --num-shards flows to run_eval.py; --shard-index defaults to $SLURM_ARRAY_TASK_ID
+    # inside each array task, so it needs no explicit flag here.
+    if shards > 1:
+        cmd.extend(["--num-shards", str(shards)])
     cmd.extend(run_eval_argv)
     return cmd
 
@@ -77,6 +90,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     p.add_argument("--print", dest="print_only", action="store_true",
                    help="Print the sbatch CLI without invoking it.")
+    p.add_argument("--shards", type=int, default=1,
+                   help="Submit as an sbatch --array of N shards; each array task evals a "
+                        "disjoint round-robin slice of the seed pool (merge with merge_shards.py).")
     args = p.parse_args(main_argv)
 
     mfst = load_manifest(args.manifest)
@@ -88,7 +104,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
     cfg = mfst.launchers[args.launcher_id]
-    cmd = _build_sbatch_cmd(args.launcher_id, cfg, extra)
+    cmd = _build_sbatch_cmd(args.launcher_id, cfg, extra, shards=args.shards)
 
     if args.print_only:
         print(shlex.join(cmd))

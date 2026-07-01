@@ -55,6 +55,28 @@ def _load_seeds(cfg: LauncherCfg) -> str:
     return cfg.seeds.delim.join(raw)
 
 
+def shard_seeds(seeds: str, shard_index: int, num_shards: int, delim: str) -> str:
+    """Round-robin slice ``seeds`` into shard ``shard_index`` of ``num_shards``.
+
+    Splits on comma OR whitespace (either delim the launcher uses), takes the
+    ``[shard_index::num_shards]`` stride, and rejoins with ``delim``. The stride
+    keeps within-shard order stable and makes the N shards a disjoint partition
+    of the pool (every seed lands in exactly one shard).
+
+    MUST be called AFTER the sha-guard preflight, which has to see the FULL pool.
+    ``num_shards <= 1`` is the identity (returns ``seeds`` unchanged) so the
+    single-shard path is byte-identical to the pre-sharding behavior.
+    """
+    if num_shards <= 1:
+        return seeds
+    toks = seeds.replace(",", " ").split()
+    assert 0 <= shard_index < num_shards <= len(toks), (
+        f"invalid shard: shard_index={shard_index}, num_shards={num_shards}, "
+        f"n_seeds={len(toks)} (need 0 <= shard_index < num_shards <= n_seeds)"
+    )
+    return delim.join(toks[shard_index::num_shards])
+
+
 def _resolve_train_cfg(cfg: LauncherCfg) -> Optional[Path]:
     """Replicate `_resolve_train_cfg.sh`: prefer .hydra_config.yaml next to ckpt.
 
@@ -455,6 +477,30 @@ def _inject_rep_output(argv: list[str], cfg: LauncherCfg, rep: int) -> list[str]
     return argv
 
 
+def _inject_shard_output(argv: list[str], shard_index: int, num_shards: int) -> list[str]:
+    """Suffix this shard's result/video dirs with ``_shard{i}of{n}`` so co-running
+    array-task shards never clobber each other's output. Mirrors ``_inject_rep_output``:
+    edits the value of --out-dir / --video-dir (pi0.5) and --jsonl-path (DP) in place.
+    Idempotent no-op when ``num_shards <= 1`` (keeps the single-shard argv identical).
+    """
+    if num_shards <= 1:
+        return argv
+    argv = list(argv)
+    suf = f"_shard{shard_index}of{num_shards}"
+    for flag in ("--out-dir", "--video-dir"):
+        if flag in argv:
+            i = argv.index(flag)
+            p = Path(argv[i + 1])
+            argv[i + 1] = str(p.with_name(p.name + suf))
+            if flag == "--out-dir":
+                Path(argv[i + 1]).mkdir(parents=True, exist_ok=True)
+    for i, a in enumerate(argv):
+        if a.startswith("--jsonl-path="):
+            p = Path(a.split("=", 1)[1])
+            argv[i] = f"--jsonl-path={p.with_name(p.stem + suf + p.suffix)}"
+    return argv
+
+
 def run_launcher(
     cfg: LauncherCfg,
     launcher_id: str,
@@ -462,6 +508,8 @@ def run_launcher(
     slurm_job_id: str,
     dry_run: bool = False,
     preflight_only: bool = False,
+    num_shards: int = 1,
+    shard_index: int = 0,
 ) -> int:
     seeds = _load_seeds(cfg)
     n_repeats = resolve_n_repeats(cfg, launcher_id)
@@ -482,6 +530,19 @@ def run_launcher(
             file=sys.stderr, flush=True,
         )
         return 0
+
+    # Seed sharding: preflight above saw the FULL pool (the sha guard must). Now that
+    # the guards passed, slice the pool round-robin so each array task (SLURM_ARRAY_TASK_ID
+    # -> shard_index) evaluates a disjoint subset. merge_shards.py recombines them.
+    if num_shards > 1:
+        full_n = len(seeds.replace(",", " ").split())
+        seeds = shard_seeds(seeds, shard_index, num_shards, cfg.seeds.delim)
+        shard_toks = seeds.replace(",", " ").split()
+        print(
+            f"[run_eval] shard {shard_index}/{num_shards}: "
+            f"{len(shard_toks)}/{full_n} seeds -> {seeds}",
+            file=sys.stderr, flush=True,
+        )
 
     is_pi05 = cfg.policy_type in (PolicyType.PI05_SINGLE, PolicyType.PI05_DECENT)
     rc_final = 0
@@ -506,6 +567,7 @@ def run_launcher(
             )
             specs = _build_server_specs(cfg, real_ports)
             argv = build_driver_argv(cfg, seeds, rep_job_id, real_ports)
+            argv = _inject_shard_output(argv, shard_index, num_shards)
             argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
             print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
             if dry_run:
@@ -523,6 +585,7 @@ def run_launcher(
         else:
             # DP path: no server bringup.
             argv = build_driver_argv(cfg, seeds, rep_job_id)
+            argv = _inject_shard_output(argv, shard_index, num_shards)
             argv = _inject_rep_output(argv, cfg, rep) if n_repeats > 1 else argv
             print(f"[run_eval] driver argv: {shlex.join(argv)}", file=sys.stderr, flush=True)
             if dry_run:
@@ -543,6 +606,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Run preflight + env_hooks for real, then stop. "
                         "Useful for verifying scene/seed/wandb without burning a GPU.")
     p.add_argument("--slurm-job-id", default=os.environ.get("SLURM_JOB_ID", "local"))
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="Split the seed pool into N disjoint round-robin shards "
+                        "(one array task each). Preflight still sees the full pool.")
+    p.add_argument("--shard-index", type=int,
+                   default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")),
+                   help="Which shard this task runs (0-based). Defaults to "
+                        "$SLURM_ARRAY_TASK_ID so an sbatch --array wires it automatically.")
     args = p.parse_args(argv)
 
     mfst = load_manifest(args.manifest)
@@ -559,6 +629,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         slurm_job_id=args.slurm_job_id,
         dry_run=args.dry_run,
         preflight_only=args.preflight_only,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
 
 

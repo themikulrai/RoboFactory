@@ -378,3 +378,144 @@ class TestRepeatLoop:
             rc = r.run_launcher(cfg, "pm_dp_in1k", slurm_job_id="JOB", dry_run=False)
         assert rc == 1            # nonzero surfaced
         assert calls["n"] == 3    # all three driver reps still ran
+
+
+# ---------------------------------------------------------------------------
+# Seed sharding: shard_seeds() round-robin partition + _inject_shard_output()
+# ---------------------------------------------------------------------------
+class TestShardSeeds:
+    def test_four_shard_disjoint_partition_preserves_order(self):
+        pool = ",".join(str(s) for s in range(60))
+        shards = [r.shard_seeds(pool, i, 4, ",") for i in range(4)]
+        parsed = [s.split(",") for s in shards]
+        # each shard is exactly pool[i::4] (order preserved within shard)
+        for i in range(4):
+            assert parsed[i] == [str(s) for s in range(60)][i::4]
+        # union is the whole pool with no duplicates and no gaps
+        flat = [tok for sh in parsed for tok in sh]
+        assert len(flat) == 60
+        assert len(set(flat)) == 60
+        assert sorted(int(x) for x in flat) == list(range(60))
+
+    def test_num_shards_one_is_identity(self):
+        pool = "1,2,3,4,5"
+        assert r.shard_seeds(pool, 0, 1, ",") == pool
+
+    def test_space_delim_roundtrip(self):
+        # split on whitespace, rejoin with the launcher's space delim
+        assert r.shard_seeds("10 11 12 13", 1, 2, " ") == "11 13"
+
+    def test_comma_input_space_delim_output(self):
+        # input delim and output delim can differ (split handles both)
+        assert r.shard_seeds("10,11,12,13", 0, 2, " ") == "10 12"
+
+    def test_invalid_shard_raises(self):
+        with pytest.raises(AssertionError):
+            r.shard_seeds("1,2,3", 0, 5, ",")   # num_shards > n_seeds
+        with pytest.raises(AssertionError):
+            r.shard_seeds("1,2,3", 3, 3, ",")   # shard_index == num_shards
+        with pytest.raises(AssertionError):
+            r.shard_seeds("1,2,3", -1, 3, ",")  # negative shard_index
+
+
+class TestInjectShardOutput:
+    def test_out_and_video_dirs_suffixed_and_created(self, tmp_path):
+        argv = [
+            "python", "x.py",
+            "--out-dir", str(tmp_path / "out"),
+            "--video-dir", str(tmp_path / "out" / "videos_JOB"),
+        ]
+        out = r._inject_shard_output(argv, 2, 4)
+        oi = out.index("--out-dir")
+        vi = out.index("--video-dir")
+        assert out[oi + 1].endswith("_shard2of4")
+        assert out[vi + 1].endswith("_shard2of4")
+        assert Path(out[oi + 1]).is_dir()  # out-dir is created
+
+    def test_jsonl_path_stem_suffixed(self):
+        argv = ["python", "y.py", "--jsonl-path=/logs/eval/PickMeat-rf_rep0.jsonl"]
+        out = r._inject_shard_output(argv, 1, 3)
+        assert out[-1] == "--jsonl-path=/logs/eval/PickMeat-rf_rep0_shard1of3.jsonl"
+
+    def test_num_shards_one_is_noop(self):
+        argv = ["--out-dir", "/a/b", "--video-dir", "/a/b/videos"]
+        assert r._inject_shard_output(argv, 0, 1) == argv
+
+
+class TestShardedDispatch:
+    """run_launcher end-to-end (mocked subprocess) proving the driver receives the
+    sharded seed slice and a shard-suffixed jsonl path, and that num_shards=1 is a
+    byte-identical regression of the pre-sharding argv."""
+
+    def setup_method(self):
+        os.environ["N_REPEATS"] = "1"  # isolate from the 3-rep canonical default
+
+    def teardown_method(self):
+        os.environ.pop("N_REPEATS", None)
+
+    def _driver_seeds(self, argv):
+        s_idx = argv.index("-s")
+        seeds = []
+        for tok in argv[s_idx + 1:]:
+            if tok.startswith("-"):
+                break
+            seeds.append(tok)
+        return seeds
+
+    def _run_capture(self, launcher_id, num_shards, shard_index):
+        cfg = _cfg(launcher_id)
+        with mock.patch.object(r.subprocess, "run") as run_mock:
+            run_mock.return_value.returncode = 0
+            r.run_launcher(
+                cfg, launcher_id, slurm_job_id="JOB",
+                num_shards=num_shards, shard_index=shard_index,
+            )
+        return [
+            c.args[0] for c in run_mock.call_args_list
+            if "eval_dp.py" in " ".join(c.args[0])
+        ][0]
+
+    def test_four_shards_partition_dp_seeds(self):
+        expected = r._load_seeds(_cfg("pm_dp_in1k")).split()
+        collected = []
+        for k in range(4):
+            argv = self._run_capture("pm_dp_in1k", 4, k)
+            shard = self._driver_seeds(argv)
+            assert shard == expected[k::4]                 # order-preserving stride
+            collected += shard
+        assert sorted(collected, key=int) == sorted(expected, key=int)
+        assert len(collected) == len(expected)             # disjoint partition
+
+    def test_num_shards_one_byte_identical(self):
+        argv = self._run_capture("pm_dp_in1k", 1, 0)
+        # full seed pool, no shard suffix anywhere.
+        assert self._driver_seeds(argv) == r._load_seeds(_cfg("pm_dp_in1k")).split()
+        assert not any("_shard" in a for a in argv)
+
+    def _run_capture_pi05(self, launcher_id, num_shards, shard_index):
+        """Capture the decent-pi0.5 driver argv without spawning real servers."""
+        cfg = _cfg(launcher_id)
+        with mock.patch.object(r, "Pi05ServerSupervisor"), \
+                mock.patch.object(r, "wait_for_ports"), \
+                mock.patch.object(r, "run_registry_drift_guard"), \
+                mock.patch.object(r.subprocess, "run") as run_mock:
+            run_mock.return_value.returncode = 0
+            r.run_launcher(
+                cfg, launcher_id, slurm_job_id="JOB",
+                num_shards=num_shards, shard_index=shard_index,
+            )
+        return [
+            c.args[0] for c in run_mock.call_args_list
+            if "eval_decent_pi05.py" in " ".join(c.args[0])
+        ][0]
+
+    def test_pi05_out_and_video_dirs_shard_suffixed(self):
+        full = r._load_seeds(_cfg("tsc_pi05_d1_decent"))          # comma-joined pool
+        expected_n = len(r.shard_seeds(full, 1, 4, ",").split(","))
+        argv = self._run_capture_pi05("tsc_pi05_d1_decent", 4, 1)
+        assert argv[argv.index("--out-dir") + 1].endswith("_shard1of4")
+        assert argv[argv.index("--video-dir") + 1].endswith("_shard1of4")
+        # driver receives exactly this shard's slice of the 60-seed pool (15 seeds).
+        got = argv[argv.index("--seeds") + 1].split(",")
+        assert got == full.split(",")[1::4]
+        assert len(got) == expected_n
