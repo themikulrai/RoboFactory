@@ -650,7 +650,16 @@ launchers:
       preflight_path: /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm0_h100/14999
     task:
       env_id: TwoRobotsStackCube-rf
-      scene_config: configs/table/two_robots_stack_cube_eval15.yaml
+      # RE-PIN (2026-07-02): scene switched eval15 -> aug15 to match how the 87/100
+      # baseline ACTUALLY ran. Provenance JSON
+      #   logs/multi-robot/2SC/eval/flatbaseline/run/eval_decent_TwoRobotsStackCube-rf_1782552460.json
+      # has args.config -> two_robots_stack_cube_aug15.yaml (NOT eval15). eval15 and
+      # aug15 differ substantively (goal_region x 0.05->0.025, goal randp 0.10->0.15),
+      # so the old eval15 pin would NOT have reproduced the baseline. The prompt below
+      # is the UNIFIED train-side string ("with"), so re-running this entry re-pins the
+      # flat baseline under (unified prompt + aug15) = the exact conditions all flat
+      # deltas (RIP/NG/Force) use. All flat deltas quote the re-pinned number.
+      scene_config: configs/table/two_robots_stack_cube_aug15.yaml
       camera_family: head_camera
       camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
       num_arms: 2
@@ -680,7 +689,7 @@ launchers:
         - /iris/u/mikulrai/checkpoints/openpi/2SC/Non-Subtask/Wristcam/2sc_wc_flatbaseline_decent_arm1_h200/14999
     wandb:
       project: 2SC-Flatbaseline
-      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, table-scene, eval15, 100seeds, step-14999]
+      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, table-scene, aug15, 100seeds, step-14999]
     sbatch:
       job_name: pi05_2sc_wc_flat_dec
       time: "08:00:00"
