@@ -737,3 +737,171 @@ launchers:
       partition: orion
       output: /iris/u/mikulrai/slurm/%j.out
       error: /iris/u/mikulrai/slurm/%j.err
+
+  # ===========================================================================
+  # 2SC wc FLAT ABLATIONS (spliced from the 2sc-ablations worktree CHERRYPICK).
+  # All pin scene = two_robots_stack_cube_aug15.yaml (the scene the re-pinned flat
+  # baseline actually ran on; provenance JSON args.config). n_repeats: 1 (probe).
+  # ---------------------------------------------------------------------------
+  # RIP (Robot-Identifying Prompt): ONE shared flat LL, served twice under the
+  # per-arm serve aliases; identity prefixes injected per arm by eval_decent_pi05.
+  # CKPT PATH (verified derivation): OPENPI_CKPT_BASE/CONFIG/EXP_NAME/14999 where
+  #   OPENPI_CKPT_BASE=/iris/u/mikulrai/checkpoints/openpi (common.sh:28),
+  #   CONFIG=pi05_robofactory_2sc_wc_flatbaseline_rip_shared (train wrapper),
+  #   EXP_NAME=2sc_wc_flatbaseline_rip_shared_a40x2 (slurm job rip_flat_a40x2).
+  # NOTE: on-disk ckpt not yet present (train 16058746 still PENDING at splice
+  # time) -> re-verify the exact dir once it lands; eval is chained afterok so it
+  # only runs after the ckpt exists.
+  2sc_pi05_wc_flatbaseline_rip_decent:
+    policy_type: pi05_decent
+    n_repeats: 1
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_rip_shared/2sc_wc_flatbaseline_rip_shared_a40x2/14999
+      train_config: pi05_robofactory_2sc_wc_flatbaseline_rip_shared_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_rip_shared/2sc_wc_flatbaseline_rip_shared_a40x2/14999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube_aug15.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 600
+      replan_after: 8
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes with the two robot arms"
+      - "--allow-oov-prompt"
+      - "--identity-prefix-arm0"
+      - "<left arm>"
+      - "--identity-prefix-arm1"
+      - "<right arm>"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt.sha256
+      delim: ","
+    server:
+      ports: [0, 1]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_wc_flatbaseline_rip_shared_arm0
+        - pi05_robofactory_2sc_wc_flatbaseline_rip_shared_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_rip_shared/2sc_wc_flatbaseline_rip_shared_a40x2/14999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_rip_shared/2sc_wc_flatbaseline_rip_shared_a40x2/14999
+    wandb:
+      project: 2SC-Flatbaseline
+      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, aug15, 100seeds, step-14999, rip]
+    sbatch:
+      job_name: pi05_2sc_wc_flat_rip
+      time: "08:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "96G"
+      partition: orion
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
+
+  # No-Global: server masks base_0_rgb (client still sends it); eval argv unchanged.
+  # PHASE-B placeholder ckpt paths (train post-G1); confirm exact dir at launch.
+  2sc_pi05_wc_flatbaseline_noglobal_decent:
+    policy_type: pi05_decent
+    n_repeats: 1
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm0/2sc_wc_flatbaseline_noglobal_decent_arm0_v1/14999
+      train_config: pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm0/2sc_wc_flatbaseline_noglobal_decent_arm0_v1/14999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube_aug15.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 600
+      replan_after: 8
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes with the two robot arms"
+      - "--allow-oov-prompt"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt.sha256
+      delim: ","
+    server:
+      ports: [0, 1]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm0
+        - pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm0/2sc_wc_flatbaseline_noglobal_decent_arm0_v1/14999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_noglobal_decent_arm1/2sc_wc_flatbaseline_noglobal_decent_arm1_v1/14999
+    wandb:
+      project: 2SC-Flatbaseline
+      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, aug15, 100seeds, step-14999, noglobal]
+    sbatch:
+      job_name: pi05_2sc_wc_flat_ng
+      time: "08:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "96G"
+      partition: orion
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
+
+  # Force: client sends 18-dim per-arm state via --per-arm-extra-obs gripper_force.
+  # PHASE-B placeholder ckpt paths (train post-G1); confirm exact dir at launch.
+  2sc_pi05_wc_flatbaseline_force_decent:
+    policy_type: pi05_decent
+    n_repeats: 1
+    ckpt:
+      dir: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm0/2sc_wc_flatbaseline_force_decent_arm0_v1/14999
+      train_config: pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm0
+      preflight_path: /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm0/2sc_wc_flatbaseline_force_decent_arm0_v1/14999
+    task:
+      env_id: TwoRobotsStackCube-rf
+      scene_config: configs/table/two_robots_stack_cube_aug15.yaml
+      camera_family: head_camera
+      camera_mapping: /iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings/two_robots_stack_cube_wristcam.json
+      num_arms: 2
+      robot_uid: panda_wristcam_multi
+      robot_uids_csv: panda_wristcam_multi,panda_wristcam_multi
+      max_steps: 600
+      replan_after: 8
+    extra_argv:
+      - "--prompt"
+      - "stack the two cubes with the two robot arms"
+      - "--allow-oov-prompt"
+      - "--per-arm-extra-obs"
+      - "gripper_force"
+    seeds:
+      file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt
+      sha256_file: /iris/u/mikulrai/runs/eval_seeds_fresh_ood_100.txt.sha256
+      delim: ","
+    server:
+      ports: [0, 1]
+      gpu_indices: [0, 1]
+      xla_mem_fraction: 0.30
+      arm_configs:
+        - pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm0
+        - pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm1
+      arm_dirs:
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm0/2sc_wc_flatbaseline_force_decent_arm0_v1/14999
+        - /iris/u/mikulrai/checkpoints/openpi/pi05_robofactory_2sc_wc_flatbaseline_force_decent_arm1/2sc_wc_flatbaseline_force_decent_arm1_v1/14999
+    wandb:
+      project: 2SC-Flatbaseline
+      tags: [eval, pi05, decent, 2sc, wristcam, flatbaseline, aug15, 100seeds, step-14999, force]
+    sbatch:
+      job_name: pi05_2sc_wc_flat_force
+      time: "08:00:00"
+      gres: "gpu:a6000:2"
+      cpus_per_task: 8
+      mem: "96G"
+      partition: orion
+      output: /iris/u/mikulrai/slurm/%j.out
+      error: /iris/u/mikulrai/slurm/%j.err
