@@ -124,6 +124,7 @@ class Pi05ServerSupervisor:
     def _build_cmd(self, spec: ServerSpec) -> list[str]:
         return [
             self.OPENPI_PYTHON,
+            "-u",
             self.SERVE_POLICY_SCRIPT,
             "--port",
             str(spec.port),

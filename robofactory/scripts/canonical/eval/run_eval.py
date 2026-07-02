@@ -664,7 +664,7 @@ def run_launcher(
                 continue
             _ensure_argv_dirs(argv)
             with Pi05ServerSupervisor(specs, log_dir=server_log_dir):
-                wait_for_ports(real_ports, deadline_s=600.0, poll_s=5.0)
+                wait_for_ports(real_ports, deadline_s=float(os.environ.get("RUN_EVAL_PORT_DEADLINE_S", "600")), poll_s=5.0)
                 print("[run_eval] all server ports up; launching eval driver", file=sys.stderr, flush=True)
                 rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
             _register_run(cfg, rep_job_id, _video_out_dirs(cfg, rep_job_id)[0])
