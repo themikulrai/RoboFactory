@@ -52,6 +52,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from policy._shared.multiview_video import ordered_unique, tile_views, subsample  # noqa: E402
+from robofactory.policy.openpi_pi05.identity_prompt import compose_identity_prompt  # noqa: E402
 
 IMAGE_SLOTS = ("base_0_rgb_raw", "left_wrist_0_rgb_raw", "right_wrist_0_rgb_raw", "extra_0_rgb_raw")
 
@@ -109,6 +110,11 @@ class Args:
     hl_port: Annotated[int, tyro.conf.arg(help="HL Qwen server HTTP port (REQUIRED)")] = tyro.MISSING
     hl_query_interval: int = 25  # K: query HL every K env steps
     hl_instruction: str = "lift the steel barrier using two robot arms"
+    # RIP: per-arm identity prefix prepended (single space) to the LL prompt (HL
+    # subtask text or the pre-query instruction). Empty => no-op (baseline). HL output
+    # text itself is NOT modified, so the HL<->LL vocab contract is untouched.
+    identity_prefix_arm0: str = ""
+    identity_prefix_arm1: str = ""
     # ---- rollout / eval control ----
     # Seed resolution (PR4 — robofactory.utils.eval_seeds is the single source of truth).
     # Prefer --seed-pool; --env-seeds is an ad-hoc final-env-seed list. When either is set,
@@ -541,6 +547,8 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
     chunk_idxs = [args.replan_after] * args.num_arms
     # Per-arm prompts. Start with the flat/instruction prompt until the first HL query.
     prompts = [args.flat_prompt if args.flat_baseline else args.hl_instruction] * args.num_arms
+    # RIP: per-arm identity prefixes (index-aligned with arms; arms >=2 get "").
+    identity_prefixes = [args.identity_prefix_arm0, args.identity_prefix_arm1]
     frames = []
     n_hl_queries = 0
     last_hl = None
@@ -695,7 +703,8 @@ def run_episode(env, ll_policies, hl_client, args, cam_map, action_prefix, seed,
         replanned = [False] * args.num_arms
         for i in range(args.num_arms):
             if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
-                obs_i = _build_ll_obs(obs, args, cam_map, prompts[i])
+                _prefix = identity_prefixes[i] if i < len(identity_prefixes) else ""
+                obs_i = _build_ll_obs(obs, args, cam_map, compose_identity_prompt(_prefix, prompts[i]))
                 obs_i["_episode_seed"] = _eff_seed  # PR5: re-key this LL server's rng per episode (popped server-side)
                 chunks[i] = np.asarray(ll_policies[i].infer(obs_i)["actions"])
                 chunk_idxs[i] = 0

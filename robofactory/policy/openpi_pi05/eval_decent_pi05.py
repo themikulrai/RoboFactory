@@ -33,6 +33,7 @@ from openpi_client.websocket_client_policy import WebsocketClientPolicy
 from robofactory.tasks import *  # noqa: F401, F403
 import robofactory.agents  # noqa: F401  (registers panda_wristcam_multi via @register_agent)
 from robofactory.utils.success_persistence import probe_sustained, SUSTAIN_K  # PR7
+from robofactory.policy.openpi_pi05.identity_prompt import compose_identity_prompt
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -96,6 +97,10 @@ class Args:
     subtask_vocab: bool = False  # validate against the LB sidecar subtask vocab (sidecar-trained ckpts)
     subtask_npz: str = ""  # override the subtask vocab npz path (defaults to lb_subtask_index.npz)
     allow_oov_prompt: bool = False  # permit an out-of-vocab prompt (recorded in JSON; for E1 prompt-swap probe)
+    # RIP: per-arm identity prefix prepended (single space) to --prompt at infer time.
+    # Empty => no-op (baseline). Vocab validation stays on the bare --prompt.
+    identity_prefix_arm0: str = ""
+    identity_prefix_arm1: str = ""
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
     video_dir: str = ""  # location override; defaults to <out_dir>/videos. Video is ALWAYS recorded.
@@ -276,6 +281,8 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
 
     chunks: list[np.ndarray | None] = [None] * args.num_arms
     chunk_idxs: list[int] = [args.replan_after] * args.num_arms
+    # RIP: per-arm identity prefixes (index-aligned with arms; arms >=2 get "").
+    identity_prefixes = [args.identity_prefix_arm0, args.identity_prefix_arm1]
     video_frames: list[np.ndarray] = []
 
     traj_fp = None
@@ -296,7 +303,10 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                     # PR5: re-key each per-arm server's rng per episode. Set fresh every call
                     # because Policy.infer pops the key in place (each arm is a separate server).
                     obs_dict["_episode_seed"] = int(seed)
-                    result = policies[i].infer(obs_dict)
+                    # RIP: prepend this arm's identity prefix to the prompt (no-op when empty).
+                    prefix = identity_prefixes[i] if i < len(identity_prefixes) else ""
+                    obs_i = {**obs_dict, "prompt": compose_identity_prompt(prefix, args.prompt)}
+                    result = policies[i].infer(obs_i)
                     chunks[i] = np.asarray(result["actions"])  # (H, 8)
                     chunk_idxs[i] = 0
                     replanned_per_arm[i] = True
@@ -617,6 +627,10 @@ def main(args: Args) -> None:
             "server_metadata": {f"arm{i}": server_metadata[i] for i in range(len(server_metadata))},
             "provenance": provenance,            # PR6: eval_protocol v2
             "prompt_validation": prompt_validation,
+            "identity_prefixes": {                # RIP provenance (empty => baseline)
+                "arm0": args.identity_prefix_arm0,
+                "arm1": args.identity_prefix_arm1,
+            },
             "validity": validity,                # PR6: valid / invalid_reason
             "save_trajectory": args.save_trajectory,  # PR9
             "trajectory_h5": traj_h5_path,            # PR9
