@@ -101,6 +101,10 @@ class Args:
     # Empty => no-op (baseline). Vocab validation stays on the bare --prompt.
     identity_prefix_arm0: str = ""
     identity_prefix_arm1: str = ""
+    # Force: when "gripper_force", append obs["extra"]["gripper_force_arm{i}"] at index 8
+    # WITHIN each arm's state block (per_arm_dim 8->9). Server transform log1p+norms it.
+    # Empty => baseline 8-dim per-arm state. The server raises on a dim mismatch (safe).
+    per_arm_extra_obs: str = ""
     sim_backend: str = "auto"
     out_dir: str = "/iris/u/mikulrai/logs/eval_pi05_decent"
     video_dir: str = ""  # location override; defaults to <out_dir>/videos. Video is ALWAYS recorded.
@@ -134,12 +138,19 @@ def _gripper_from_qpos(qpos_step: np.ndarray) -> float:
     return float((qpos_step[7] + qpos_step[8]) / 2.0)
 
 
-def _build_state(obs: dict, num_arms: int, robot_uid: str) -> np.ndarray:
+def _build_state(obs: dict, num_arms: int, robot_uid: str, per_arm_extra_obs: str = "") -> np.ndarray:
+    # Per-arm blocks stay CONTIGUOUS so the server's RoboFactoryDecentInputs per-arm
+    # slice [i*d:(i+1)*d] holds one arm. Force is INTERLEAVED at index 8 within each
+    # arm's block: [q7, grip, force] (per_arm_dim=9) when --per-arm-extra-obs=gripper_force,
+    # else [q7, grip] (per_arm_dim=8). Force is sent RAW; the server transform log1p+norms it.
     parts: list[np.ndarray] = []
     for i in range(num_arms):
         q = np.asarray(obs["agent"][f"{robot_uid}-{i}"]["qpos"]).squeeze()
         parts.append(q[:7].astype(np.float32))
         parts.append(np.array([_gripper_from_qpos(q)], dtype=np.float32))
+        if per_arm_extra_obs == "gripper_force":
+            fval = float(np.asarray(obs["extra"][f"gripper_force_arm{i}"]).squeeze())
+            parts.append(np.array([fval], dtype=np.float32))
     return np.concatenate(parts).astype(np.float32)
 
 
@@ -153,9 +164,10 @@ def _extract_image(obs: dict, cam_name: str) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str], robot_uid: str) -> dict:
+def _build_obs_dict(obs: dict, prompt: str, num_arms: int, cam_map: dict[str, str], robot_uid: str,
+                    per_arm_extra_obs: str = "") -> dict:
     out: dict = {
-        "state": _build_state(obs, num_arms, robot_uid),
+        "state": _build_state(obs, num_arms, robot_uid, per_arm_extra_obs),
         "prompt": prompt,
     }
     # The image-slot keys are driven ENTIRELY by the camera-mapping JSON keys (cam_map),
@@ -299,7 +311,8 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
             for i in range(args.num_arms):
                 if chunks[i] is None or chunk_idxs[i] >= args.replan_after:
                     if obs_dict is None:
-                        obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid)
+                        obs_dict = _build_obs_dict(obs, args.prompt, args.num_arms, cam_map, args.robot_uid,
+                                                   args.per_arm_extra_obs)
                     # PR5: re-key each per-arm server's rng per episode. Set fresh every call
                     # because Policy.infer pops the key in place (each arm is a separate server).
                     obs_dict["_episode_seed"] = int(seed)
@@ -324,7 +337,7 @@ def run_episode(env, policies: list, args: Args, cam_map: dict[str, str], view_s
                 chunk_idxs[i] += 1
 
             if traj_fp is not None:
-                state_24 = _build_state(obs, args.num_arms, args.robot_uid)
+                state_24 = _build_state(obs, args.num_arms, args.robot_uid, args.per_arm_extra_obs)
                 action_chunks_per_arm = [
                     ([[float(v) for v in r] for r in chunks[i].tolist()] if replanned_per_arm[i] else None)
                     for i in range(args.num_arms)
@@ -531,7 +544,7 @@ def main(args: Args) -> None:
             from robofactory.utils.preflight_collapse import probe_collapse_pi05_loaded_policy
             _calib = '/iris/u/mikulrai/runs/calibration/pm_in1k_goodref.npz'
             _ref_shape = (224, 224, 3)
-            _state_dim = args.num_arms * 8
+            _state_dim = args.num_arms * (9 if args.per_arm_extra_obs == "gripper_force" else 8)
             _probe_slots = tuple(cam_map.keys())
             def _build_obs_for_probe(img_chw, qpos):
                 state = np.resize(np.asarray(qpos, dtype=np.float32), _state_dim).astype(np.float32)
