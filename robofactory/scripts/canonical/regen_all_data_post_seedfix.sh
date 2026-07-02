@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=regen_seedfix
-#SBATCH --output=/iris/u/mikulrai/logs/datagen_post_seedfix/regen_%A_%a.out
-#SBATCH --error=/iris/u/mikulrai/logs/datagen_post_seedfix/regen_%A_%a.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --time=4:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G

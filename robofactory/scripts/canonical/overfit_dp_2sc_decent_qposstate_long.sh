@@ -8,15 +8,14 @@
 #SBATCH --mem=64G
 #SBATCH --time=08:00:00
 #SBATCH --requeue
-#SBATCH --output=/iris/u/mikulrai/logs/overfit_qpos_long_2026-05-13/dp_%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/overfit_qpos_long_2026-05-13/dp_%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # Tier H — extended state=qpos retrain to 8000 epochs total (resume from 2000).
 # Per-step L2 at 2000 ep was 0.016 rad mean. Need to drive it below ~5 mrad to
 # avoid trajectory drift over 250+ eval steps. checkpoint_every=1000.
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/overfit_qpos_long_2026-05-13
 
 : "${ARM:?ARM env var required (0 or 1)}"
 NUM_EPOCHS="${NUM_EPOCHS:-8000}"

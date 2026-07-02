@@ -8,8 +8,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
 #SBATCH --requeue
-#SBATCH --output=/iris/u/mikulrai/logs/overfit_lp/dp_lp_overfit_%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/overfit_lp/dp_lp_overfit_%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # LongPipelineDelivery overfit-1 training tuned for max-memorization:
 #   - lr=1e-3, weight_decay=0, warmup=20 (fast LR ramp + no anti-overfit reg)
@@ -21,7 +21,6 @@
 # Env vars (required): ARM (0..3)
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/overfit_lp
 
 : "${ARM:?ARM env var required (0..3)}"
 CAM_FAMILY="${CAM_FAMILY:-workspace}"

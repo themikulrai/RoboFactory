@@ -8,8 +8,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --requeue
-#SBATCH --output=/iris/u/mikulrai/logs/overfit_lb/dp_lb_overfit_%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/overfit_lb/dp_lb_overfit_%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # Quick overfit test for LongPipelineDelivery (LB) task: can DP memorize 1 demo?
 # User's hypothesis: cube tasks (2SC TSC) fail overfit because of cube-specific
@@ -20,7 +20,6 @@
 # Env vars (required): ARM (0..3)
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/overfit_lb
 
 : "${ARM:?ARM env var required (0..3)}"
 CAM_FAMILY="${CAM_FAMILY:-workspace}"

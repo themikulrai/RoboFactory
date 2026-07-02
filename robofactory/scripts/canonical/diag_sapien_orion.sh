@@ -6,14 +6,13 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16G
 #SBATCH --time=00:15:00
-#SBATCH --output=/iris/u/mikulrai/logs/diag/diag_sapien_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/diag/diag_sapien_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # Timed import + env-build probe to find WHERE LP eval hangs on orion.
 # Single-arm task too (PickMeat) for control: does LP-specific 4-arm scene cause the hang?
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/diag
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory

@@ -9,8 +9,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
-#SBATCH --output=/iris/u/mikulrai/logs/conversion_post_seedfix/conv_%A_%a.out
-#SBATCH --error=/iris/u/mikulrai/logs/conversion_post_seedfix/conv_%A_%a.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #
 # Idempotent orchestrator: convert every post-seedfix wristcam H5 into both
 #   (a) zarr  (Diffusion Policy)   via parse_h5_to_zarr_unified.py

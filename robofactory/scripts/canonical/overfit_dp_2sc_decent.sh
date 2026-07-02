@@ -8,8 +8,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
 #SBATCH --requeue
-#SBATCH --output=/iris/u/mikulrai/logs/overfit_2026-05-11/dp_2sc_overfit_%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/overfit_2026-05-11/dp_2sc_overfit_%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # Diagnostic overfit run for 2SC DP decentralised — sanity check for the same
 # encoder-collapse / shared-obs pathology seen in TSC. N=1 demo overfit; if SR
@@ -23,7 +23,6 @@
 #                      WITH_GLOBAL=true (set false for no-head_cam_global ablation)
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/overfit_2026-05-11
 
 : "${ARM:?ARM env var required (0 or 1)}"
 CAM_FAMILY="${CAM_FAMILY:-workspace}"

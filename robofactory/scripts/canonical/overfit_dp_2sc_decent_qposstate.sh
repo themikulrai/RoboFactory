@@ -8,8 +8,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
 #SBATCH --requeue
-#SBATCH --output=/iris/u/mikulrai/logs/overfit_qpos_2026-05-13/dp_2sc_overfit_qposstate_%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/overfit_qpos_2026-05-13/dp_2sc_overfit_qposstate_%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 
 # Tier D — Overfit retrain with state=qpos (the H3 fix).
 #
@@ -20,7 +20,6 @@
 # at train, qpos at eval) as the structural blocker.
 
 set -euxo pipefail
-mkdir -p /iris/u/mikulrai/logs/overfit_qpos_2026-05-13
 
 : "${ARM:?ARM env var required (0 or 1)}"
 CAM_FAMILY="${CAM_FAMILY:-workspace}"

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=overfit_pass
-#SBATCH --output=/iris/u/mikulrai/logs/preflight/overfit_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/preflight/overfit_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --time=01:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4

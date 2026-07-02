@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
-#SBATCH --output=/iris/u/mikulrai/logs/conversion_post_seedfix/conv_%A_%a.out
-#SBATCH --error=/iris/u/mikulrai/logs/conversion_post_seedfix/conv_%A_%a.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #
 # Convert post-seedfix H5 demonstrations into:
 #   (a) zarr        (Diffusion Policy training)        via parse_h5_to_zarr_unified.py
@@ -60,7 +60,7 @@ ZARR_OUT_ROOT="${RF_DATA_ROOT:?}/zarr_data"
 LEROBOT_OUT_ROOT="${RF_LEROBOT_HOME:?RF_LEROBOT_HOME unset — source ~/.config/dataroots.sh}"
 CAM_MAP_DIR=/iris/u/mikulrai/projects/openpi/examples/robofactory/camera_mappings
 
-mkdir -p "${ZARR_OUT_ROOT}" "${LEROBOT_OUT_ROOT}" /iris/u/mikulrai/logs/conversion_post_seedfix
+mkdir -p "${ZARR_OUT_ROOT}" "${LEROBOT_OUT_ROOT}"
 
 # --- per-task metadata --------------------------------------------------------
 declare -A N_AGENTS=(
