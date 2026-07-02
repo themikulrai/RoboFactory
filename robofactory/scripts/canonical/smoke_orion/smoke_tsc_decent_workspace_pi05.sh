@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=smk_tsc_dec_ws_pi05
-#SBATCH --output=/iris/u/mikulrai/logs/coverage_matrix_smoke/tsc_decent_workspace_pi05_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/coverage_matrix_smoke/tsc_decent_workspace_pi05_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --time=0:30:00
 #SBATCH --gres=gpu:3
 #SBATCH --cpus-per-task=8
@@ -17,6 +17,9 @@ set -e
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
 
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task ThreeRobotsStackCube-rf --cam ws --method pi05 --category misc --variant smoke
+
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
 source /iris/u/mikulrai/.config/dataroots.sh 2>/dev/null || true
@@ -25,7 +28,7 @@ export HF_HOME=/iris/u/mikulrai/.cache/huggingface
 export XDG_CACHE_HOME=/iris/u/mikulrai/.cache
 export JAX_COMPILATION_CACHE_DIR=/iris/u/mikulrai/.cache/jax
 export TMPDIR=/iris/u/mikulrai/tmp
-mkdir -p "$XDG_CACHE_HOME/jax/xla_autotune" "$TMPDIR" /iris/u/mikulrai/logs/coverage_matrix_smoke
+mkdir -p "$XDG_CACHE_HOME/jax/xla_autotune" "$TMPDIR"
 export XLA_FLAGS="--xla_gpu_per_fusion_autotune_cache_dir=$XDG_CACHE_HOME/jax/xla_autotune ${XLA_FLAGS:-}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.30
@@ -58,7 +61,7 @@ for d in "$ARM0_DIR" "$ARM1_DIR" "$ARM2_DIR"; do
     [ -d "$d" ] || { echo "missing ckpt dir: $d"; exit 1; }
 done
 
-SERVER_LOG_DIR=/iris/u/mikulrai/logs/coverage_matrix_smoke/tsc_decent_workspace_pi05_${SLURM_JOB_ID}_servers
+SERVER_LOG_DIR="$RUN_LOG_DIR/servers"
 mkdir -p "$SERVER_LOG_DIR"
 
 start_server () {
@@ -109,8 +112,8 @@ for port in 8000 8001 8002; do
     echo "[wait] port ${port} up"
 done
 
-VIDEO_DIR=/iris/u/mikulrai/logs/coverage_matrix_smoke/videos_${SLURM_JOB_ID}
-OUT_DIR=/iris/u/mikulrai/logs/coverage_matrix_smoke
+VIDEO_DIR="$RUN_VIDEO_DIR"
+OUT_DIR="$RUN_LOG_DIR"
 mkdir -p "$VIDEO_DIR" "$OUT_DIR"
 
 "$PREFLIGHT_PYTHON" -u ./policy/openpi_pi05/eval_decent_pi05.py \
@@ -133,3 +136,5 @@ mkdir -p "$VIDEO_DIR" "$OUT_DIR"
     --wandb \
     --wandb-project openpi-robofactory \
     --wandb-tags 'eval,smoke,coverage-matrix,orion,tsc,decent,workspace,pi05'
+
+logrun_finish --status done --config "" --cmd "$0"

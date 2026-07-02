@@ -7,8 +7,8 @@
 # partition / gpu / account are set at submit time via the iris-mcp tool args.
 #
 #SBATCH --job-name=eval_dp_lb_wc_cent
-#SBATCH --output=/iris/u/mikulrai/logs/eval_dp_lb_wc_cent/%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/eval_dp_lb_wc_cent/%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -17,10 +17,12 @@
 #SBATCH --gres=gpu:a40:1
 
 set -euo pipefail
-mkdir -p /iris/u/mikulrai/logs/eval_dp_lb_wc_cent
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
+
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam wc --method dp --category eval --variant cent
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
@@ -41,12 +43,11 @@ PY=/iris/u/mikulrai/data/miniforge3/envs/RoboFactory/bin/python
 CKPT=/iris/u/mikulrai/checkpoints/RoboFactory/58ea4af29c21/300.ckpt
 [ -f "$CKPT" ] || { echo "missing DP joint ckpt: $CKPT"; exit 1; }
 
-RECORD_DIR=/iris/u/mikulrai/logs/eval_dp_lb_wc_cent/joint_${SLURM_JOB_ID}_{env_id}
-mkdir -p /iris/u/mikulrai/logs/eval_dp_lb_wc_cent
+RECORD_DIR="$RUN_VIDEO_DIR/joint_${SLURM_JOB_ID}_{env_id}"
 # DP seed pool (x-bucket), passed space-separated.
 SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
 
-RESULT_FILE="/iris/u/mikulrai/logs/eval_dp_lb_wc_cent/lb_wc_cent_joint_60seeds_${SLURM_JOB_ID:-manual}.jsonl"
+RESULT_FILE="$RUN_LOG_DIR/lb_wc_cent_joint_60seeds_${SLURM_JOB_ID:-manual}.jsonl"
 "$PY" -u ./policy/Diffusion-Policy/eval_joint_dp.py \
     --ckpt-path "$CKPT" \
     --config configs/table/lift_barrier.yaml \
@@ -68,3 +69,5 @@ python scripts/log_eval.py \
     --jsonl "$RESULT_FILE" \
     --job "${SLURM_JOB_ID:-manual}" \
     --title "Eval LB wc DP [Cent joint, 60seeds]" || true
+
+logrun_finish --status done --config "" --cmd "$0"

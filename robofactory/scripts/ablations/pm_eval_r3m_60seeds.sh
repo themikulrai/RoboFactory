@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pm_eval_r3m_60s
-#SBATCH --output=/iris/u/mikulrai/logs/phase2_debug/pm_eval_r3m_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/phase2_debug/pm_eval_r3m_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --time=8:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -10,6 +10,9 @@
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
+
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task PickMeat-rf --cam r3m --method dp --category eval --variant ablation
 
 export HOME=/iris/u/mikulrai
 [ -L "$HOME/.r3m" ] || ln -sfn /iris/u/mikulrai/.cache/r3m "$HOME/.r3m"
@@ -38,7 +41,7 @@ python -u -m robofactory.utils.preflight_eval \
   --ckpt-path /iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_r3m.ckpt \
   --scene-config configs/table/pick_meat.yaml || exit 1
 
-RESULT_FILE="/iris/u/mikulrai/logs/phase2_debug/pm_eval_r3m_${SLURM_JOB_ID:-manual}.jsonl"
+RESULT_FILE="$RUN_LOG_DIR/pm_eval_r3m_${SLURM_JOB_ID:-manual}.jsonl"
 python -u ./policy/Diffusion-Policy/eval_dp.py \
   --config=configs/table/pick_meat.yaml \
   --ckpt-path=/iris/u/mikulrai/checkpoints/RoboFactory/PickMeat-rf_150/backup/300_r3m.ckpt \
@@ -59,3 +62,5 @@ python scripts/log_eval.py \
     --jsonl "$RESULT_FILE" \
     --job "${SLURM_JOB_ID:-manual}" \
     --title "Eval PickMeat WC DP [r3m enc, 60seeds]" || true
+
+logrun_finish --status done --config "" --cmd "$0"

@@ -7,8 +7,8 @@
 # partition / gpu / account are set at submit time via the iris-mcp tool args.
 #
 #SBATCH --job-name=eval_dp_lb_wc_dec
-#SBATCH --output=/iris/u/mikulrai/logs/eval_dp_lb_wc_decent/%x_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/eval_dp_lb_wc_decent/%x_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -17,10 +17,12 @@
 #SBATCH --gres=gpu:a40:1
 
 set -euo pipefail
-mkdir -p /iris/u/mikulrai/logs/eval_dp_lb_wc_decent
 
 source /iris/u/mikulrai/data/miniforge3/etc/profile.d/conda.sh
 conda activate RoboFactory
+
+source /iris/u/mikulrai/bin/log-run-paths.sh
+logrun_init --task LiftBarrier-rf --cam wc --method dp --category eval --variant decent
 
 export HOME=/iris/u/mikulrai
 export TORCH_HOME=$HOME/.cache/torch
@@ -45,8 +47,8 @@ for id in 0 1; do
     [ -f "$p" ] || { echo "missing DP ckpt: $p"; exit 1; }
 done
 
-VIDEO_DIR=/iris/u/mikulrai/logs/eval_dp_lb_wc_decent/videos_${SLURM_JOB_ID}
-OUT_DIR=/iris/u/mikulrai/logs/eval_dp_lb_wc_decent
+VIDEO_DIR="$RUN_VIDEO_DIR"
+OUT_DIR="$RUN_LOG_DIR"
 mkdir -p "$VIDEO_DIR" "$OUT_DIR"
 # DP seed pool (x-bucket 10000-10029 + 1000-1029), passed space-separated.
 SEEDS=$(tr '\n' ' ' < /iris/u/mikulrai/runs/eval_seeds_60_dp.txt)
@@ -87,3 +89,5 @@ python scripts/log_eval.py \
     --jsonl "$RESULT_FILE" \
     --job "${SLURM_JOB_ID:-manual}" \
     --title "Eval LB wc DP [Decent ckpt300, 60seeds]" || true
+
+logrun_finish --status done --config "" --cmd "$0"

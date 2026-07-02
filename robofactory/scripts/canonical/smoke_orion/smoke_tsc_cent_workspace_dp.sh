@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=smk_tsc_cent_ws_dp
-#SBATCH --output=/iris/u/mikulrai/logs/coverage_matrix_smoke/tsc_cent_workspace_dp_%j.out
-#SBATCH --error=/iris/u/mikulrai/logs/coverage_matrix_smoke/tsc_cent_workspace_dp_%j.err
+#SBATCH --output=/iris/u/mikulrai/slurm/%j.out
+#SBATCH --error=/iris/u/mikulrai/slurm/%j.err
 #SBATCH --time=0:30:00
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
